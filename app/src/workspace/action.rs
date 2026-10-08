@@ -870,6 +870,28 @@ pub enum WorkspaceAction {
     ToggleProjectManagerPanel,
     /// Save the active tab's folder in the Projects panel.
     SaveActiveDirectoryAsProject,
+    /// Open a project from the Projects panel: a new tab in its folder, with
+    /// the Projects panel closed and the file explorer showing the project.
+    OpenProjectFolder {
+        path: PathBuf,
+    },
+    /// Open a project from the Projects panel in a new window, with a terminal
+    /// in its folder and the file explorer showing it.
+    OpenProjectInNewWindow {
+        path: PathBuf,
+    },
+    /// A Claude thread is being dragged from the Threads panel; highlights the
+    /// pane of the active tab it would split.
+    DragClaudeThread {
+        position: RectF,
+    },
+    /// A dragged Claude thread was dropped: over a pane of the active tab it
+    /// moves there as a split. A thread already open in a tab moves its pane;
+    /// otherwise a new split runs `command`, which resumes it.
+    DropClaudeThread {
+        session_id: String,
+        command: Option<String>,
+    },
     /// Open a file in the code editor, split to the right of the active pane
     /// (so it gets a close button even while the tab list is hidden).
     OpenFileInSplitPane {
@@ -1143,6 +1165,10 @@ impl WorkspaceAction {
             | ToggleClaudeThreadsPanel
             | ToggleProjectManagerPanel
             | SaveActiveDirectoryAsProject
+            | OpenProjectFolder { .. }
+            | OpenProjectInNewWindow { .. }
+            | DragClaudeThread { .. }
+            | DropClaudeThread { .. }
             | OpenFileInSplitPane { .. }
             | OpenWorktreeAddRepoPicker
             | Crash

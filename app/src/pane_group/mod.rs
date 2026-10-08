@@ -3955,6 +3955,18 @@ impl PaneGroup {
         new_pane_id
     }
 
+    /// Splits `base_pane_id` with a new terminal pane on its `direction` side
+    /// (e.g. to open a Claude thread dropped from the Threads panel there).
+    pub(crate) fn split_terminal_pane_from(
+        &mut self,
+        base_pane_id: PaneId,
+        direction: Direction,
+        ctx: &mut ViewContext<Self>,
+    ) -> Option<ViewHandle<TerminalView>> {
+        let new_pane_id = self.insert_terminal_pane(direction, base_pane_id, None, ctx);
+        self.terminal_view_from_pane_id(new_pane_id, ctx)
+    }
+
     /// Used when splitting panes.
     fn insert_terminal_pane(
         &mut self,

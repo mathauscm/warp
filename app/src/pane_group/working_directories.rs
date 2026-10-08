@@ -673,12 +673,35 @@ impl WorkingDirectoriesModel {
             }
         }
 
+        // Like VS Code, a file inside a folder the tree already shows (a
+        // terminal's directory, or a root kept from before) stays under the
+        // outermost such folder instead of adding its own repo or parent
+        // folder as a root. Its repo still counts for code review below.
+        let shown_local_roots: Vec<PathBuf> = file_path_ancestors
+            .iter()
+            .cloned()
+            .chain(
+                old_directories
+                    .iter()
+                    .filter_map(|dir| dir.path.to_local_path().map(|p| p.to_path_buf())),
+            )
+            .collect();
+        let editor_repo_roots: Vec<PathBuf> = local_editor_paths
+            .iter()
+            .filter_map(|(_, path)| self.get_repo_root_for_path(Path::new(path), ctx))
+            .collect();
+
         let local_cwds: Vec<(EntityId, String)> = local_editor_paths
             .into_iter()
             .filter_map(|(view_id, path)| {
                 let path_buf = PathBuf::from(&path);
-                let resolved_path = self
-                    .get_repo_root_for_path(&path_buf, ctx)
+                let shown_root = shown_local_roots
+                    .iter()
+                    .filter(|root| path_buf.starts_with(root))
+                    .min_by_key(|root| root.components().count())
+                    .cloned();
+                let resolved_path = shown_root
+                    .or_else(|| self.get_repo_root_for_path(&path_buf, ctx))
                     .or_else(|| path_buf.parent().map(|p| p.to_path_buf()))?;
 
                 if file_path_ancestors.insert(resolved_path.clone()) {
@@ -743,6 +766,7 @@ impl WorkingDirectoriesModel {
             .flat_map(|dirs| dirs.iter())
             .filter_map(|lor| lor.to_local_path())
             .filter_map(|dir| self.get_repo_root_for_path(dir, ctx))
+            .chain(editor_repo_roots)
             .collect();
         let mut new_roots: HashSet<PathBuf> =
             HashSet::from_iter(new_local_repo_roots.iter().cloned());

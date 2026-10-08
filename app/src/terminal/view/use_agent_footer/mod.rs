@@ -11,7 +11,9 @@ use crate::ai::agent::ImageContext;
 use crate::ai::blocklist::agent_view::agent_input_footer::{
     AgentInputFooter, AgentInputFooterEvent,
 };
-use crate::terminal::cli_agent_sessions::{CLIAgentInputEntrypoint, CLIAgentSessionsModel};
+use crate::terminal::cli_agent_sessions::{
+    CLIAgentInputEntrypoint, CLIAgentSessionStatus, CLIAgentSessionsModel,
+};
 use crate::terminal::shared_session::{
     SharedSessionActionSource, SharedSessionScrollbackType, SharedSessionSource,
 };
@@ -61,9 +63,11 @@ use crate::terminal::cli_agent_sessions::CLIAgentRichInputCloseReason;
 use crate::terminal::model_events::{ModelEvent, ModelEventDispatcher};
 use crate::ui_components::blended_colors;
 use crate::ui_components::icons::Icon;
+use crate::view_components::DismissibleToast;
 use crate::view_components::action_button::{
     ActionButton, ActionButtonTheme, ButtonSize, KeystrokeSource, TooltipAlignment,
 };
+use crate::workspace::ToastStack;
 
 /// Small delay inserted between separate PTY writes to CLI agents.
 /// (Used both for the mode-switch prefix split and for the `DelayedEnter`
@@ -266,6 +270,9 @@ impl TerminalView {
             UseAgentToolbarEvent::StopRemoteControl => {
                 self.auto_stop_sharing_on_cli_end = false;
                 self.stop_sharing_session(SharedSessionActionSource::FooterChip, ctx);
+            }
+            UseAgentToolbarEvent::StartClaudeRemoteControl => {
+                self.start_claude_remote_control(ctx);
             }
             UseAgentToolbarEvent::OpenRichInput => {
                 if self.has_active_cli_agent_input_session(ctx) {
@@ -760,6 +767,35 @@ impl TerminalView {
 
         let strategy = rich_input_submit_strategy(agent);
         self.write_cli_agent_text_then_submit(text_bytes, strategy, ctx);
+    }
+
+    /// Footer "Claude Remote" chip: types Claude Code's `/remote-control` into
+    /// the Claude session, which then shows its link and QR code. While Claude
+    /// is working or waiting for an approval the command would land in the
+    /// middle of that, so it's refused with a toast instead.
+    fn start_claude_remote_control(&mut self, ctx: &mut ViewContext<Self>) {
+        let is_busy = CLIAgentSessionsModel::as_ref(ctx)
+            .session(self.view_id)
+            .is_some_and(|session| {
+                session.is_working_on_prompt()
+                    || matches!(session.status, CLIAgentSessionStatus::Blocked { .. })
+            });
+        if is_busy {
+            let window_id = ctx.window_id();
+            ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+                toast_stack.add_ephemeral_toast(
+                    DismissibleToast::error(
+                        "O Claude está ocupado. Use o Claude Remote quando ele terminar."
+                            .to_string(),
+                    ),
+                    window_id,
+                    ctx,
+                );
+            });
+            return;
+        }
+        #[cfg(feature = "local_tty")]
+        self.submit_text_to_cli_agent_pty("/remote-control".to_owned(), ctx);
     }
 
     /// Sends a raw Enter (`\r`) directly to the active CLI agent's PTY,
@@ -1276,6 +1312,9 @@ impl UseAgentToolbar {
             AgentInputFooterEvent::StopRemoteControl => {
                 ctx.emit(UseAgentToolbarEvent::StopRemoteControl);
             }
+            AgentInputFooterEvent::StartClaudeRemoteControl => {
+                ctx.emit(UseAgentToolbarEvent::StartClaudeRemoteControl);
+            }
             AgentInputFooterEvent::OpenRichInput => {
                 ctx.emit(UseAgentToolbarEvent::OpenRichInput);
             }
@@ -1378,6 +1417,8 @@ pub enum UseAgentToolbarEvent {
     },
     /// Stop remote control (stop the active shared session).
     StopRemoteControl,
+    /// Run Claude Code's own `/remote-control` in the Claude session.
+    StartClaudeRemoteControl,
     /// Open the rich input editor for composing a prompt.
     OpenRichInput,
     /// Hide the rich input editor (same as Escape).

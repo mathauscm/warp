@@ -183,6 +183,15 @@ impl CLIAgentSession {
         self.remote_host.is_some()
     }
 
+    /// Whether the agent is working on a prompt right now. A session starts
+    /// out `InProgress` before any prompt (and stays so until its first
+    /// `Stop`), so that status alone also covers an agent idle at its prompt;
+    /// a submitted prompt is what tells a running turn apart.
+    pub fn is_working_on_prompt(&self) -> bool {
+        matches!(self.status, CLIAgentSessionStatus::InProgress)
+            && self.session_context.query.is_some()
+    }
+
     /// Whether the session surfaces trustworthy fine-grained status
     /// (in-progress / blocked / success). True only after receiving a rich OSC
     /// 777 notification. Codex's OSC 9 fallback emits only opaque `Stop`

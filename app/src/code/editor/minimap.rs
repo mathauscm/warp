@@ -6,6 +6,7 @@ use std::any::Any;
 use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use pathfinder_color::ColorU;
 use warp_editor::render::model::RenderState;
@@ -124,15 +125,16 @@ impl Geometry {
     }
 }
 
-/// The minimap with its click and drag handling.
+/// The minimap with its click and drag handling. `dragging` belongs to the
+/// editor view, so a drag survives the re-renders its own scrolling causes.
 pub fn render(
     lines: MinimapLines,
     render_state: ModelHandle<RenderState>,
     background: Option<ColorU>,
     slider_color: ColorU,
+    dragging: Arc<AtomicBool>,
 ) -> Box<dyn Element> {
     let geometry: Rc<Cell<Option<Geometry>>> = Rc::new(Cell::new(None));
-    let dragging = Rc::new(Cell::new(false));
     let element = MinimapElement {
         lines,
         render_state,
@@ -156,7 +158,7 @@ pub fn render(
             if !geometry.bounds.contains_point(position) {
                 return DispatchEventResult::PropagateToParent;
             }
-            down_dragging.set(true);
+            down_dragging.store(true, Ordering::Relaxed);
             ctx.dispatch_typed_action(CodeEditorViewAction::MinimapScrollTo {
                 scroll_top: geometry.scroll_top_for(position.y()),
             });
@@ -166,7 +168,7 @@ pub fn render(
             let Some(geometry) = drag_geometry.get() else {
                 return DispatchEventResult::PropagateToParent;
             };
-            if !drag_dragging.get() {
+            if !drag_dragging.load(Ordering::Relaxed) {
                 return DispatchEventResult::PropagateToParent;
             }
             ctx.dispatch_typed_action(CodeEditorViewAction::MinimapScrollTo {
@@ -175,7 +177,7 @@ pub fn render(
             DispatchEventResult::StopPropagation
         })
         .on_left_mouse_up(move |_, _, _| {
-            dragging.set(false);
+            dragging.store(false, Ordering::Relaxed);
             DispatchEventResult::PropagateToParent
         })
         .finish()
@@ -187,7 +189,7 @@ struct MinimapElement {
     background: Option<ColorU>,
     slider_color: ColorU,
     geometry: Rc<Cell<Option<Geometry>>>,
-    dragging: Rc<Cell<bool>>,
+    dragging: Arc<AtomicBool>,
     size: Option<Vector2F>,
     origin: Option<Point>,
 }
@@ -283,7 +285,7 @@ impl Element for MinimapElement {
             }
         }
 
-        let slider_alpha = if self.dragging.get() {
+        let slider_alpha = if self.dragging.load(Ordering::Relaxed) {
             SLIDER_DRAG_ALPHA
         } else {
             SLIDER_ALPHA
