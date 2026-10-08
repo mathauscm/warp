@@ -2,6 +2,7 @@ use warpui::elements::{DraggableState, MouseStateHandle};
 
 use super::FileTreeItem;
 use crate::appearance::Appearance;
+use crate::code::file_tree::git_status::GitFileStatus;
 use crate::code::icon_from_file_path;
 use crate::ui_components::icons::Icon;
 use crate::ui_components::item_highlight::ImageOrIcon;
@@ -36,6 +37,7 @@ impl FileTreeItem {
                     mouse_state: mouse_state_handle.clone(),
                     draggable_state: draggable_state.clone(),
                     is_ignored: metadata.ignored,
+                    git_status: None,
                 }
             }
             FileTreeItem::DirectoryHeader {
@@ -57,6 +59,7 @@ impl FileTreeItem {
                     mouse_state: mouse_state_handle.clone(),
                     draggable_state: draggable_state.clone(),
                     is_ignored: directory.ignored,
+                    git_status: None,
                 }
             }
         }
@@ -71,4 +74,6 @@ pub(super) struct RenderState {
     pub mouse_state: MouseStateHandle,
     pub draggable_state: DraggableState,
     pub is_ignored: bool,
+    /// Git status shown as a tint and a letter (files) or a dot (folders).
+    pub git_status: Option<GitFileStatus>,
 }

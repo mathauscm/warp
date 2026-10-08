@@ -2,12 +2,16 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use editing::sort_entries_for_file_tree;
 use itertools::Itertools;
 use pathfinder_geometry::rect::RectF;
 use pathfinder_geometry::vector::Vector2F;
 use render::RenderState;
+use warpui::r#async::Timer;
+
+use super::git_status::{self, GitFileStatus, GitStatuses};
 use repo_metadata::file_tree_store::{
     FileTreeDirectoryEntryState, FileTreeEntryState, FileTreeFileMetadata,
 };
@@ -290,6 +294,10 @@ pub struct FileTreeView {
     pending_focus_target: Option<PendingFocusTarget>,
     /// Whether to show hidden files (dotfiles) in the file tree.
     show_hidden_files: bool,
+    /// Git status of the shown repos, refreshed in the background.
+    git_statuses: Arc<GitStatuses>,
+    /// Discards git status results from a superseded refresh.
+    git_status_epoch: usize,
 }
 
 /// Directory the file tree wants to focus once its entry becomes available.
@@ -349,6 +357,7 @@ impl FileTreeView {
         self.is_active = is_active;
 
         if is_active {
+            self.schedule_git_status_refresh(Duration::ZERO, ctx);
             self.subscribe_to_repository_metadata(ctx);
             self.subscribe_to_active_file_model(ctx);
             self.subscribe_to_code_settings(ctx);
@@ -502,6 +511,8 @@ impl FileTreeView {
         ctx: &mut ViewContext<Self>,
     ) {
         use repo_metadata::{RepoMetadataEvent, RepositoryIdentifier};
+        // Files changed on disk: refresh the git decorations shortly after.
+        self.schedule_git_status_refresh(Duration::from_millis(300), ctx);
         match event {
             RepoMetadataEvent::RepositoryUpdated {
                 id: RepositoryIdentifier::Local(std_path),
@@ -703,6 +714,8 @@ impl FileTreeView {
 
         Self {
             root_directories: HashMap::new(),
+            git_statuses: Default::default(),
+            git_status_epoch: 0,
             displayed_directories: Vec::new(),
             #[cfg(feature = "local_fs")]
             enablement: CodingPanelEnablementState::Enabled,
@@ -1290,6 +1303,7 @@ impl FileTreeView {
         should_expand_last_directory: bool,
         ctx: &mut ViewContext<Self>,
     ) {
+        self.schedule_git_status_refresh(Duration::from_millis(300), ctx);
         for root_path in paths {
             self.root_directories
                 .entry(root_path.clone())
@@ -1871,7 +1885,10 @@ impl FileTreeView {
             .finish(),
         );
 
-        let text_color = item_highlight_state.text_and_icon_color(appearance);
+        let git_status = render_state.git_status.filter(|_| !render_state.is_ignored);
+        let text_color = git_status
+            .map(|status| status.color())
+            .unwrap_or_else(|| item_highlight_state.text_and_icon_color(appearance));
         let text_style = if render_state.is_ignored {
             Properties::default()
                 .style(Style::Italic)
@@ -1908,6 +1925,25 @@ impl FileTreeView {
                     )
                     .finish(),
                 );
+                if let Some(status) = git_status {
+                    header_row.add_child(
+                        warpui::elements::Expanded::new(1., Empty::new().finish()).finish(),
+                    );
+                    let badge = if render_state.is_expanded.is_some() {
+                        "\u{25CF}"
+                    } else {
+                        status.letter()
+                    };
+                    header_row.add_child(
+                        Container::new(
+                            Text::new_inline(badge, appearance.ui_font_family(), ITEM_FONT_SIZE)
+                                .with_color(status.color())
+                                .finish(),
+                        )
+                        .with_margin_left(6.)
+                        .finish(),
+                    );
+                }
             }
         }
 
@@ -1986,7 +2022,8 @@ impl FileTreeView {
 
         let is_selected = self.selected_item.as_ref() == Some(id);
         let is_expanded = self.is_item_expanded(&id.root, item);
-        let render_state = item.to_render_state(is_expanded, appearance);
+        let mut render_state = item.to_render_state(is_expanded, appearance);
+        render_state.git_status = self.git_status_for(item);
 
         let item_display_name = render_state.display_name.clone();
         let item_position_id = format!("file_tree_item:{item_display_name}");
@@ -2086,6 +2123,47 @@ impl FileTreeView {
             .finish();
 
         SavePosition::new(draggable, item_position_id.as_str()).finish()
+    }
+
+    fn git_status_for(&self, item: &FileTreeItem) -> Option<GitFileStatus> {
+        let path = item.path().to_local_path()?;
+        match item {
+            FileTreeItem::File { .. } => self.git_statuses.file(&path),
+            FileTreeItem::DirectoryHeader { .. } => self.git_statuses.folder(&path),
+        }
+    }
+
+    /// Re-reads `git status` for the shown roots shortly after `delay`. While
+    /// the tree is visible it keeps polling, so edits made outside Warp (or by
+    /// an agent) show up without a file-system event.
+    #[cfg(feature = "local_fs")]
+    fn schedule_git_status_refresh(&mut self, delay: Duration, ctx: &mut ViewContext<Self>) {
+        const POLL_INTERVAL: Duration = Duration::from_secs(4);
+
+        crate::code::vscode_appearance::ensure_loaded(ctx);
+        self.git_status_epoch += 1;
+        let epoch = self.git_status_epoch;
+        let roots: Vec<PathBuf> = self
+            .displayed_directories
+            .iter()
+            .filter_map(StandardizedPath::to_local_path)
+            .collect();
+        ctx.spawn(
+            async move {
+                Timer::after(delay).await;
+                git_status::load(roots).await
+            },
+            move |me, statuses, ctx| {
+                if me.git_status_epoch != epoch {
+                    return;
+                }
+                me.git_statuses = Arc::new(statuses);
+                ctx.notify();
+                if me.is_active {
+                    me.schedule_git_status_refresh(POLL_INTERVAL, ctx);
+                }
+            },
+        );
     }
 
     fn selected_item_std_path(&self) -> Option<StandardizedPath> {
