@@ -5,10 +5,18 @@
 use std::sync::OnceLock;
 
 use pathfinder_color::ColorU;
+use pathfinder_geometry::vector::vec2f;
+use warp_core::ui::Icon as WarpIcon;
+use warp_core::ui::theme::color::internal_colors;
+use warpui::elements::{
+    ChildAnchor, ConstrainedBox, Container, CornerRadius, Element, Hoverable, OffsetPositioning,
+    Padding, ParentAnchor, ParentElement, ParentOffsetBounds, Radius, Stack,
+};
 use warpui::fonts::FamilyId;
+use warpui::platform::Cursor;
 use warpui::{AppContext, SingletonEntity, ViewContext};
 
-use super::TerminalView;
+use super::{TerminalAction, TerminalView};
 use crate::appearance::Appearance;
 use crate::terminal::CLIAgent;
 use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
@@ -16,6 +24,8 @@ use crate::terminal::color::{self, BrightColors, Colors, NormalColors, PrimaryCo
 
 /// The Claude app's dark page background.
 pub(super) const BACKGROUND: ColorU = rgb(0x262624);
+/// Size of the X that closes a lone Claude pane.
+const CLOSE_ICON_SIZE: f32 = 14.;
 /// The Claude app's main text color.
 const FOREGROUND: ColorU = rgb(0xfaf9f5);
 
@@ -112,6 +122,56 @@ impl TerminalView {
         CLIAgentSessionsModel::as_ref(app)
             .session(self.view_id)
             .is_some_and(|session| session.agent == CLIAgent::Claude)
+    }
+
+    /// Paints the pane with the Claude background and, when the pane is alone
+    /// in its tab (so it has no header), floats a close button in its top
+    /// right corner. That's how a Claude session opened from the Threads panel
+    /// closes while the tab list is hidden.
+    pub(super) fn wrap_claude_pane(
+        &self,
+        element: Box<dyn Element>,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let element = Container::new(element)
+            .with_background_color(BACKGROUND)
+            .finish();
+        if self.split_pane_state(app).is_in_split_pane() {
+            return element;
+        }
+
+        let theme = Appearance::as_ref(app).theme();
+        let icon_color = theme.sub_text_color(theme.background());
+        let hover_background = internal_colors::fg_overlay_2(theme);
+        let close_button =
+            Hoverable::new(self.claude_close_button_mouse_state.clone(), move |state| {
+                let icon = ConstrainedBox::new(WarpIcon::X.to_warpui_icon(icon_color).finish())
+                    .with_width(CLOSE_ICON_SIZE)
+                    .with_height(CLOSE_ICON_SIZE)
+                    .finish();
+                let mut button = Container::new(icon)
+                    .with_padding(Padding::uniform(4.))
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)));
+                if state.is_hovered() {
+                    button = button.with_background(hover_background);
+                }
+                button.finish()
+            })
+            .with_cursor(Cursor::PointingHand)
+            .on_click(|ctx, _, _| ctx.dispatch_typed_action(TerminalAction::Close))
+            .finish();
+
+        let mut stack = Stack::new().with_child(element);
+        stack.add_positioned_overlay_child(
+            close_button,
+            OffsetPositioning::offset_from_parent(
+                vec2f(-8., 8.),
+                ParentOffsetBounds::ParentByPosition,
+                ParentAnchor::TopRight,
+                ChildAnchor::TopRight,
+            ),
+        );
+        stack.finish()
     }
 
     /// Uses the Claude app palette while Claude runs here, otherwise the

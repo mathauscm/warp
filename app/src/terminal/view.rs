@@ -2722,6 +2722,11 @@ pub struct TerminalView {
     /// Whether we've already emitted a chrome refresh for the active block after it crossed the
     /// long-running threshold. Reset when the active command starts and finishes.
     did_notify_long_running: bool,
+    /// A pending command whose block shows only its output, without the
+    /// command line (e.g. `claude --resume <id>` from the Threads panel).
+    hidden_pending_command: Option<String>,
+    /// Close button floating over a lone Claude pane; see `claude_look`.
+    claude_close_button_mouse_state: MouseStateHandle,
 
     /// This field is an "&&" combination of two other pieces of state:
     ///   1. Whether this View (or one of its children) is the focused View.
@@ -4445,6 +4450,8 @@ impl TerminalView {
             view_id: ctx.view_id(),
             current_state: TerminalViewStateChange::default(),
             did_notify_long_running: false,
+            hidden_pending_command: None,
+            claude_close_button_mouse_state: Default::default(),
             is_focused_and_active: true,
             current_prompt,
             model_event_sender,
@@ -10058,6 +10065,16 @@ impl TerminalView {
         })
     }
 
+    /// Like [`Self::set_pending_command`], but the command stays out of the
+    /// input while the shell starts, and its block hides the command line and
+    /// shows only its output.
+    pub fn set_hidden_pending_command(&mut self, exec: &str, ctx: &mut ViewContext<Self>) {
+        self.hidden_pending_command = Some(exec.trim().to_owned());
+        self.input.update(ctx, |input, _| {
+            input.set_hidden_pending_command(exec);
+        });
+    }
+
     pub fn set_pending_command_queue(
         &mut self,
         commands: Vec<String>,
@@ -12540,6 +12557,14 @@ impl TerminalView {
                     return;
                 }
                 self.did_notify_long_running = false;
+
+                if self.hidden_pending_command.as_deref() == Some(command.trim()) {
+                    self.hidden_pending_command = None;
+                    let mut model = self.model.lock();
+                    if let Some(block) = model.block_list_mut().mut_block_from_id(block_id) {
+                        block.set_should_hide_command_grid(true);
+                    }
+                }
 
                 // Snapshot the prompt state as of when the command began executing.
                 // Commands may themselves affect the prompt (if running `git checkout`), for
@@ -29248,9 +29273,7 @@ impl View for TerminalView {
         };
 
         let element = if self.runs_claude(app) {
-            Container::new(element)
-                .with_background_color(claude_look::BACKGROUND)
-                .finish()
+            self.wrap_claude_pane(element, app)
         } else {
             element
         };

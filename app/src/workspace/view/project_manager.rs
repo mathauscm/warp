@@ -381,10 +381,11 @@ impl TypedActionView for ProjectManagerView {
                 }
             }
             ProjectManagerAction::OpenClaude(index) => {
-                if let Some(directory) = self.project_root(*index) {
+                if let Some(project) = self.projects.get(*index) {
                     ctx.dispatch_typed_action_deferred(WorkspaceAction::RunCommandInNewTab {
-                        directory,
+                        directory: project.root(),
                         command: NEW_THREAD_COMMAND.to_owned(),
+                        group: Some(project.name.clone()),
                     });
                 }
             }

@@ -217,17 +217,21 @@ impl ClaudeThreadsView {
             });
             return;
         }
-        let thread = self
-            .threads
-            .values()
-            .flatten()
-            .find(|thread| thread.session_id == session_id);
-        let Some(command) = thread.and_then(ClaudeThread::resume_command) else {
+        let Some((project, thread)) = self.threads.iter().find_map(|(project, threads)| {
+            let thread = threads
+                .iter()
+                .find(|thread| thread.session_id == session_id)?;
+            Some((project, thread))
+        }) else {
+            return;
+        };
+        let Some(command) = thread.resume_command() else {
             return;
         };
         ctx.dispatch_typed_action_deferred(WorkspaceAction::RunCommandInNewTab {
             directory: cwd.to_path_buf(),
             command,
+            group: Some(project_group_name(project)),
         });
     }
 
@@ -264,6 +268,12 @@ impl ClaudeThreadsView {
     }
 }
 
+/// Claude sessions opened from a project share a tab group named after its
+/// folder.
+fn project_group_name(project: &Path) -> String {
+    ThreadProject::new(project.to_path_buf()).name()
+}
+
 impl Entity for ClaudeThreadsView {
     type Event = ();
 }
@@ -288,6 +298,7 @@ impl TypedActionView for ClaudeThreadsView {
                 ctx.dispatch_typed_action_deferred(WorkspaceAction::RunCommandInNewTab {
                     directory: path.clone(),
                     command: NEW_THREAD_COMMAND.to_owned(),
+                    group: Some(project_group_name(path)),
                 });
             }
             ClaudeThreadsAction::OpenThread { session_id, cwd } => {
