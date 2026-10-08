@@ -9051,15 +9051,17 @@ impl Workspace {
             .active_tab_pane_group()
             .as_ref(ctx)
             .active_session_path(ctx);
-        self.run_command_in_new_tab(directory, CLAUDE_COMMAND, ctx);
+        self.run_command_in_new_tab(directory, CLAUDE_COMMAND, false, ctx);
     }
 
     /// Opens a new terminal tab in `directory` (the default one when `None`)
-    /// and runs `command` once its shell is ready.
+    /// and runs `command` once its shell is ready. With `hide_command`, the
+    /// block shows only the command's output, not the command line.
     fn run_command_in_new_tab(
         &mut self,
         directory: Option<PathBuf>,
         command: &str,
+        hide_command: bool,
         ctx: &mut ViewContext<Self>,
     ) {
         let options = NewTerminalOptions::default()
@@ -9073,7 +9075,11 @@ impl Workspace {
         );
         if let Some(terminal) = self.active_session_view(ctx) {
             terminal.update(ctx, |terminal, ctx| {
-                terminal.set_pending_command(command, ctx);
+                if hide_command {
+                    terminal.set_hidden_pending_command(command, ctx);
+                } else {
+                    terminal.set_pending_command(command, ctx);
+                }
             });
         }
     }
@@ -9778,6 +9784,43 @@ impl Workspace {
         self.project_manager_view.update(ctx, |view, ctx| {
             view.set_visible(open && content == VerticalTabsContent::Projects, ctx);
         });
+        ctx.notify();
+    }
+
+    /// Moves the active tab to the end of the tab group called `name`, creating
+    /// the group when there isn't one yet.
+    fn move_active_tab_to_named_group(&mut self, name: &str, ctx: &mut ViewContext<Self>) {
+        if !FeatureFlag::GroupedTabs.is_enabled() {
+            return;
+        }
+        let existing = self
+            .tab_groups
+            .values()
+            .find(|group| group.name.as_deref() == Some(name))
+            .map(|group| group.id);
+        let group_id = existing.unwrap_or_else(|| {
+            let mut group = TabGroup::new();
+            group.name = Some(name.to_owned());
+            let id = group.id;
+            self.tab_groups.insert(id, group);
+            id
+        });
+
+        let tab_index = self.active_tab_index;
+        let already_in_group = self
+            .tabs
+            .get(tab_index)
+            .is_some_and(|tab| tab.group_id == Some(group_id));
+        if !already_in_group {
+            let target_index = self.index_after_group(group_id).unwrap_or(self.tabs.len());
+            if let Some(tab) = self.tabs.get_mut(tab_index) {
+                tab.group_id = Some(group_id);
+                tab.pinned = false;
+            }
+            self.move_tab_to_index(tab_index, target_index, ctx);
+        }
+        self.expand_tab_group(group_id, ctx);
+        ctx.dispatch_global_action("workspace:save_app", ());
         ctx.notify();
     }
 
@@ -24893,8 +24936,17 @@ impl TypedActionView for Workspace {
                 self.open_directory_in_new_tab(path.clone(), ctx);
             }
             OpenClaudeSession => self.open_claude_session(ctx),
-            RunCommandInNewTab { directory, command } => {
-                self.run_command_in_new_tab(Some(directory.clone()), command, ctx);
+            RunCommandInNewTab {
+                directory,
+                command,
+                group,
+            } => {
+                // Threads and Projects open Claude Code without echoing
+                // `claude --resume <session id>` above it.
+                self.run_command_in_new_tab(Some(directory.clone()), command, true, ctx);
+                if let Some(name) = group {
+                    self.move_active_tab_to_named_group(name, ctx);
+                }
             }
             ToggleClaudeThreadsPanel => {
                 self.toggle_vertical_tabs_content(VerticalTabsContent::Threads, ctx);

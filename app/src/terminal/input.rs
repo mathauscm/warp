@@ -1733,6 +1733,9 @@ pub struct Input {
     /// If true, will submit the command in the editor to the shell upon receiving the
     /// precmd message.
     has_pending_command: bool,
+    /// A pending command kept out of the editor, so it isn't shown while the
+    /// shell starts; submitted instead of the editor's text.
+    hidden_pending_command: Option<String>,
     last_word_insertion: LastWordInsertion,
 
     ai_controller: ModelHandle<BlocklistAIController>,
@@ -4155,6 +4158,7 @@ impl Input {
             debounce_input_background_tx,
             debounce_ai_query_prediction_tx,
             has_pending_command: false,
+            hidden_pending_command: None,
             last_word_insertion,
             decorations_future_handle: None,
             autosuggestions_abort_handle: None,
@@ -7711,13 +7715,17 @@ impl Input {
             return;
         }
 
-        let command = self.get_command(ctx);
+        let command = match &self.hidden_pending_command {
+            Some(command) => command.clone(),
+            None => self.get_command(ctx),
+        };
         if self.can_execute_command(ctx).is_no() {
             return;
         }
 
         self.try_execute_command(&command, ctx);
         self.has_pending_command = false;
+        self.hidden_pending_command = None;
 
         self.editor.update(ctx, |editor, ctx| {
             editor.set_interaction_state(InteractionState::Editable, ctx);
@@ -13794,6 +13802,13 @@ impl Input {
     pub fn set_pending_command(&mut self, exec: &str, ctx: &mut ViewContext<Self>) {
         self.has_pending_command = true;
         self.system_insert(exec, ctx);
+    }
+
+    /// Like [`Self::set_pending_command`], but the command never shows in the
+    /// editor while waiting for the shell.
+    pub fn set_hidden_pending_command(&mut self, exec: &str) {
+        self.has_pending_command = true;
+        self.hidden_pending_command = Some(exec.to_owned());
     }
 
     fn should_enter_accept_completion_suggestion(&self, app: &AppContext) -> bool {

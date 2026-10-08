@@ -858,6 +858,9 @@ pub enum WorkspaceAction {
     RunCommandInNewTab {
         directory: PathBuf,
         command: String,
+        /// Tab group to put the new tab in, created when no group has this
+        /// name yet (e.g. the project folder of a Claude thread).
+        group: Option<String>,
     },
     /// Show the Threads panel (Claude Code conversations by project) in the
     /// vertical tabs sidebar, or hide it when it's already showing.

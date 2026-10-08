@@ -341,8 +341,8 @@ impl SnackbarHeader {
         }
 
         // Don't show the snackbar for background blocks, since they have no
-        // associated command.
-        if block.is_background() {
+        // associated command, nor for blocks whose command line is hidden.
+        if block.is_background() || block.should_hide_command_grid() {
             self.clear_state();
             return None;
         }
