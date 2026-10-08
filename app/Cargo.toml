@@ -288,6 +288,8 @@ objc2-app-kit = { workspace = true, features = [
 objc2-core-foundation.workspace = true
 objc2-foundation = { workspace = true, features = [
     "NSBundle",
+    "NSError",
+    "NSFileManager",
     "NSLocale",
     "NSPathUtilities",
     "NSString",

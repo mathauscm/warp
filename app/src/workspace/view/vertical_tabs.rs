@@ -713,7 +713,6 @@ pub(super) struct VerticalTabsPanelState {
     new_tab_button_state: MouseStateHandle,
     pub(super) search_query: String,
     settings_button_mouse_state: MouseStateHandle,
-    file_explorer_button_mouse_state: MouseStateHandle,
     panes_segment_mouse_state: MouseStateHandle,
     tabs_segment_mouse_state: MouseStateHandle,
     focused_session_option_mouse_state: MouseStateHandle,
@@ -752,7 +751,6 @@ impl Default for VerticalTabsPanelState {
             new_tab_button_state: Default::default(),
             search_query: String::new(),
             settings_button_mouse_state: Default::default(),
-            file_explorer_button_mouse_state: Default::default(),
             panes_segment_mouse_state: Default::default(),
             tabs_segment_mouse_state: Default::default(),
             focused_session_option_mouse_state: Default::default(),
@@ -1441,7 +1439,6 @@ fn render_control_bar(
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_spacing(CONTROL_BAR_SPACING)
             .with_child(Shrinkable::new(1., search_bar).finish())
-            .with_child(render_file_explorer_button(state, appearance))
             .with_child(ChildView::new(&workspace.worktree_selector).finish())
             .with_child(settings_button)
             .with_child(new_tab_button)
@@ -1579,61 +1576,6 @@ fn render_settings_button(
     SavePosition::new(button, VERTICAL_TABS_SETTINGS_BUTTON_POSITION_ID).finish()
 }
 
-/// Icon button that toggles the project explorer, available with or without a
-/// CLI agent running.
-fn render_file_explorer_button(
-    state: &VerticalTabsPanelState,
-    appearance: &Appearance,
-) -> Box<dyn Element> {
-    let theme = appearance.theme();
-    let sub_text = theme.sub_text_color(theme.background());
-    let ui_builder = appearance.ui_builder().clone();
-
-    Hoverable::new(
-        state.file_explorer_button_mouse_state.clone(),
-        move |hover_state| {
-            let icon = ConstrainedBox::new(WarpIcon::FileCopy.to_warpui_icon(sub_text).finish())
-                .with_width(16.)
-                .with_height(16.)
-                .finish();
-            let background = if hover_state.is_hovered() {
-                internal_colors::fg_overlay_2(theme)
-            } else {
-                ThemeFill::Solid(ColorU::transparent_black())
-            };
-            let button = Container::new(icon)
-                .with_padding(Padding::uniform(2.))
-                .with_background(background)
-                .with_corner_radius(CornerRadius::with_all(CONTROL_BAR_BUTTON_RADIUS))
-                .finish();
-
-            if !hover_state.is_hovered() {
-                return button;
-            }
-            let tooltip = ui_builder
-                .tool_tip("File explorer".to_string())
-                .build()
-                .finish();
-            let mut stack = Stack::new().with_child(button);
-            stack.add_positioned_overlay_child(
-                tooltip,
-                OffsetPositioning::offset_from_parent(
-                    vec2f(0., 4.),
-                    ParentOffsetBounds::WindowByPosition,
-                    ParentAnchor::BottomMiddle,
-                    ChildAnchor::TopMiddle,
-                ),
-            );
-            stack.finish()
-        },
-    )
-    .on_click(|ctx, _, _| {
-        ctx.dispatch_typed_action(WorkspaceAction::ToggleProjectExplorer);
-    })
-    .with_cursor(Cursor::PointingHand)
-    .finish()
-}
-
 fn render_new_tab_button(
     state: &VerticalTabsPanelState,
     workspace: &Workspace,
@@ -1736,6 +1678,24 @@ fn render_vertical_tabs_panel(
     let appearance = Appearance::as_ref(app);
     let theme = appearance.theme();
 
+    // Threads and Projects take the place of the tab list (see
+    // `claude_threads` and `project_manager`).
+    let other_content = match workspace.vertical_tabs_content {
+        super::VerticalTabsContent::Tabs => None,
+        super::VerticalTabsContent::Threads => {
+            Some(ChildView::new(&workspace.claude_threads_view).finish())
+        }
+        super::VerticalTabsContent::Projects => {
+            Some(ChildView::new(&workspace.project_manager_view).finish())
+        }
+    };
+    if let Some(content) = other_content {
+        let content = Container::new(content)
+            .with_background(internal_colors::fg_overlay_1(theme))
+            .finish();
+        return render_resizable_panel(state, side, content);
+    }
+
     let scrollable_groups = ClippedScrollable::vertical(
         state.scroll_state.clone(),
         render_groups(state, workspace, app),
@@ -1783,10 +1743,6 @@ fn render_vertical_tabs_panel(
     // with None and silently dropping all clicks on the popup items.
     let panel_with_popup: Box<dyn Element> = panel_content;
 
-    let drag_side = match side {
-        super::PanelPosition::Left => DragBarSide::Right,
-        super::PanelPosition::Right => DragBarSide::Left,
-    };
     // Wrap the panel in a `Hoverable` so right-clicking the empty area of the
     // vertical tabs panel opens the tab configs dropdown.
     let inner = Hoverable::new(state.panel_right_click_mouse_state.clone(), |_| {
@@ -1810,6 +1766,19 @@ fn render_vertical_tabs_panel(
     .with_defer_events_to_children()
     .finish();
 
+    render_resizable_panel(state, side, inner)
+}
+
+/// Lets the panel be resized by dragging its inner edge.
+fn render_resizable_panel(
+    state: &VerticalTabsPanelState,
+    side: super::PanelPosition,
+    inner: Box<dyn Element>,
+) -> Box<dyn Element> {
+    let drag_side = match side {
+        super::PanelPosition::Left => DragBarSide::Right,
+        super::PanelPosition::Right => DragBarSide::Left,
+    };
     Resizable::new(state.resizable_state.clone(), inner)
         .with_dragbar_side(drag_side)
         .on_resize(|ctx, _| {

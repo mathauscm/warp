@@ -419,6 +419,18 @@ impl CLIAgentSessionsModel {
         self.sessions.get(&terminal_view_id)
     }
 
+    /// The terminal running the agent conversation with this session id (as
+    /// reported by the agent's plugin), if any.
+    pub fn session_by_agent_session_id(
+        &self,
+        session_id: &str,
+    ) -> Option<(EntityId, &CLIAgentSession)> {
+        self.sessions
+            .iter()
+            .find(|(_, session)| session.session_context.session_id.as_deref() == Some(session_id))
+            .map(|(terminal_view_id, session)| (*terminal_view_id, session))
+    }
+
     /// Returns `true` if the rich input editor is currently open for this terminal.
     pub fn is_input_open(&self, terminal_view_id: EntityId) -> bool {
         self.sessions
