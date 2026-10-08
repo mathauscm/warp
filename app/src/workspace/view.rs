@@ -1109,6 +1109,9 @@ pub struct Workspace {
     worktree_selector: ViewHandle<WorktreeSelector>,
     /// Set while a dragged tab hovers a pane of the active tab; see `tab_merge`.
     tab_merge_target: Option<tab_merge::TabMergeTarget>,
+    /// Set while a Claude thread dragged from the Threads panel hovers a pane
+    /// of the active tab; see `tab_merge`.
+    thread_split_target: Option<tab_merge::PaneDropTarget>,
     /// Claude Code conversations by project; see `claude_threads`.
     claude_threads_view: ViewHandle<claude_threads::ClaudeThreadsView>,
     /// Saved projects by tag; see `project_manager`.
@@ -3538,6 +3541,7 @@ impl Workspace {
             show_new_session_dropdown_menu: None,
             worktree_selector,
             tab_merge_target: None,
+            thread_split_target: None,
             claude_threads_view,
             project_manager_view,
             vertical_tabs_content: VerticalTabsContent::Tabs,
@@ -9749,7 +9753,7 @@ impl Workspace {
         ctx.notify();
     }
 
-    /// Header "Threads" and "Projetos" buttons: show that content in the
+    /// Header "Threads" and "Projects" buttons: show that content in the
     /// vertical tabs sidebar, or close the sidebar when it's already showing it.
     fn toggle_vertical_tabs_content(
         &mut self,
@@ -9822,6 +9826,47 @@ impl Workspace {
         self.expand_tab_group(group_id, ctx);
         ctx.dispatch_global_action("workspace:save_app", ());
         ctx.notify();
+    }
+
+    /// Opens a project picked in the Projects panel like VS Code opens a
+    /// folder: a new tab in it, the Projects panel out of the way and the file
+    /// explorer showing the project.
+    fn open_project_folder(&mut self, path: PathBuf, ctx: &mut ViewContext<Self>) {
+        self.open_directory_in_new_tab(path, ctx);
+        if self.vertical_tabs_panel_open
+            && self.vertical_tabs_content == VerticalTabsContent::Projects
+        {
+            self.toggle_vertical_tabs_content(VerticalTabsContent::Projects, ctx);
+        }
+        if *CodeSettings::as_ref(ctx).show_project_explorer {
+            self.open_left_panel_view(&LeftPanelAction::ProjectExplorer, ctx);
+        }
+    }
+
+    /// Opens a project in a new window, like the Project Manager extension's
+    /// "Open in New Window": a terminal in its folder and the file explorer
+    /// showing it. The current window stays as it is.
+    fn open_project_in_new_window(path: PathBuf, ctx: &mut ViewContext<Self>) {
+        let options = NewTerminalOptions::default()
+            .with_initial_directory(path)
+            .with_homepage_hidden();
+        let (window_id, _) = crate::root_view::open_new_with_workspace_source(
+            NewWorkspaceSource::Session {
+                options: Box::new(options),
+                initial_team_uid: None,
+            },
+            ctx,
+        );
+        ctx.windows().show_window_and_focus_app(window_id);
+        if *CodeSettings::as_ref(ctx).show_project_explorer
+            && let Some(workspace) = ctx
+                .views_of_type::<Workspace>(window_id)
+                .and_then(|workspaces| workspaces.into_iter().next())
+        {
+            workspace.update(ctx, |workspace, ctx| {
+                workspace.open_left_panel_view(&LeftPanelAction::ProjectExplorer, ctx);
+            });
+        }
     }
 
     /// Saves the active tab's folder in the Projects panel.
@@ -21071,7 +21116,7 @@ impl Workspace {
                     icons::Icon::Folder,
                     &self.mouse_states.project_manager_button,
                     WorkspaceAction::ToggleProjectManagerPanel,
-                    "Projetos".to_string(),
+                    "Projects".to_string(),
                     keybinding_name_to_display_string(TOGGLE_PROJECT_MANAGER_BINDING_NAME, ctx),
                     self.vertical_tabs_panel_open
                         && self.vertical_tabs_content == VerticalTabsContent::Projects,
@@ -24955,6 +25000,17 @@ impl TypedActionView for Workspace {
                 self.toggle_vertical_tabs_content(VerticalTabsContent::Projects, ctx);
             }
             SaveActiveDirectoryAsProject => self.save_active_directory_as_project(ctx),
+            OpenProjectFolder { path } => self.open_project_folder(path.clone(), ctx),
+            OpenProjectInNewWindow { path } => {
+                Self::open_project_in_new_window(path.clone(), ctx);
+            }
+            DragClaudeThread { position } => {
+                self.update_thread_split_target(position.center(), ctx);
+            }
+            DropClaudeThread {
+                session_id,
+                command,
+            } => self.drop_thread(session_id, command.as_deref(), ctx),
             OpenFileInSplitPane { path } => {
                 self.open_file_with_target(
                     path.clone(),
@@ -25240,6 +25296,9 @@ impl TypedActionView for Workspace {
             }
             DropGroup => {
                 send_telemetry_from_ctx!(TelemetryEvent::DragAndDropTabGroup, ctx);
+                if let Some(target) = self.take_tab_merge_target() {
+                    self.merge_tab_into_pane(target, ctx);
+                }
                 ctx.notify();
             }
             OpenWarpDrive => {
@@ -29866,6 +29925,11 @@ impl Workspace {
         let Some((first, last)) = group_member_index_range(&self.tabs, group_id) else {
             return;
         };
+        // Over a pane of the active tab, dropping a single-tab group merges its
+        // tab there (see `tab_merge`) instead of reordering the group.
+        if self.update_group_merge_target(group_id, cursor_position, ctx) {
+            return;
+        }
         // Reorders that would carry the block across the pinned/unpinned
         // boundary are skipped below: a pinned group must stay in the pinned
         // prefix and an unpinned group must stay out of it.

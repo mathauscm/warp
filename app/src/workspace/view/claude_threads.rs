@@ -19,10 +19,12 @@ use warp_core::ui::theme::color::internal_colors;
 use warpui::r#async::Timer;
 use warpui::elements::{
     ChildAnchor, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox, Container,
-    CornerRadius, CrossAxisAlignment, Element, Fill as ElementFill, Flex, Hoverable,
-    MainAxisAlignment, MainAxisSize, MouseStateHandle, OffsetPositioning, Padding, ParentAnchor,
-    ParentElement, ParentOffsetBounds, Radius, ScrollbarWidth, Shrinkable, Stack, Text,
+    CornerRadius, CrossAxisAlignment, DragAxis, Draggable, DraggableState, Element,
+    Fill as ElementFill, Flex, Hoverable, MainAxisAlignment, MainAxisSize, MouseStateHandle,
+    OffsetPositioning, Padding, ParentAnchor, ParentElement, ParentOffsetBounds, Radius,
+    SavePosition, ScrollbarWidth, Shrinkable, Stack, Text,
 };
+use warpui::geometry::rect::RectF;
 use warpui::platform::{Cursor, FilePickerConfiguration};
 use warpui::prelude::Align;
 use warpui::text_layout::ClipConfig;
@@ -62,8 +64,14 @@ const META_FONT_SIZE: f32 = 10.;
 const META_WIDTH: f32 = 52.;
 const META_HEIGHT: f32 = ACTION_ICON_SIZE + 2. * ACTION_BUTTON_PADDING;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ClaudeThreadsAction {
+    /// A project's header row is being dragged to reorder the projects.
+    DragProject {
+        path: PathBuf,
+        position: RectF,
+    },
+    DropProject,
     AddProject,
     RemoveProject(PathBuf),
     ToggleProjectCollapsed(PathBuf),
@@ -97,6 +105,9 @@ pub struct ClaudeThreadsView {
     scroll_state: ClippedScrollStateHandle,
     /// Hover state of each row and button, keyed by what it belongs to.
     mouse_states: RefCell<HashMap<String, MouseStateHandle>>,
+    /// Drag state of each project header and thread row, keyed like
+    /// `mouse_states`.
+    drag_states: RefCell<HashMap<String, DraggableState>>,
 }
 
 impl ClaudeThreadsView {
@@ -118,6 +129,7 @@ impl ClaudeThreadsView {
             pending_delete: None,
             scroll_state: ClippedScrollStateHandle::default(),
             mouse_states: RefCell::new(HashMap::new()),
+            drag_states: RefCell::new(HashMap::new()),
         }
     }
 
@@ -266,6 +278,45 @@ impl ClaudeThreadsView {
             .or_default()
             .clone()
     }
+
+    fn drag_state(&self, key: String) -> DraggableState {
+        self.drag_states
+            .borrow_mut()
+            .entry(key)
+            .or_default()
+            .clone()
+    }
+
+    /// Moves the dragged project to the slot of the project block under the
+    /// cursor. The order is saved when the drag ends.
+    fn drag_project(&mut self, path: &Path, position: RectF, ctx: &mut ViewContext<Self>) {
+        let Some(from) = self.projects.iter().position(|p| p.path == path) else {
+            return;
+        };
+        let cursor_y = position.center().y();
+        let to = self.projects.iter().position(|project| {
+            ctx.element_position_by_id(project_block_position_id(&project.path))
+                .is_some_and(|rect| rect.min_y() <= cursor_y && cursor_y < rect.max_y())
+        });
+        if let Some(to) = to
+            && to != from
+        {
+            let project = self.projects.remove(from);
+            self.projects.insert(to, project);
+            ctx.notify();
+        }
+    }
+}
+
+/// Save-position id of a project's block (header and threads), used to find
+/// where a dragged project would land.
+fn project_block_position_id(path: &Path) -> String {
+    format!("claude_threads_project_block:{}", path.display())
+}
+
+/// Quotes `path` for a POSIX shell.
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }
 
 /// Claude sessions opened from a project share a tab group named after its
@@ -311,6 +362,13 @@ impl TypedActionView for ClaudeThreadsView {
             }
             ClaudeThreadsAction::ConfirmDeleteThread(session_id) => {
                 self.delete_thread(session_id, ctx);
+            }
+            ClaudeThreadsAction::DragProject { path, position } => {
+                self.drag_project(path, *position, ctx);
+            }
+            ClaudeThreadsAction::DropProject => {
+                self.save_projects();
+                ctx.notify();
             }
             ClaudeThreadsAction::CancelDeleteThread => {
                 self.pending_delete = None;
@@ -367,10 +425,18 @@ impl View for ClaudeThreadsView {
         }
         let now = SystemTime::now();
         for project in &self.projects {
-            list.add_child(self.render_project_row(project, palette, appearance));
+            let mut block = Flex::column()
+                .with_main_axis_size(MainAxisSize::Min)
+                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                .with_spacing(ROW_SPACING)
+                .with_child(self.render_project_row(project, palette, appearance));
             if !project.collapsed {
-                self.add_thread_rows(&mut list, project, now, palette, appearance, app);
+                self.add_thread_rows(&mut block, project, now, palette, appearance, app);
             }
+            list.add_child(
+                SavePosition::new(block.finish(), &project_block_position_id(&project.path))
+                    .finish(),
+            );
         }
 
         let scrollable = ClippedScrollable::vertical(
@@ -457,8 +523,9 @@ impl ClaudeThreadsView {
             palette,
             appearance,
         );
+        let drag_path = path.clone();
 
-        Hoverable::new(
+        let row = Hoverable::new(
             self.mouse_state(format!("project:{key}")),
             move |hover_state| {
                 let mut buttons = Flex::row()
@@ -501,7 +568,21 @@ impl ClaudeThreadsView {
             ctx.dispatch_typed_action(ClaudeThreadsAction::ToggleProjectCollapsed(path.clone()));
         })
         .with_defer_events_to_children()
-        .finish()
+        .finish();
+
+        // Dragging the header up or down reorders the projects.
+        Draggable::new(self.drag_state(format!("project:{key}")), row)
+            .on_drag(move |ctx, _, position, _| {
+                ctx.dispatch_typed_action(ClaudeThreadsAction::DragProject {
+                    path: drag_path.clone(),
+                    position,
+                });
+            })
+            .on_drop(|ctx, _, _, _| {
+                ctx.dispatch_typed_action(ClaudeThreadsAction::DropProject);
+            })
+            .with_drag_axis(DragAxis::VerticalOnly)
+            .finish()
     }
 
     fn add_thread_rows(
@@ -588,10 +669,14 @@ impl ClaudeThreadsView {
             .is_ok_and(|age| age < RECENTLY_ACTIVE)
             || thread.updated_at > now;
         let can_delete = running_session.is_none() && !recently_active;
-        let status_color = running_session.map(|(_, session)| match session.status {
-            CLIAgentSessionStatus::InProgress => palette.working,
-            CLIAgentSessionStatus::Blocked { .. } => palette.claude,
-            _ => palette.sub_text,
+        let status_color = running_session.map(|(_, session)| {
+            if matches!(session.status, CLIAgentSessionStatus::Blocked { .. }) {
+                palette.claude
+            } else if session.is_working_on_prompt() {
+                palette.working
+            } else {
+                palette.sub_text
+            }
         });
         let title = thread.title.clone();
         let age = claude_threads::format_age(thread.updated_at, now);
@@ -631,8 +716,14 @@ impl ClaudeThreadsView {
                 ),
             ]
         });
+        // Dropped on a pane, a thread already open moves its pane there; any
+        // other resumes in a new split from its folder.
+        let drop_command = thread
+            .resume_command()
+            .map(|resume| format!("cd {} && {resume}", shell_quote(&thread.cwd)));
+        let is_running = running_session.is_some();
 
-        Hoverable::new(
+        let row = Hoverable::new(
             self.mouse_state(format!("thread:{session_id}")),
             move |hover_state| {
                 let mut meta = Flex::row()
@@ -712,7 +803,26 @@ impl ClaudeThreadsView {
             ctx.dispatch_typed_action(action.clone());
         })
         .with_defer_events_to_children()
-        .finish()
+        .finish();
+
+        // Dragging a thread onto a pane of the active tab splits it there (see
+        // `tab_merge`): an open thread moves its pane, so the same conversation
+        // never runs twice.
+        if drop_command.is_none() && !is_running {
+            return row;
+        }
+        let drop_session_id = session_id.clone();
+        Draggable::new(self.drag_state(format!("thread:{session_id}")), row)
+            .on_drag(|ctx, _, position, _| {
+                ctx.dispatch_typed_action(WorkspaceAction::DragClaudeThread { position });
+            })
+            .on_drop(move |ctx, _, _, _| {
+                ctx.dispatch_typed_action(WorkspaceAction::DropClaudeThread {
+                    session_id: drop_session_id.clone(),
+                    command: drop_command.clone(),
+                });
+            })
+            .finish()
     }
 }
 

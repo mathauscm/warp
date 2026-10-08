@@ -2989,7 +2989,8 @@ impl Input {
                     me.select_image(ctx);
                 }
                 AgentInputFooterEvent::StartRemoteControl
-                | AgentInputFooterEvent::StopRemoteControl => {
+                | AgentInputFooterEvent::StopRemoteControl
+                | AgentInputFooterEvent::StartClaudeRemoteControl => {
                     // Handled by UseAgentToolbar's subscription, not here.
                 }
                 // These events are handled by UseAgentToolbar's subscription.

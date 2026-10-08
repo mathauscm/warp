@@ -5,6 +5,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::ops::Range;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use ai::diff_validation::DiffDelta;
 use lazy_static::lazy_static;
@@ -292,6 +294,9 @@ pub struct CodeEditorView {
     /// Bumped on every syntax highlighting update so the minimap rebuilds.
     minimap_highlight_generation: u64,
     minimap_cache: RefCell<Option<((BufferVersion, u64), MinimapLines)>>,
+    /// Whether the minimap slider is being dragged; kept here so the drag
+    /// outlives the re-renders it triggers.
+    minimap_dragging: Arc<AtomicBool>,
 }
 
 impl CodeEditorView {
@@ -443,6 +448,7 @@ impl CodeEditorView {
             window_id: ctx.window_id(),
             minimap_highlight_generation: 0,
             minimap_cache: Default::default(),
+            minimap_dragging: Default::default(),
         }
     }
 
@@ -2410,6 +2416,7 @@ impl View for CodeEditorView {
                 render_state.clone(),
                 vscode_appearance::palette().map(|palette| palette.background),
                 theme.main_text_color(theme.background()).into_solid(),
+                self.minimap_dragging.clone(),
             );
             Flex::row()
                 .with_cross_axis_alignment(CrossAxisAlignment::Stretch)

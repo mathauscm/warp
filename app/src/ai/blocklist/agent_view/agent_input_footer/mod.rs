@@ -132,6 +132,8 @@ const FAST_FORWARD_LOCKED_TOOLTIP: &str =
     "Fast forward is always enabled for cloud agent conversations";
 
 const START_REMOTE_CONTROL_TOOLTIP: &str = "Start remote control";
+const CLAUDE_REMOTE_TOOLTIP: &str =
+    "Controlar esta sessão pelo celular ou claude.ai/code (/remote-control do Claude Code)";
 const START_REMOTE_CONTROL_LOGIN_REQUIRED_TOOLTIP: &str = "Log in to use /remote-control";
 
 const LIVE_REMOTE_VM_INDICATOR_TOOLTIP: &str = "Connected to a live cloud agent session. Your next prompt continues on the running remote machine.";
@@ -202,6 +204,9 @@ pub struct AgentInputFooter {
     file_button: ViewHandle<ActionButton>,
     start_remote_control_button: ViewHandle<ActionButton>,
     stop_remote_control_button: ViewHandle<ActionButton>,
+    /// Runs Claude Code's own `/remote-control`; replaces Warp's remote
+    /// control chip in Claude Code panes.
+    claude_remote_button: ViewHandle<ActionButton>,
     context_window_button: ViewHandle<ActionButton>,
     usage_button: ViewHandle<ActionButton>,
     /// Non-interactive indicators for a cloud follow-up pane: one shown when attached to a live
@@ -681,6 +686,17 @@ impl AgentInputFooter {
                 })
         });
 
+        let claude_remote_button = ctx.add_typed_action_view(|_ctx| {
+            ActionButton::new("Claude Remote", RemoteControlButtonTheme)
+                .with_icon(Icon::Phone01)
+                .with_tooltip(CLAUDE_REMOTE_TOOLTIP)
+                .with_size(cli_button_size)
+                .with_tooltip_alignment(TooltipAlignment::Left)
+                .on_click(|ctx| {
+                    ctx.dispatch_typed_action(AgentInputFooterAction::StartClaudeRemoteControl);
+                })
+        });
+
         let stop_remote_control_button = ctx.add_typed_action_view(|_ctx| {
             ActionButton::new("Stop sharing", RemoteControlButtonTheme)
                 .with_icon(Icon::StopFilled)
@@ -990,6 +1006,7 @@ impl AgentInputFooter {
             rich_input_button,
             settings_button,
             start_remote_control_button,
+            claude_remote_button,
             stop_remote_control_button,
             install_plugin_button,
             plugin_instructions_button,
@@ -1632,6 +1649,12 @@ impl AgentInputFooter {
             AgentToolbarItemKind::ShareSession => {
                 if is_conversation_transcript_context {
                     return None;
+                }
+                // Claude Code panes offer Claude's own remote control instead
+                // of Warp's session sharing, unless Warp is sharing right now
+                // (so it can still be stopped here).
+                if self.cli_agent(app) == Some(CLIAgent::Claude) && !shared_status.is_sharer() {
+                    return Some(ChildView::new(&self.claude_remote_button).finish());
                 }
                 let enabled = FeatureFlag::CreatingSharedSessions.is_enabled()
                     && FeatureFlag::HOARemoteControl.is_enabled()
@@ -2692,6 +2715,8 @@ pub enum AgentInputFooterAction {
     DismissPluginChip,
     StartRemoteControl,
     StopRemoteControl,
+    /// The "Claude Remote" chip: run Claude Code's `/remote-control`.
+    StartClaudeRemoteControl,
     OpenCodingAgentSettings,
     /// User clicked the "Hand off to cloud" footer chip. The terminal `Input`
     /// subscriber decides whether to dispatch the immediate empty-prompt
@@ -2874,6 +2899,9 @@ impl TypedActionView for AgentInputFooter {
             AgentInputFooterAction::StopRemoteControl => {
                 ctx.emit(AgentInputFooterEvent::StopRemoteControl);
             }
+            AgentInputFooterAction::StartClaudeRemoteControl => {
+                ctx.emit(AgentInputFooterEvent::StartClaudeRemoteControl);
+            }
             AgentInputFooterAction::OpenCodingAgentSettings => {
                 #[cfg(not(target_family = "wasm"))]
                 ctx.dispatch_typed_action_deferred(WorkspaceAction::ScrollToSettingsWidget {
@@ -2934,6 +2962,7 @@ pub enum AgentInputFooterEvent {
     ToggleFileExplorer(Option<CLIAgent>),
     StartRemoteControl,
     StopRemoteControl,
+    StartClaudeRemoteControl,
     OpenRichInput,
     HideRichInput,
     ToggledChipMenu {

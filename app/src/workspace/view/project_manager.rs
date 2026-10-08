@@ -1,11 +1,11 @@
 //! Projects panel of the vertical tabs sidebar: saved project folders grouped
 //! by tag, like the "Project Manager" VS Code extension (see
 //! `crate::project_manager`). It takes the place of the tab list while the
-//! header "Projetos" button is active.
+//! header "Projects" button is active.
 //!
 //! Clicking a project opens a new tab in its folder. On hover a project offers
-//! Claude Code in its folder, editing its tags, renaming, revealing it in
-//! Finder and removing it from the list.
+//! Claude Code in its folder, editing its tags, renaming, opening it in a new
+//! window and removing it from the list.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -19,7 +19,7 @@ use warp_core::ui::theme::color::internal_colors;
 use warpui::r#async::Timer;
 use warpui::elements::{
     ChildAnchor, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox, Container,
-    CornerRadius, CrossAxisAlignment, Element, Fill as ElementFill, Flex, Hoverable,
+    CornerRadius, CrossAxisAlignment, Element, Empty, Fill as ElementFill, Flex, Hoverable,
     MainAxisAlignment, MainAxisSize, MouseStateHandle, OffsetPositioning, Padding, ParentAnchor,
     ParentElement, ParentOffsetBounds, Radius, ScrollbarWidth, Shrinkable, Stack, Text, Wrap,
 };
@@ -66,7 +66,7 @@ pub enum ProjectManagerAction {
     ToggleTagCollapsed(String),
     OpenProject(usize),
     OpenClaude(usize),
-    RevealInFinder(usize),
+    OpenInNewWindow(usize),
     StartRename(usize),
     StartEditTags(usize),
     RemoveProject(usize),
@@ -375,9 +375,7 @@ impl TypedActionView for ProjectManagerView {
             }
             ProjectManagerAction::OpenProject(index) => {
                 if let Some(path) = self.project_root(*index) {
-                    ctx.dispatch_typed_action_deferred(WorkspaceAction::OpenDirectoryInNewTab {
-                        path,
-                    });
+                    ctx.dispatch_typed_action_deferred(WorkspaceAction::OpenProjectFolder { path });
                 }
             }
             ProjectManagerAction::OpenClaude(index) => {
@@ -389,9 +387,11 @@ impl TypedActionView for ProjectManagerView {
                     });
                 }
             }
-            ProjectManagerAction::RevealInFinder(index) => {
+            ProjectManagerAction::OpenInNewWindow(index) => {
                 if let Some(path) = self.project_root(*index) {
-                    ctx.dispatch_typed_action_deferred(WorkspaceAction::OpenInExplorer { path });
+                    ctx.dispatch_typed_action_deferred(WorkspaceAction::OpenProjectInNewWindow {
+                        path,
+                    });
                 }
             }
             ProjectManagerAction::StartRename(index) => {
@@ -560,11 +560,11 @@ impl View for ProjectManagerView {
 }
 
 impl ProjectManagerView {
-    /// "Projetos (N)" with the panel actions, in the extension's order.
+    /// "Projects (N)" with the panel actions, in the extension's order.
     fn render_header(&self, palette: Palette, appearance: &Appearance) -> Box<dyn Element> {
         let enabled = self.projects.iter().filter(|p| p.enabled).count();
         let title = Text::new_inline(
-            format!("Projetos ({enabled})"),
+            format!("Projects ({enabled})"),
             appearance.ui_font_family(),
             TITLE_FONT_SIZE,
         )
@@ -832,8 +832,8 @@ impl ProjectManagerView {
             ),
             (
                 WarpIcon::LinkExternal,
-                "Revelar no Finder",
-                ProjectManagerAction::RevealInFinder(index),
+                "Abrir em nova janela",
+                ProjectManagerAction::OpenInNewWindow(index),
             ),
             (
                 WarpIcon::X,
@@ -879,7 +879,9 @@ impl ProjectManagerView {
                 .with_cross_axis_alignment(CrossAxisAlignment::Center)
                 .with_spacing(ICON_TEXT_GAP)
                 .with_child(Shrinkable::new(1., label).finish());
-            if hover_state.is_hovered() && !is_editing {
+            // The buttons' height is always reserved, so they can appear on
+            // hover without making the row taller.
+            let buttons: Box<dyn Element> = if hover_state.is_hovered() && !is_editing {
                 let mut buttons = Flex::row()
                     .with_main_axis_size(MainAxisSize::Min)
                     .with_cross_axis_alignment(CrossAxisAlignment::Center)
@@ -887,8 +889,15 @@ impl ProjectManagerView {
                 for button in action_buttons {
                     buttons.add_child(button);
                 }
-                row.add_child(buttons.finish());
-            }
+                buttons.finish()
+            } else {
+                Empty::new().finish()
+            };
+            row.add_child(
+                ConstrainedBox::new(buttons)
+                    .with_height(ACTION_ICON_SIZE + 2. * ACTION_BUTTON_PADDING)
+                    .finish(),
+            );
             let row = Container::new(row.finish())
                 .with_padding_left(indent)
                 .finish();

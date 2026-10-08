@@ -2484,7 +2484,11 @@ impl BackingView for CodeView {
         ctx: &view::HeaderRenderContext<'_>,
         app: &AppContext,
     ) -> view::HeaderContent {
-        if self.tab_group.len() >= 2 {
+        // A single code file shows its tab too, like VS Code; Markdown keeps the
+        // centered header, which holds its view-mode toggle.
+        let use_tab_bar = self.tab_group.len() >= 2
+            || (self.tab_group.len() == 1 && self.markdown_mode_segmented_control.is_none());
+        if use_tab_bar {
             // Multi-tab case: render custom tab bar with explicit draggable handling
             view::HeaderContent::Custom {
                 element: self.render_tab_bar_with_draggable(ctx, app),
