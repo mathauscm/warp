@@ -853,6 +853,25 @@ pub enum WorkspaceAction {
     },
     /// Run `claude` in the active terminal when it's idle, otherwise in a new tab.
     OpenClaudeSession,
+    /// Open a new terminal tab in `directory` and run `command` in it (used by
+    /// the Threads panel to start or resume Claude Code conversations).
+    RunCommandInNewTab {
+        directory: PathBuf,
+        command: String,
+    },
+    /// Show the Threads panel (Claude Code conversations by project) in the
+    /// vertical tabs sidebar, or hide it when it's already showing.
+    ToggleClaudeThreadsPanel,
+    /// Show the Projects panel (saved projects by tag) in the vertical tabs
+    /// sidebar, or hide it when it's already showing.
+    ToggleProjectManagerPanel,
+    /// Save the active tab's folder in the Projects panel.
+    SaveActiveDirectoryAsProject,
+    /// Open a file in the code editor, split to the right of the active pane
+    /// (so it gets a close button even while the tab list is hidden).
+    OpenFileInSplitPane {
+        path: PathBuf,
+    },
     SaveCurrentTabAsNewConfig(usize),
     SyncTrafficLights,
     /// Opens a tab config file in the editor and dismisses the associated error toast.
@@ -1117,6 +1136,11 @@ impl WorkspaceAction {
             | OpenWorktreeInRepo { .. }
             | OpenDirectoryInNewTab { .. }
             | OpenClaudeSession
+            | RunCommandInNewTab { .. }
+            | ToggleClaudeThreadsPanel
+            | ToggleProjectManagerPanel
+            | SaveActiveDirectoryAsProject
+            | OpenFileInSplitPane { .. }
             | OpenWorktreeAddRepoPicker
             | Crash
             | Panic

@@ -2,6 +2,7 @@ pub(crate) mod agent_cli_launch_modal;
 pub(crate) mod auto_handoff_sleep_modal;
 mod build_plan_migration_modal;
 pub(crate) mod chatgpt_plan_modal;
+mod claude_threads;
 pub(crate) mod cloud_agent_capacity_modal;
 pub(crate) mod codex_modal;
 pub mod conversation_list;
@@ -15,6 +16,7 @@ pub(crate) mod left_panel;
 pub(crate) mod onboarding;
 pub(crate) mod openwarp_launch_modal;
 pub(crate) mod orchestration_launch_modal;
+mod project_manager;
 pub(crate) mod right_panel;
 mod startup_directory;
 mod tab_grouping;
@@ -700,6 +702,9 @@ pub(crate) const NEW_WINDOW_BINDING_NAME: &str = "workspace:new_window";
 pub(crate) const NEW_AGENT_TAB_BINDING_NAME: &str = "workspace:new_agent_tab";
 pub(crate) const NEW_AMBIENT_AGENT_TAB_BINDING_NAME: &str = "workspace:new_ambient_agent_tab";
 pub(crate) const TOGGLE_TAB_CONFIGS_MENU_BINDING_NAME: &str = "workspace:toggle_tab_configs_menu";
+pub(crate) const TOGGLE_CLAUDE_THREADS_BINDING_NAME: &str = "workspace:toggle_claude_threads";
+pub(crate) const TOGGLE_PROJECT_MANAGER_BINDING_NAME: &str = "workspace:toggle_project_manager";
+pub(crate) const OPEN_CLAUDE_SESSION_BINDING_NAME: &str = "workspace:open_claude_session";
 
 // Editable left panel toolbelt keybindings.
 pub(crate) const LEFT_PANEL_PROJECT_EXPLORER_BINDING_NAME: &str =
@@ -1046,6 +1051,17 @@ enum TabBarSlot {
     },
 }
 
+/// What the vertical tabs sidebar shows. The header buttons for tabs, Threads
+/// and Projects switch between them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VerticalTabsContent {
+    Tabs,
+    /// Claude Code conversations by project; see `claude_threads`.
+    Threads,
+    /// Saved projects by tag; see `project_manager`.
+    Projects,
+}
+
 pub struct Workspace {
     window_id: WindowId,
     pub(crate) tabs: Vec<TabData>,
@@ -1093,6 +1109,12 @@ pub struct Workspace {
     worktree_selector: ViewHandle<WorktreeSelector>,
     /// Set while a dragged tab hovers a pane of the active tab; see `tab_merge`.
     tab_merge_target: Option<tab_merge::TabMergeTarget>,
+    /// Claude Code conversations by project; see `claude_threads`.
+    claude_threads_view: ViewHandle<claude_threads::ClaudeThreadsView>,
+    /// Saved projects by tag; see `project_manager`.
+    project_manager_view: ViewHandle<project_manager::ProjectManagerView>,
+    /// What the vertical tabs sidebar shows: the tab list, Threads or Projects.
+    vertical_tabs_content: VerticalTabsContent,
     changelog_model: ModelHandle<ChangelogModel>,
     palette: ViewHandle<CommandPalette>,
     ctrl_tab_palette: ViewHandle<CommandPalette>,
@@ -2968,6 +2990,9 @@ impl Workspace {
             move_to_group_sidecar_menu,
         ) = Self::build_menus(ctx);
         let worktree_selector = Self::build_worktree_selector(ctx);
+        let claude_threads_view = ctx.add_typed_action_view(claude_threads::ClaudeThreadsView::new);
+        let project_manager_view =
+            ctx.add_typed_action_view(project_manager::ProjectManagerView::new);
 
         // Subscribe to network changes
         ctx.subscribe_to_model(
@@ -3513,6 +3538,9 @@ impl Workspace {
             show_new_session_dropdown_menu: None,
             worktree_selector,
             tab_merge_target: None,
+            claude_threads_view,
+            project_manager_view,
+            vertical_tabs_content: VerticalTabsContent::Tabs,
             changelog_model,
             welcome_tips_view_state,
             welcome_tips_view,
@@ -7282,6 +7310,10 @@ impl Workspace {
                 self.vertical_tabs_panel_open = true;
                 self.sync_window_button_visibility(ctx);
             }
+            // The menu anchors to the tab list's `+` button.
+            if self.vertical_tabs_content != VerticalTabsContent::Tabs {
+                self.set_vertical_tabs_content(VerticalTabsContent::Tabs, ctx);
+            }
             self.open_tab_configs_menu(
                 NewSessionMenuAnchor::AddTabButton(Vector2F::zero()),
                 TabConfigsMenuOpenSource::KeyboardShortcut,
@@ -9019,6 +9051,17 @@ impl Workspace {
             .active_tab_pane_group()
             .as_ref(ctx)
             .active_session_path(ctx);
+        self.run_command_in_new_tab(directory, CLAUDE_COMMAND, ctx);
+    }
+
+    /// Opens a new terminal tab in `directory` (the default one when `None`)
+    /// and runs `command` once its shell is ready.
+    fn run_command_in_new_tab(
+        &mut self,
+        directory: Option<PathBuf>,
+        command: &str,
+        ctx: &mut ViewContext<Self>,
+    ) {
         let options = NewTerminalOptions::default()
             .with_initial_directory_opt(directory)
             .with_homepage_hidden();
@@ -9030,7 +9073,7 @@ impl Workspace {
         );
         if let Some(terminal) = self.active_session_view(ctx) {
             terminal.update(ctx, |terminal, ctx| {
-                terminal.set_pending_command(CLAUDE_COMMAND, ctx);
+                terminal.set_pending_command(command, ctx);
             });
         }
     }
@@ -9685,6 +9728,12 @@ impl Workspace {
     }
 
     fn toggle_vertical_tabs_panel(&mut self, ctx: &mut ViewContext<Self>) {
+        // From Threads or Projects, the tabs button switches back to the tab list.
+        if self.vertical_tabs_panel_open && self.vertical_tabs_content != VerticalTabsContent::Tabs
+        {
+            self.set_vertical_tabs_content(VerticalTabsContent::Tabs, ctx);
+            return;
+        }
         self.vertical_tabs_panel_open = !self.vertical_tabs_panel_open;
         if !self.vertical_tabs_panel_open {
             self.close_vertical_tabs_settings_popup();
@@ -9692,6 +9741,58 @@ impl Workspace {
         }
         self.sync_window_button_visibility(ctx);
         ctx.notify();
+    }
+
+    /// Header "Threads" and "Projetos" buttons: show that content in the
+    /// vertical tabs sidebar, or close the sidebar when it's already showing it.
+    fn toggle_vertical_tabs_content(
+        &mut self,
+        content: VerticalTabsContent,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if self.vertical_tabs_panel_open && self.vertical_tabs_content == content {
+            self.set_vertical_tabs_content(VerticalTabsContent::Tabs, ctx);
+            self.toggle_vertical_tabs_panel(ctx);
+            return;
+        }
+        if !self.vertical_tabs_panel_open {
+            self.toggle_vertical_tabs_panel(ctx);
+        }
+        self.set_vertical_tabs_content(content, ctx);
+    }
+
+    fn set_vertical_tabs_content(
+        &mut self,
+        content: VerticalTabsContent,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.vertical_tabs_content = content;
+        if content != VerticalTabsContent::Tabs {
+            self.close_vertical_tabs_settings_popup();
+            self.vertical_tabs_panel.clear_detail_sidecar();
+        }
+        let open = self.vertical_tabs_panel_open;
+        self.claude_threads_view.update(ctx, |view, ctx| {
+            view.set_visible(open && content == VerticalTabsContent::Threads, ctx);
+        });
+        self.project_manager_view.update(ctx, |view, ctx| {
+            view.set_visible(open && content == VerticalTabsContent::Projects, ctx);
+        });
+        ctx.notify();
+    }
+
+    /// Saves the active tab's folder in the Projects panel.
+    fn save_active_directory_as_project(&mut self, ctx: &mut ViewContext<Self>) {
+        let Some(directory) = self
+            .active_tab_pane_group()
+            .as_ref(ctx)
+            .active_session_path(ctx)
+        else {
+            return;
+        };
+        self.project_manager_view.update(ctx, |view, ctx| {
+            view.add_project(directory, ctx);
+        });
     }
 
     fn close_vertical_tabs_settings_popup(&mut self) {
@@ -20812,7 +20913,8 @@ impl Workspace {
         let (is_active, tooltip_text, action, keybinding_name, save_position_id) =
             if vertical_tabs_active {
                 (
-                    self.vertical_tabs_panel_open,
+                    self.vertical_tabs_panel_open
+                        && self.vertical_tabs_content == VerticalTabsContent::Tabs,
                     "Tabs panel",
                     WorkspaceAction::ToggleVerticalTabsPanel,
                     "workspace:toggle_vertical_tabs_panel",
@@ -20867,7 +20969,7 @@ impl Workspace {
     }
 
     /// Tab bar button that starts a Claude Code session.
-    fn render_claude_button(&self, appearance: &Appearance) -> Box<dyn Element> {
+    fn render_claude_button(&self, appearance: &Appearance, ctx: &AppContext) -> Box<dyn Element> {
         Container::new(
             Align::new(
                 self.render_tab_bar_icon_button(
@@ -20876,7 +20978,7 @@ impl Workspace {
                     &self.mouse_states.claude_button,
                     WorkspaceAction::OpenClaudeSession,
                     "Abrir Claude Code".to_string(),
-                    None,
+                    keybinding_name_to_display_string(OPEN_CLAUDE_SESSION_BINDING_NAME, ctx),
                     false,
                     false,
                 )
@@ -20885,6 +20987,94 @@ impl Workspace {
             .finish(),
         )
         .finish()
+    }
+
+    /// Tab bar button that shows the Threads panel in the vertical tabs sidebar.
+    fn render_claude_threads_button(
+        &self,
+        appearance: &Appearance,
+        ctx: &AppContext,
+    ) -> Box<dyn Element> {
+        Container::new(
+            Align::new(
+                self.render_tab_bar_icon_button(
+                    appearance,
+                    icons::Icon::MessageChatSquare,
+                    &self.mouse_states.claude_threads_button,
+                    WorkspaceAction::ToggleClaudeThreadsPanel,
+                    "Threads".to_string(),
+                    keybinding_name_to_display_string(TOGGLE_CLAUDE_THREADS_BINDING_NAME, ctx),
+                    self.vertical_tabs_panel_open
+                        && self.vertical_tabs_content == VerticalTabsContent::Threads,
+                    false,
+                )
+                .finish(),
+            )
+            .finish(),
+        )
+        .finish()
+    }
+
+    /// Tab bar button that shows the Projects panel in the vertical tabs sidebar.
+    fn render_project_manager_button(
+        &self,
+        appearance: &Appearance,
+        ctx: &AppContext,
+    ) -> Box<dyn Element> {
+        Container::new(
+            Align::new(
+                self.render_tab_bar_icon_button(
+                    appearance,
+                    icons::Icon::Folder,
+                    &self.mouse_states.project_manager_button,
+                    WorkspaceAction::ToggleProjectManagerPanel,
+                    "Projetos".to_string(),
+                    keybinding_name_to_display_string(TOGGLE_PROJECT_MANAGER_BINDING_NAME, ctx),
+                    self.vertical_tabs_panel_open
+                        && self.vertical_tabs_content == VerticalTabsContent::Projects,
+                    false,
+                )
+                .finish(),
+            )
+            .finish(),
+        )
+        .finish()
+    }
+
+    /// Tab bar button that toggles the project explorer, or `None` when the
+    /// explorer is turned off in the settings.
+    fn render_file_explorer_button(
+        &self,
+        appearance: &Appearance,
+        ctx: &AppContext,
+    ) -> Option<Box<dyn Element>> {
+        if !*CodeSettings::as_ref(ctx).show_project_explorer {
+            return None;
+        }
+        let is_active = self.active_tab_pane_group().as_ref(ctx).left_panel_open
+            && self.left_panel_view.as_ref(ctx).active_view() == ToolPanelView::ProjectExplorer;
+        Some(
+            Container::new(
+                Align::new(
+                    self.render_tab_bar_icon_button(
+                        appearance,
+                        icons::Icon::FileCopy,
+                        &self.mouse_states.file_explorer_button,
+                        WorkspaceAction::ToggleProjectExplorer,
+                        "File explorer".to_string(),
+                        keybinding_name_to_display_string(
+                            LEFT_PANEL_PROJECT_EXPLORER_BINDING_NAME,
+                            ctx,
+                        ),
+                        is_active,
+                        false,
+                    )
+                    .finish(),
+                )
+                .finish(),
+            )
+            .finish(),
+        )
     }
 
     fn render_tools_panel_button(
@@ -21306,12 +21496,22 @@ impl Workspace {
             .header_toolbar_chip_selection
             .clone();
         if knowledge_center_closed {
-            let mut left_toolbar_buttons = config
-                .left_items()
-                .into_iter()
-                .filter_map(|item| self.render_header_toolbar_button(&item, appearance, ctx))
-                .collect::<Vec<_>>();
-            left_toolbar_buttons.push(self.render_claude_button(appearance));
+            let mut left_toolbar_buttons = Vec::new();
+            for item in config.left_items() {
+                if let Some(button) = self.render_header_toolbar_button(&item, appearance, ctx) {
+                    left_toolbar_buttons.push(button);
+                }
+                // Threads sits next to the tabs panel button: both switch the
+                // content of the same sidebar.
+                if item == HeaderToolbarItemKind::TabsPanel && vertical_tabs_active {
+                    left_toolbar_buttons.push(self.render_claude_threads_button(appearance, ctx));
+                    left_toolbar_buttons.push(self.render_project_manager_button(appearance, ctx));
+                }
+            }
+            left_toolbar_buttons.push(self.render_claude_button(appearance, ctx));
+            if let Some(button) = self.render_file_explorer_button(appearance, ctx) {
+                left_toolbar_buttons.push(button);
+            }
             let left_toolbar_button_count = left_toolbar_buttons.len();
             for (index, button) in left_toolbar_buttons.into_iter().enumerate() {
                 let is_last_left_toolbar_button = index + 1 == left_toolbar_button_count;
@@ -24693,6 +24893,31 @@ impl TypedActionView for Workspace {
                 self.open_directory_in_new_tab(path.clone(), ctx);
             }
             OpenClaudeSession => self.open_claude_session(ctx),
+            RunCommandInNewTab { directory, command } => {
+                self.run_command_in_new_tab(Some(directory.clone()), command, ctx);
+            }
+            ToggleClaudeThreadsPanel => {
+                self.toggle_vertical_tabs_content(VerticalTabsContent::Threads, ctx);
+            }
+            ToggleProjectManagerPanel => {
+                self.toggle_vertical_tabs_content(VerticalTabsContent::Projects, ctx);
+            }
+            SaveActiveDirectoryAsProject => self.save_active_directory_as_project(ctx),
+            OpenFileInSplitPane { path } => {
+                self.open_file_with_target(
+                    path.clone(),
+                    FileTarget::CodeEditor(
+                        crate::util::openable_file_type::EditorLayout::SplitPane,
+                    ),
+                    None,
+                    CodeSource::Link {
+                        path: path.clone(),
+                        range_start: None,
+                        range_end: None,
+                    },
+                    ctx,
+                );
+            }
             OpenWorktreeAddRepoPicker => {
                 self.close_new_session_dropdown_menu(ctx);
                 self.open_folder_picker_for_worktree_submenu(ctx);
