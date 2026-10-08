@@ -2,6 +2,7 @@ pub(super) mod chips;
 pub mod editor;
 mod environment_selector;
 pub mod toolbar_item;
+pub(crate) mod worktree_selector;
 
 #[cfg(not(target_family = "wasm"))]
 use std::env;
@@ -51,6 +52,7 @@ use warpui::{
 pub(crate) use self::environment_selector::{
     EnvironmentSelector, EnvironmentSelectorEvent, EnvironmentSelectorTarget,
 };
+use self::worktree_selector::{WorktreeButtonStyle, WorktreeSelector, WorktreeSelectorEvent};
 use crate::ai::AIRequestUsageModel;
 use crate::ai::blocklist::BlocklistAIInputModel;
 use crate::ai::blocklist::agent_view::is_in_cloud_context;
@@ -210,6 +212,7 @@ pub struct AgentInputFooter {
     model_selector: ViewHandle<ProfileModelSelector>,
     environment_selector: Option<ViewHandle<EnvironmentSelector>>,
     handoff_environment_selector: ViewHandle<EnvironmentSelector>,
+    worktree_selector: ViewHandle<WorktreeSelector>,
     prompt_alert: ViewHandle<PromptAlertView>,
     ambient_agent_view_model: Option<ModelHandle<AmbientAgentViewModel>>,
     handoff_compose_state: ModelHandle<HandoffComposeState>,
@@ -793,6 +796,28 @@ impl AgentInputFooter {
             },
         );
 
+        let worktree_terminal_model = terminal_model.clone();
+        let worktree_selector = ctx.add_typed_action_view(|ctx| {
+            WorktreeSelector::new(
+                menu_positioning_provider.clone(),
+                Arc::new(move |_app: &AppContext| {
+                    worktree_terminal_model
+                        .lock()
+                        .block_list()
+                        .active_block()
+                        .pwd()
+                        .map(std::path::PathBuf::from)
+                }),
+                WorktreeButtonStyle::Footer,
+                ctx,
+            )
+        });
+        ctx.subscribe_to_view(&worktree_selector, |_, _, event, ctx| match event {
+            WorktreeSelectorEvent::MenuVisibilityChanged { open } => {
+                ctx.emit(AgentInputFooterEvent::ToggledChipMenu { open: *open });
+            }
+        });
+
         let prompt_alert = ctx.add_typed_action_view(PromptAlertView::new);
         ctx.subscribe_to_view(&prompt_alert, |_, _, event, ctx| {
             ctx.emit(AgentInputFooterEvent::PromptAlert(event.clone()));
@@ -980,6 +1005,7 @@ impl AgentInputFooter {
             model_selector: profile_model_selector_full,
             environment_selector,
             handoff_environment_selector,
+            worktree_selector,
             prompt_alert,
             terminal_model,
             handoff_compose_state,
@@ -1622,6 +1648,9 @@ impl AgentInputFooter {
                 Some(ChildView::new(button).finish())
             }
             AgentToolbarItemKind::Settings => Some(ChildView::new(&self.settings_button).finish()),
+            AgentToolbarItemKind::Worktree => item
+                .is_available(app)
+                .then(|| ChildView::new(&self.worktree_selector).finish()),
             // Handled by the available_in() guard above; included for exhaustiveness.
             AgentToolbarItemKind::ModelSelector
             | AgentToolbarItemKind::NLDToggle
@@ -1809,8 +1838,12 @@ impl AgentInputFooter {
             .is_some_and(|selector| selector.as_ref(app).is_menu_open());
         let has_open_handoff_env_selector =
             self.handoff_environment_selector.as_ref(app).is_menu_open();
+        let has_open_worktree_selector = self.worktree_selector.as_ref(app).is_menu_open();
 
-        has_open_display_chip || has_open_env_selector || has_open_handoff_env_selector
+        has_open_display_chip
+            || has_open_env_selector
+            || has_open_handoff_env_selector
+            || has_open_worktree_selector
     }
 
     pub fn is_model_selector_open(&self, app: &AppContext) -> bool {
@@ -2456,6 +2489,9 @@ impl AgentInputFooter {
             AgentToolbarItemKind::FileExplorer => item
                 .is_available(app)
                 .then(|| ChildView::new(&self.file_explorer_button).finish()),
+            AgentToolbarItemKind::Worktree => item
+                .is_available(app)
+                .then(|| ChildView::new(&self.worktree_selector).finish()),
             // Handled by the available_in() guard above; included for exhaustiveness.
             AgentToolbarItemKind::RichInput | AgentToolbarItemKind::Settings => None,
         }

@@ -76,6 +76,9 @@ pub enum AgentToolbarItemKind {
 
     // Agent view only – "Hand off to cloud" chip.
     HandoffToCloud,
+
+    // Both – switches or creates a branch in the workspace's worktree slot.
+    Worktree,
 }
 
 impl AgentToolbarItemKind {
@@ -85,7 +88,8 @@ impl AgentToolbarItemKind {
             | Self::VoiceInput
             | Self::FileAttach
             | Self::ShareSession
-            | Self::FileExplorer => ToolbarAvailability::Both,
+            | Self::FileExplorer
+            | Self::Worktree => ToolbarAvailability::Both,
             Self::ModelSelector
             | Self::NLDToggle
             | Self::ContextWindowUsage
@@ -105,7 +109,9 @@ impl AgentToolbarItemKind {
         is_cloud_mode: bool,
     ) -> bool {
         match self {
-            Self::Settings | Self::ShareSession | Self::FileExplorer => !status.is_viewer(),
+            Self::Settings | Self::ShareSession | Self::FileExplorer | Self::Worktree => {
+                !status.is_viewer()
+            }
             Self::FileAttach => !status.is_viewer() || is_cloud_mode,
             Self::FastForwardToggle => !status.is_viewer() || status.is_executor(),
             // Handoff is host-initiated; viewers cannot hand off another user's conversation.
@@ -135,6 +141,7 @@ impl AgentToolbarItemKind {
             Self::Settings => "Settings",
             Self::FastForwardToggle => "Fast Forward",
             Self::HandoffToCloud => "Hand off to cloud",
+            Self::Worktree => "Worktree",
         }
     }
 
@@ -155,6 +162,7 @@ impl AgentToolbarItemKind {
             // The bundled `upload-cloud-01.svg` (cloud-with-upward-arrow) is the
             // closest fit among the existing icons for V0; design may swap it later.
             Self::HandoffToCloud => Some(Icon::UploadCloud),
+            Self::Worktree => Some(Icon::GitBranch),
         }
     }
 
@@ -175,7 +183,8 @@ impl AgentToolbarItemKind {
             | Self::ShareSession
             | Self::FileExplorer
             | Self::RichInput
-            | Self::Settings => false,
+            | Self::Settings
+            | Self::Worktree => false,
         }
     }
 
@@ -195,6 +204,7 @@ impl AgentToolbarItemKind {
             Self::FileExplorer => {
                 cfg!(feature = "local_fs") && *CodeSettings::as_ref(app).show_project_explorer
             }
+            Self::Worktree => cfg!(not(target_family = "wasm")),
             _ => true,
         }
     }
@@ -266,6 +276,9 @@ impl AgentToolbarItemKind {
             // Opt-in only: deliberately absent from `default_left`/`default_right`.
             Self::FileExplorer,
         ]);
+        if cfg!(not(target_family = "wasm")) {
+            items.push(Self::Worktree);
+        }
         if FeatureFlag::PricingTransparency.is_enabled() {
             items.push(Self::UsageSummary);
         }
@@ -302,6 +315,9 @@ impl AgentToolbarItemKind {
         if FeatureFlag::CLIAgentRichInput.is_enabled() {
             items.push(Self::RichInput);
         }
+        if cfg!(not(target_family = "wasm")) {
+            items.push(Self::Worktree);
+        }
         items
     }
 
@@ -327,6 +343,9 @@ impl AgentToolbarItemKind {
             Self::VoiceInput,
             Self::Settings,
         ]);
+        if cfg!(not(target_family = "wasm")) {
+            items.push(Self::Worktree);
+        }
         if FeatureFlag::CreatingSharedSessions.is_enabled()
             && FeatureFlag::HOARemoteControl.is_enabled()
         {

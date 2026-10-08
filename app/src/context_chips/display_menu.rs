@@ -410,6 +410,24 @@ impl DisplayChipMenu {
         self
     }
 
+    pub fn search_query(&self) -> &str {
+        &self.search_query
+    }
+
+    pub fn set_search_placeholder(&mut self, text: &str, ctx: &mut ViewContext<Self>) {
+        if let Some(search_input) = self.search_input.clone() {
+            search_input.update(ctx, |editor, ctx| editor.set_placeholder_text(text, ctx));
+        }
+    }
+
+    /// Empties the search input so the menu reopens showing every item.
+    pub fn clear_search(&mut self, ctx: &mut ViewContext<Self>) {
+        if let Some(search_input) = self.search_input.clone() {
+            search_input.update(ctx, |editor, ctx| editor.clear_buffer(ctx));
+        }
+        self.update_search_query(String::new(), ctx);
+    }
+
     pub fn reset_selected_index(&mut self) {
         if self.filtered_items.is_empty() && self.fixed_footer.is_some() {
             self.is_footer_selected = true;
