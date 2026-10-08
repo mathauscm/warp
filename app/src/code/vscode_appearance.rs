@@ -84,6 +84,18 @@ pub struct EditorPalette {
     pub gutter_deleted: Option<ColorU>,
     /// Color per tree-sitter capture name (see [`CAPTURE_SCOPES`]).
     pub captures: HashMap<String, ColorU>,
+    pub git_decorations: GitDecorationColors,
+}
+
+/// The theme's `gitDecoration.*ResourceForeground` colors, used by the file tree.
+#[derive(Debug, Clone, Default)]
+pub struct GitDecorationColors {
+    pub modified: Option<ColorU>,
+    pub added: Option<ColorU>,
+    pub renamed: Option<ColorU>,
+    pub untracked: Option<ColorU>,
+    pub deleted: Option<ColorU>,
+    pub conflicting: Option<ColorU>,
 }
 
 #[derive(Debug, Default)]
@@ -285,6 +297,14 @@ fn palette_from_theme(theme: &Theme) -> EditorPalette {
         gutter_modified: color("editorGutter.modifiedBackground"),
         gutter_deleted: color("editorGutter.deletedBackground"),
         captures,
+        git_decorations: GitDecorationColors {
+            modified: color("gitDecoration.modifiedResourceForeground"),
+            added: color("gitDecoration.addedResourceForeground"),
+            renamed: color("gitDecoration.renamedResourceForeground"),
+            untracked: color("gitDecoration.untrackedResourceForeground"),
+            deleted: color("gitDecoration.deletedResourceForeground"),
+            conflicting: color("gitDecoration.conflictingResourceForeground"),
+        },
     }
 }
 
