@@ -9,6 +9,7 @@ pub mod find;
 pub mod goto_line;
 pub mod line;
 mod line_iterator;
+mod minimap;
 pub mod model;
 mod nav_bar;
 pub mod scroll;

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::iter;
 use std::ops::Range;
 
@@ -20,6 +21,10 @@ pub struct ColorMap {
     pub comment_color: ColorU,
     pub property_color: ColorU,
     pub tag_color: ColorU,
+    /// Colors keyed by full capture name (e.g. `keyword.return`). When set,
+    /// captures are looked up here first, falling back to shorter prefixes;
+    /// captures with no entry use the default text color.
+    pub by_capture: Option<&'static HashMap<String, ColorU>>,
 }
 
 /// Query for retrieving syntax highlighting information on the tokens.
@@ -79,6 +84,18 @@ impl HighlightQuery {
 }
 
 fn convert_capture_name_to_color(name: &str, color_map: &ColorMap) -> Option<ColorU> {
+    if let Some(by_capture) = color_map.by_capture {
+        let mut capture = name;
+        loop {
+            if let Some(color) = by_capture.get(capture) {
+                return Some(*color);
+            }
+            match capture.rsplit_once('.') {
+                Some((parent, _)) => capture = parent,
+                None => return None,
+            }
+        }
+    }
     match name {
         "text.title" => return Some(color_map.keyword_color),
         "text.literal" => return Some(color_map.string_color),

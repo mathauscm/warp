@@ -991,6 +991,15 @@ impl BlockListElement {
         self
     }
 
+    /// Renders with a font other than the global terminal font. The pane's
+    /// size info must have been computed with the same font.
+    pub fn with_font(mut self, family: FamilyId, size: f32, line_height_ratio: f32) -> Self {
+        self.font_family = family;
+        self.font_size = size;
+        self.line_height_ratio = line_height_ratio;
+        self
+    }
+
     pub fn with_hide_cursor_cell(mut self) -> Self {
         self.hide_cursor_cell = true;
         self

@@ -846,6 +846,13 @@ pub enum WorkspaceAction {
     /// Open a folder picker to add a new repo to PersistedWorkspace (from the
     /// "New worktree config" submenu's "+ Add new repo..." item).
     OpenWorktreeAddRepoPicker,
+    /// Open a new terminal tab whose shell starts in `path` (used by the footer
+    /// "Worktree" button after switching or creating a branch).
+    OpenDirectoryInNewTab {
+        path: PathBuf,
+    },
+    /// Run `claude` in the active terminal when it's idle, otherwise in a new tab.
+    OpenClaudeSession,
     SaveCurrentTabAsNewConfig(usize),
     SyncTrafficLights,
     /// Opens a tab config file in the editor and dismisses the associated error toast.
@@ -1108,6 +1115,8 @@ impl WorkspaceAction {
             | OpenNewWorktreeModal
             | OpenNewWorktreeRepoPicker
             | OpenWorktreeInRepo { .. }
+            | OpenDirectoryInNewTab { .. }
+            | OpenClaudeSession
             | OpenWorktreeAddRepoPicker
             | Crash
             | Panic

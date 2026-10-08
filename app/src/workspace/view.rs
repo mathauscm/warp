@@ -18,6 +18,7 @@ pub(crate) mod orchestration_launch_modal;
 pub(crate) mod right_panel;
 mod startup_directory;
 mod tab_grouping;
+mod tab_merge;
 #[cfg(test)]
 #[path = "view_tests.rs"]
 pub(crate) mod tests;
@@ -190,6 +191,9 @@ use crate::ai::ambient_agents::telemetry::{CloudAgentTelemetryEvent, CloudModeEn
 use crate::ai::ambient_agents::telemetry::{HandoffEntryPoint, HandoffSurface};
 use crate::ai::blocklist::agent_view::AgentViewEntryOrigin;
 use crate::ai::blocklist::agent_view::agent_input_footer::editor::AgentToolbarEditorMode;
+use crate::ai::blocklist::agent_view::agent_input_footer::worktree_selector::{
+    BelowButtonPositioning, CwdSource, WorktreeButtonStyle, WorktreeSelector, WorktreeSelectorEvent,
+};
 use crate::ai::blocklist::agent_view::editor::{AgentToolbarEditorEvent, AgentToolbarEditorModal};
 #[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
 use crate::ai::blocklist::handoff;
@@ -1085,6 +1089,10 @@ pub struct Workspace {
     /// variant determines whether the menu sits below the `+` add-tab button
     /// or floats at the pointer position (right-click on the panel chrome).
     show_new_session_dropdown_menu: Option<NewSessionMenuAnchor>,
+    /// "Worktree" button in the vertical tabs control bar.
+    worktree_selector: ViewHandle<WorktreeSelector>,
+    /// Set while a dragged tab hovers a pane of the active tab; see `tab_merge`.
+    tab_merge_target: Option<tab_merge::TabMergeTarget>,
     changelog_model: ModelHandle<ChangelogModel>,
     palette: ViewHandle<CommandPalette>,
     ctrl_tab_palette: ViewHandle<CommandPalette>,
@@ -1293,6 +1301,35 @@ impl Workspace {
             menu.set_content_padding_overrides(None, None);
             menu.reset_selection(view_ctx);
         });
+    }
+
+    /// Builds the tab bar "Worktree" button, which resolves the worktree
+    /// workspace from the active tab's directory.
+    fn build_worktree_selector(ctx: &mut ViewContext<Self>) -> ViewHandle<WorktreeSelector> {
+        let workspace = ctx.handle();
+        let cwd_source: CwdSource = Arc::new(move |app: &AppContext| {
+            let workspace = workspace.upgrade(app)?;
+            workspace
+                .as_ref(app)
+                .active_tab_pane_group()
+                .as_ref(app)
+                .active_session_path(app)
+        });
+        let worktree_selector = ctx.add_typed_action_view(|ctx| {
+            WorktreeSelector::new(
+                Arc::new(BelowButtonPositioning),
+                cwd_source,
+                WorktreeButtonStyle::Toolbar,
+                ctx,
+            )
+        });
+        ctx.subscribe_to_view(&worktree_selector, |me, _, event, ctx| match event {
+            WorktreeSelectorEvent::MenuVisibilityChanged { open: false } => {
+                me.focus_active_tab(ctx);
+            }
+            WorktreeSelectorEvent::MenuVisibilityChanged { open: true } => {}
+        });
+        worktree_selector
     }
 
     fn close_new_session_dropdown_menu(&mut self, ctx: &mut ViewContext<Self>) {
@@ -2930,6 +2967,7 @@ impl Workspace {
             new_session_sidecar_menu,
             move_to_group_sidecar_menu,
         ) = Self::build_menus(ctx);
+        let worktree_selector = Self::build_worktree_selector(ctx);
 
         // Subscribe to network changes
         ctx.subscribe_to_model(
@@ -3473,6 +3511,8 @@ impl Workspace {
             show_tab_selection_right_click_menu: None,
             new_session_dropdown_menu,
             show_new_session_dropdown_menu: None,
+            worktree_selector,
+            tab_merge_target: None,
             changelog_model,
             welcome_tips_view_state,
             welcome_tips_view,
@@ -6970,14 +7010,12 @@ impl Workspace {
         let reopen_closed_session_shortcut_label =
             keybinding_name_to_display_string("app:reopen_closed_session", ctx);
 
-        // 1. Agent (if AI enabled)
-        if is_any_ai_enabled {
-            let mut agent_item = MenuItemFields::new("Agent")
+        // 1. Agent (only when agent is the default session mode)
+        if is_any_ai_enabled && effective_default == DefaultSessionMode::Agent {
+            let agent_item = MenuItemFields::new("Agent")
                 .with_on_select_action(WorkspaceAction::AddAgentTab)
-                .with_icon(icons::Icon::LayoutAlt01);
-            if effective_default == DefaultSessionMode::Agent {
-                agent_item = agent_item.with_key_shortcut_label(shortcut_label.clone());
-            }
+                .with_icon(icons::Icon::LayoutAlt01)
+                .with_key_shortcut_label(shortcut_label.clone());
             menu_items.push(agent_item.into_item());
         }
 
@@ -8955,6 +8993,46 @@ impl Workspace {
         input_handle.update(ctx, |input_view, ctx| {
             input_view.replace_buffer_content(&cd_command, ctx);
         });
+    }
+
+    /// Starts Claude Code in the active terminal when it's idle at a prompt,
+    /// otherwise in a new terminal tab opened in the same directory.
+    fn open_claude_session(&mut self, ctx: &mut ViewContext<Self>) {
+        const CLAUDE_COMMAND: &str = "claude";
+
+        if let Some(terminal) = self.active_session_view(ctx) {
+            let idle_input = {
+                let terminal = terminal.as_ref(ctx);
+                (!terminal.is_long_running()
+                    && !terminal.has_pending_command_or_awaiting_completion(ctx))
+                .then(|| terminal.input().clone())
+            };
+            if let Some(input) = idle_input {
+                input.update(ctx, |input, ctx| {
+                    input.try_execute_command(CLAUDE_COMMAND, ctx);
+                });
+                return;
+            }
+        }
+
+        let directory = self
+            .active_tab_pane_group()
+            .as_ref(ctx)
+            .active_session_path(ctx);
+        let options = NewTerminalOptions::default()
+            .with_initial_directory_opt(directory)
+            .with_homepage_hidden();
+        self.add_tab_with_pane_layout(
+            PanesLayout::SingleTerminal(Box::new(options)),
+            Arc::new(HashMap::new()),
+            None,
+            ctx,
+        );
+        if let Some(terminal) = self.active_session_view(ctx) {
+            terminal.update(ctx, |terminal, ctx| {
+                terminal.set_pending_command(CLAUDE_COMMAND, ctx);
+            });
+        }
     }
 
     fn open_directory_in_new_tab(&mut self, path: PathBuf, ctx: &mut ViewContext<Self>) {
@@ -20788,6 +20866,27 @@ impl Workspace {
         .finish()
     }
 
+    /// Tab bar button that starts a Claude Code session.
+    fn render_claude_button(&self, appearance: &Appearance) -> Box<dyn Element> {
+        Container::new(
+            Align::new(
+                self.render_tab_bar_icon_button(
+                    appearance,
+                    icons::Icon::ClaudeLogo,
+                    &self.mouse_states.claude_button,
+                    WorkspaceAction::OpenClaudeSession,
+                    "Abrir Claude Code".to_string(),
+                    None,
+                    false,
+                    false,
+                )
+                .finish(),
+            )
+            .finish(),
+        )
+        .finish()
+    }
+
     fn render_tools_panel_button(
         &self,
         appearance: &Appearance,
@@ -21207,11 +21306,12 @@ impl Workspace {
             .header_toolbar_chip_selection
             .clone();
         if knowledge_center_closed {
-            let left_toolbar_buttons = config
+            let mut left_toolbar_buttons = config
                 .left_items()
                 .into_iter()
                 .filter_map(|item| self.render_header_toolbar_button(&item, appearance, ctx))
                 .collect::<Vec<_>>();
+            left_toolbar_buttons.push(self.render_claude_button(appearance));
             let left_toolbar_button_count = left_toolbar_buttons.len();
             for (index, button) in left_toolbar_buttons.into_iter().enumerate() {
                 let is_last_left_toolbar_button = index + 1 == left_toolbar_button_count;
@@ -24589,6 +24689,10 @@ impl TypedActionView for Workspace {
             OpenWorktreeInRepo { repo_path } => {
                 self.open_worktree_in_repo(repo_path.clone(), ctx);
             }
+            OpenDirectoryInNewTab { path } => {
+                self.open_directory_in_new_tab(path.clone(), ctx);
+            }
+            OpenClaudeSession => self.open_claude_session(ctx),
             OpenWorktreeAddRepoPicker => {
                 self.close_new_session_dropdown_menu(ctx);
                 self.open_folder_picker_for_worktree_submenu(ctx);
@@ -25294,6 +25398,11 @@ impl TypedActionView for Workspace {
                     }
                 }
                 send_telemetry_from_ctx!(TelemetryEvent::DragAndDropTab, ctx);
+                if let Some(target) = self.take_tab_merge_target()
+                    && !is_cross_window
+                {
+                    self.merge_tab_into_pane(target, ctx);
+                }
                 if is_cross_window {
                     let drop_result =
                         CrossWindowTabDrag::handle(ctx).update(ctx, |drag, ctx| drag.on_drop(ctx));
@@ -26985,6 +27094,10 @@ impl View for Workspace {
                     ChildAnchor::TopLeft,
                 ),
             );
+        }
+
+        if let Some((preview, positioning)) = self.render_tab_merge_preview(app) {
+            stack.add_positioned_overlay_child(preview, positioning);
         }
 
         if FeatureFlag::VerticalTabs.is_enabled()
@@ -28835,6 +28948,12 @@ impl Workspace {
         if let Some(tab_data) = self.tabs.get(current_index)
             && tab_data.detached
         {
+            return;
+        }
+
+        // Over a pane of the active tab, the drop merges the tab there instead
+        // of reordering it or detaching it into a new window.
+        if self.update_tab_merge_target(current_index, position, ctx) {
             return;
         }
 

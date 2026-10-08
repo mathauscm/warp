@@ -18,11 +18,11 @@ use warp_core::ui::color::coloru_with_opacity;
 use warp_core::ui::theme::color::internal_colors;
 use warp_core::ui::theme::{AnsiColorIdentifier, Fill as WarpThemeFill, WarpTheme};
 use warpui::elements::{
-    Border, ChildAnchor, Clipped, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox,
-    Container, CornerRadius, CrossAxisAlignment, DispatchEventResult, DragAxis, DragBarSide,
-    Draggable, DropShadow, DropTarget, Element, Empty, EventHandler, Expanded, Fill as ElementFill,
-    Flex, Highlight, Hoverable, MainAxisAlignment, MainAxisSize, MouseStateHandle,
-    OffsetPositioning, Padding, ParentAnchor, ParentElement, ParentOffsetBounds,
+    Border, ChildAnchor, ChildView, Clipped, ClippedScrollStateHandle, ClippedScrollable,
+    ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, DispatchEventResult, DragAxis,
+    DragBarSide, Draggable, DropShadow, DropTarget, Element, Empty, EventHandler, Expanded,
+    Fill as ElementFill, Flex, Highlight, Hoverable, MainAxisAlignment, MainAxisSize,
+    MouseStateHandle, OffsetPositioning, Padding, ParentAnchor, ParentElement, ParentOffsetBounds,
     PositionedElementAnchor, PositionedElementOffsetBounds, Radius, Resizable,
     ResizableStateHandle, SavePosition, ScrollTarget, ScrollToPositionMode, ScrollbarWidth,
     Shrinkable, Stack, Text, resizable_state_handle,
@@ -713,6 +713,7 @@ pub(super) struct VerticalTabsPanelState {
     new_tab_button_state: MouseStateHandle,
     pub(super) search_query: String,
     settings_button_mouse_state: MouseStateHandle,
+    file_explorer_button_mouse_state: MouseStateHandle,
     panes_segment_mouse_state: MouseStateHandle,
     tabs_segment_mouse_state: MouseStateHandle,
     focused_session_option_mouse_state: MouseStateHandle,
@@ -751,6 +752,7 @@ impl Default for VerticalTabsPanelState {
             new_tab_button_state: Default::default(),
             search_query: String::new(),
             settings_button_mouse_state: Default::default(),
+            file_explorer_button_mouse_state: Default::default(),
             panes_segment_mouse_state: Default::default(),
             tabs_segment_mouse_state: Default::default(),
             focused_session_option_mouse_state: Default::default(),
@@ -1439,6 +1441,8 @@ fn render_control_bar(
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_spacing(CONTROL_BAR_SPACING)
             .with_child(Shrinkable::new(1., search_bar).finish())
+            .with_child(render_file_explorer_button(state, appearance))
+            .with_child(ChildView::new(&workspace.worktree_selector).finish())
             .with_child(settings_button)
             .with_child(new_tab_button)
             .finish(),
@@ -1573,6 +1577,61 @@ fn render_settings_button(
     .finish();
 
     SavePosition::new(button, VERTICAL_TABS_SETTINGS_BUTTON_POSITION_ID).finish()
+}
+
+/// Icon button that toggles the project explorer, available with or without a
+/// CLI agent running.
+fn render_file_explorer_button(
+    state: &VerticalTabsPanelState,
+    appearance: &Appearance,
+) -> Box<dyn Element> {
+    let theme = appearance.theme();
+    let sub_text = theme.sub_text_color(theme.background());
+    let ui_builder = appearance.ui_builder().clone();
+
+    Hoverable::new(
+        state.file_explorer_button_mouse_state.clone(),
+        move |hover_state| {
+            let icon = ConstrainedBox::new(WarpIcon::FileCopy.to_warpui_icon(sub_text).finish())
+                .with_width(16.)
+                .with_height(16.)
+                .finish();
+            let background = if hover_state.is_hovered() {
+                internal_colors::fg_overlay_2(theme)
+            } else {
+                ThemeFill::Solid(ColorU::transparent_black())
+            };
+            let button = Container::new(icon)
+                .with_padding(Padding::uniform(2.))
+                .with_background(background)
+                .with_corner_radius(CornerRadius::with_all(CONTROL_BAR_BUTTON_RADIUS))
+                .finish();
+
+            if !hover_state.is_hovered() {
+                return button;
+            }
+            let tooltip = ui_builder
+                .tool_tip("File explorer".to_string())
+                .build()
+                .finish();
+            let mut stack = Stack::new().with_child(button);
+            stack.add_positioned_overlay_child(
+                tooltip,
+                OffsetPositioning::offset_from_parent(
+                    vec2f(0., 4.),
+                    ParentOffsetBounds::WindowByPosition,
+                    ParentAnchor::BottomMiddle,
+                    ChildAnchor::TopMiddle,
+                ),
+            );
+            stack.finish()
+        },
+    )
+    .on_click(|ctx, _, _| {
+        ctx.dispatch_typed_action(WorkspaceAction::ToggleProjectExplorer);
+    })
+    .with_cursor(Cursor::PointingHand)
+    .finish()
 }
 
 fn render_new_tab_button(
@@ -2584,14 +2643,9 @@ fn render_tab_group_internal(
             .on_drop(|ctx, _, _, _| {
                 ctx.dispatch_typed_action(WorkspaceAction::DropTab);
             });
-        // Only lock the drag to the vertical axis when cross-window tab drag is
-        // disabled. When it is enabled, the user needs to be able to drag
-        // horizontally out of the panel to detach the tab into a new window.
-        let draggable = if FeatureFlag::DragTabsToWindows.is_enabled() {
-            draggable
-        } else {
-            draggable.with_drag_axis(DragAxis::VerticalOnly)
-        };
+        // The drag is never locked to the vertical axis: besides detaching a
+        // tab into a new window, dropping it over a pane of the active tab
+        // merges it there as a split (see `tab_merge`).
         draggable.finish()
     };
 

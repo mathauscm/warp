@@ -19,7 +19,7 @@ use warpui::actions::StandardAction;
 use warpui::elements::Axis;
 use warpui::event::ModifiersState;
 use warpui::keymap::{EditableBinding, FixedBinding, Keystroke, PerPlatformKeystroke};
-use warpui::units::Pixels;
+use warpui::units::{IntoPixels, Pixels};
 use warpui::{AppContext, TypedActionView, ViewContext, WeakViewHandle};
 
 use crate::cmd_or_ctrl_shift;
@@ -626,6 +626,10 @@ pub enum CodeEditorViewAction {
     ToggleComment,
     ScrollVertical(Pixels),
     ScrollHorizontal(Pixels),
+    /// Scroll so the top of the viewport is at `scroll_top` (from the minimap).
+    MinimapScrollTo {
+        scroll_top: f32,
+    },
     ScrollHalfPageDown,
     ScrollHalfPageUp,
     SelectUp,
@@ -765,6 +769,7 @@ impl CodeEditorViewAction {
             Self::WindowsCtrlC => true,
             Self::ScrollVertical(_)
             | Self::ScrollHorizontal(_)
+            | Self::MinimapScrollTo { .. }
             | Self::ScrollHalfPageDown
             | Self::ScrollHalfPageUp
             | Self::SelectUp
@@ -874,6 +879,12 @@ impl TypedActionView for CodeEditorView {
             ScrollVertical(delta) => self.model.update(ctx, |model, ctx| {
                 model.render_state().update(ctx, |render_state, ctx| {
                     render_state.scroll(*delta, ctx);
+                })
+            }),
+            MinimapScrollTo { scroll_top } => self.model.update(ctx, |model, ctx| {
+                model.render_state().update(ctx, |render_state, ctx| {
+                    let current = render_state.viewport().scroll_top().as_f32();
+                    render_state.scroll((current - *scroll_top).into_pixels(), ctx);
                 })
             }),
             ScrollHorizontal(delta) => self.model.update(ctx, |model, ctx| {

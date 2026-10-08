@@ -5579,7 +5579,7 @@ impl PaneGroup {
 
     /// Clear all panes that were hidden due to being closed (for undo functionality)
     /// This is typically called when starting pane rearrangement operations
-    fn clear_hidden_closed_panes(&mut self, ctx: &mut ViewContext<Self>) {
+    pub(crate) fn clear_hidden_closed_panes(&mut self, ctx: &mut ViewContext<Self>) {
         let closed_pane_ids = self.panes.get_closed_pane_ids();
         for pane_id in closed_pane_ids {
             self.cleanup_closed_pane(pane_id, ctx);

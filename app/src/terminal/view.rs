@@ -5,6 +5,7 @@ mod block_banner;
 pub mod block_onboarding;
 pub(crate) mod blocklist_filter;
 mod bookmarks;
+mod claude_look;
 mod context_menu;
 pub mod init;
 pub mod inline_banner;
@@ -1229,14 +1230,18 @@ impl SizeUpdateBuilder {
         let input_mode = *InputModeSettings::as_ref(ctx).input_mode.value();
         let model = view.model.lock();
 
+        let claude_font = view.claude_font(ctx);
         let new_size = create_size_info(
             self.new_pane_size_px,
             &model,
             view.sessions.as_ref(ctx),
             ctx.font_cache(),
-            appearance.monospace_font_family(),
-            appearance.monospace_font_size(),
-            appearance.line_height_ratio(),
+            claude_font.map_or_else(|| appearance.monospace_font_family(), |font| font.family),
+            claude_font.map_or_else(|| appearance.monospace_font_size(), |font| font.size),
+            claude_font.map_or_else(
+                || appearance.line_height_ratio(),
+                |font| font.line_height_ratio,
+            ),
             ctx,
         );
 
@@ -14036,6 +14041,20 @@ impl TerminalView {
             }
             _ => {}
         }
+        match event {
+            CLIAgentSessionsModelEvent::Started {
+                terminal_view_id,
+                agent,
+            } if *terminal_view_id == self.view_id => {
+                self.apply_claude_look(*agent == CLIAgent::Claude, ctx);
+            }
+            CLIAgentSessionsModelEvent::Ended {
+                terminal_view_id, ..
+            } if *terminal_view_id == self.view_id => {
+                self.apply_claude_look(false, ctx);
+            }
+            _ => {}
+        }
         if event.terminal_view_id() == self.view_id
             && matches!(
                 event,
@@ -24184,12 +24203,8 @@ impl TerminalView {
     }
 
     fn handle_theme_change(&mut self, ctx: &mut ViewContext<Self>) {
-        let appearance = Appearance::as_ref(ctx);
-        let colors = color::List::from(&appearance.theme().clone().into());
-        let mut model = self.model.lock();
-        model.update_colors(colors);
-        self.colors = colors;
-        ctx.notify();
+        let use_claude_look = self.runs_claude(ctx);
+        self.apply_terminal_colors(use_claude_look, ctx);
     }
 
     fn handle_reporting_settings_event(
@@ -25037,6 +25052,10 @@ impl TerminalView {
         if should_use_ligature_rendering(app) {
             alt_screen_element = alt_screen_element.with_ligature_rendering();
         }
+        if let Some(font) = self.claude_font(app) {
+            alt_screen_element =
+                alt_screen_element.with_font(font.family, font.size, font.line_height_ratio);
+        }
         if self.should_hide_cli_agent_cursor_cell(app) {
             alt_screen_element = alt_screen_element.with_hide_cursor_cell();
         }
@@ -25305,6 +25324,9 @@ impl TerminalView {
 
         if should_use_ligature_rendering(app) {
             element = element.with_ligature_rendering();
+        }
+        if let Some(font) = self.claude_font(app) {
+            element = element.with_font(font.family, font.size, font.line_height_ratio);
         }
 
         if self.should_hide_cli_agent_cursor_cell(app) {
@@ -29223,6 +29245,14 @@ impl View for TerminalView {
             )
         } else {
             SavePosition::new(stack.finish(), &self.terminal_position_id()).finish()
+        };
+
+        let element = if self.runs_claude(app) {
+            Container::new(element)
+                .with_background_color(claude_look::BACKGROUND)
+                .finish()
+        } else {
+            element
         };
 
         let final_element = if self.is_file_drop_target && FeatureFlag::SshDragAndDrop.is_enabled()
