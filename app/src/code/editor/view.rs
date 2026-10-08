@@ -1,5 +1,6 @@
 #![cfg_attr(target_family = "wasm", allow(dead_code, unused_imports))]
 // Adding this file level gate as some of the code around editability is not used in WASM yet.
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::ops::Range;
@@ -9,6 +10,7 @@ use ai::diff_validation::DiffDelta;
 use lazy_static::lazy_static;
 use num_traits::SaturatingSub;
 use pathfinder_geometry::vector::vec2f;
+use rangemap::RangeSet;
 use settings::Setting as _;
 use string_offset::CharOffset;
 use vec1::{Vec1, vec1};
@@ -37,9 +39,9 @@ use warpui::elements::new_scrollable::{
     AxisConfiguration, DualAxisConfig, NewScrollableElement, ScrollableAppearance,
 };
 use warpui::elements::{
-    ChildAnchor, ChildView, Dismiss, Fill, Flex, Margin, MouseStateHandle, NewScrollable,
-    OffsetPositioning, Padding, ParentAnchor, ParentElement, ParentOffsetBounds, ScrollStateHandle,
-    Shrinkable, Stack,
+    ChildAnchor, ChildView, CrossAxisAlignment, Dismiss, Fill, Flex, Margin, MouseStateHandle,
+    NewScrollable, OffsetPositioning, Padding, ParentAnchor, ParentElement, ParentOffsetBounds,
+    ScrollStateHandle, Shrinkable, Stack,
 };
 use warpui::event::ModifiersState;
 use warpui::keymap::Keystroke;
@@ -64,11 +66,13 @@ use crate::code::editor::element::{
 use crate::code::editor::find::view::{CodeEditorFind as Find, Event as FindViewEvent};
 use crate::code::editor::goto_line::view::{Event as GoToLineEvent, GoToLineView};
 use crate::code::editor::line::EditorLineLocation;
+use crate::code::editor::minimap::{self, MinimapLines};
 use crate::code::editor::model::{
     CodeEditorModel, CodeEditorModelEvent, HoverableLink, LineBound, StableEditorLine,
 };
 use crate::code::editor::nav_bar::{NavBar, NavBarBehavior, NavBarEvent};
 use crate::code::editor::scroll::{ScrollPosition, ScrollTrigger, ScrollWheelBehavior};
+use crate::code::vscode_appearance;
 use crate::code::{
     NoopCommentEditorProvider, NoopFindReferencesCardProvider, ShowCommentEditorProvider,
     ShowFindReferencesCardProvider,
@@ -186,6 +190,8 @@ struct CodeEditorViewDisplayOptions {
     starting_line_number: Option<usize>,
     gutter_hover_target: GutterHoverTarget,
     line_height_override: Option<f32>,
+    /// Whether to show the VS Code-style minimap on the right.
+    show_minimap: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -283,6 +289,9 @@ pub struct CodeEditorView {
     /// The offset where find references card is anchored (if showing).
     find_references_anchor_offset: Option<CharOffset>,
     window_id: WindowId,
+    /// Bumped on every syntax highlighting update so the minimap rebuilds.
+    minimap_highlight_generation: u64,
+    minimap_cache: RefCell<Option<((BufferVersion, u64), MinimapLines)>>,
 }
 
 impl CodeEditorView {
@@ -295,6 +304,7 @@ impl CodeEditorView {
         render_options: CodeEditorRenderOptions,
         ctx: &mut ViewContext<Self>,
     ) -> Self {
+        vscode_appearance::ensure_loaded(ctx);
         let appearance_handle = Appearance::handle(ctx);
         let font_settings_handle = FontSettings::handle(ctx);
         let initial_styles = code_text_styles(
@@ -415,6 +425,7 @@ impl CodeEditorView {
                 ),
                 gutter_hover_target: GutterHoverTarget::GutterElement,
                 line_height_override: render_options.line_height_override,
+                show_minimap: false,
             },
             pending_scroll: None,
             supports_vim_mode,
@@ -430,6 +441,8 @@ impl CodeEditorView {
             show_find_references_provider: render_options.show_find_references_provider,
             find_references_anchor_offset: None,
             window_id: ctx.window_id(),
+            minimap_highlight_generation: 0,
+            minimap_cache: Default::default(),
         }
     }
 
@@ -943,6 +956,42 @@ impl CodeEditorView {
         self
     }
 
+    pub(crate) fn with_minimap(mut self) -> Self {
+        self.display_options.show_minimap = true;
+        self
+    }
+
+    /// The minimap content, rebuilt when the text or its highlighting changes.
+    fn minimap_lines(&self, app: &AppContext) -> MinimapLines {
+        let model = self.model.as_ref(app);
+        let key = (model.buffer_version(app), self.minimap_highlight_generation);
+        if let Some((cached_key, lines)) = self.minimap_cache.borrow().as_ref()
+            && *cached_key == key
+        {
+            return lines.clone();
+        }
+
+        let buffer = model.buffer().as_ref(app);
+        let text = buffer.text();
+        let mut ranges = RangeSet::new();
+        ranges.insert(CharOffset::from(1)..buffer.max_charoffset());
+        let decoration = model.text_decoration_for_ranges(ranges, None, app);
+        let colors = decoration.base_color_map.as_deref();
+        let default_color = vscode_appearance::palette()
+            .map(|palette| palette.foreground)
+            .unwrap_or_else(|| {
+                let theme = Appearance::as_ref(app).theme();
+                theme.main_text_color(theme.background()).into_solid()
+            });
+        let lines = minimap::build_lines(
+            text.as_str(),
+            |offset| colors.and_then(|colors| colors.get(&CharOffset::from(offset)).copied()),
+            default_color,
+        );
+        *self.minimap_cache.borrow_mut() = Some((key, lines.clone()));
+        lines
+    }
+
     pub(crate) fn with_horizontal_scrollbar_appearance(
         mut self,
         scrollbar_appearance: ScrollableAppearance,
@@ -1238,11 +1287,21 @@ impl CodeEditorView {
         let theme = appearance.theme();
         if self.display_options.show_line_numbers {
             let editor_settings = AppEditorSettings::as_ref(ctx);
+            let vscode = vscode_appearance::get();
+            let palette = vscode_appearance::palette();
             Some(LineNumberConfig {
-                font_family: appearance.monospace_font_family(),
-                font_size: appearance.monospace_font_size(),
-                text_color: theme.sub_text_color(theme.background()).into(),
-                highlight_text_color: theme.main_text_color(theme.background()).into(),
+                font_family: vscode
+                    .and_then(|vscode| vscode.font_family)
+                    .unwrap_or_else(|| appearance.monospace_font_family()),
+                font_size: vscode
+                    .and_then(|vscode| vscode.font_size)
+                    .unwrap_or_else(|| appearance.monospace_font_size()),
+                text_color: palette
+                    .map(|palette| palette.line_number)
+                    .unwrap_or_else(|| theme.sub_text_color(theme.background()).into()),
+                highlight_text_color: palette
+                    .map(|palette| palette.line_number_active)
+                    .unwrap_or_else(|| theme.main_text_color(theme.background()).into()),
                 starting_line_number: self.display_options.starting_line_number,
                 mode: *editor_settings.code_editor_line_number_mode.value(),
                 active_line_number: self.active_cursor_line_for_line_numbers(ctx),
@@ -1281,6 +1340,7 @@ impl CodeEditorView {
                 ctx.notify()
             }
             CodeEditorModelEvent::SyntaxHighlightingUpdated => {
+                self.minimap_highlight_generation += 1;
                 self.nav_bar.update(ctx, |_, ctx| ctx.notify());
                 ctx.notify()
             }
@@ -2344,6 +2404,22 @@ impl View for CodeEditorView {
         .with_propagate_mousewheel_if_not_handled(true)
         .finish();
 
+        let scrollable = if self.display_options.show_minimap {
+            let minimap = minimap::render(
+                self.minimap_lines(app),
+                render_state.clone(),
+                vscode_appearance::palette().map(|palette| palette.background),
+                theme.main_text_color(theme.background()).into_solid(),
+            );
+            Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                .with_child(Shrinkable::new(1., scrollable).finish())
+                .with_child(minimap)
+                .finish()
+        } else {
+            scrollable
+        };
+
         let inner = match self.display_options.vertical_expansion_behavior {
             VerticalExpansionBehavior::InfiniteHeight => scrollable,
             VerticalExpansionBehavior::FillMaxHeight
@@ -2407,7 +2483,12 @@ impl View for CodeEditorView {
                 }
             }
         }
-        stack.finish()
+        match vscode_appearance::palette() {
+            Some(palette) => warpui::elements::Container::new(stack.finish())
+                .with_background_color(palette.background)
+                .finish(),
+            None => stack.finish(),
+        }
     }
 
     fn on_focus(&mut self, focus_ctx: &FocusContext, ctx: &mut ViewContext<Self>) {
@@ -2466,12 +2547,22 @@ pub fn code_text_styles(
 ) -> RichTextStyles {
     let mut styling = rich_text_styles(appearance, font_settings);
     let theme = appearance.theme();
+    let vscode = vscode_appearance::get();
+    let palette = vscode_appearance::palette();
     styling.base_text = ParagraphStyles {
-        font_size: appearance.monospace_font_size(),
-        line_height_ratio: line_height_override.unwrap_or(appearance.line_height_ratio()),
-        font_family: appearance.monospace_font_family(),
+        font_size: vscode
+            .and_then(|vscode| vscode.font_size)
+            .unwrap_or_else(|| appearance.monospace_font_size()),
+        line_height_ratio: line_height_override
+            .or_else(|| vscode.and_then(|vscode| vscode.line_height_ratio))
+            .unwrap_or(appearance.line_height_ratio()),
+        font_family: vscode
+            .and_then(|vscode| vscode.font_family)
+            .unwrap_or_else(|| appearance.monospace_font_family()),
         font_weight: Default::default(),
-        text_color: theme.main_text_color(theme.background()).into_solid(),
+        text_color: palette
+            .map(|palette| palette.foreground)
+            .unwrap_or_else(|| theme.main_text_color(theme.background()).into_solid()),
         baseline_ratio: 0.8,
         fixed_width_tab_size: Some(4),
     };
@@ -2484,6 +2575,14 @@ pub fn code_text_styles(
     styling.cursor_width = 2.;
     // URLs are not clickable in code editors, so we should not highlight them.
     styling.highlight_urls = false;
+    if let Some(palette) = palette {
+        if let Some(selection) = palette.selection {
+            styling.selection_fill = Fill::Solid(selection);
+        }
+        if let Some(cursor) = palette.cursor {
+            styling.cursor_fill = Fill::Solid(cursor);
+        }
+    }
     styling
 }
 

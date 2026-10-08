@@ -1401,6 +1401,7 @@ impl CodeEditorModel {
     }
 
     fn syntax_highlighting_color_map(ctx: &mut ModelContext<Self>) -> ColorMap {
+        crate::code::vscode_appearance::ensure_loaded(ctx);
         let appearance = Appearance::as_ref(ctx);
         let terminal_color = appearance.theme().terminal_colors().normal;
 
@@ -1430,6 +1431,7 @@ impl CodeEditorModel {
             tag_color: AnsiColorIdentifier::Red
                 .to_ansi_color(&terminal_color)
                 .into(),
+            by_capture: crate::code::vscode_appearance::palette().map(|palette| &palette.captures),
         }
     }
 
@@ -1757,7 +1759,10 @@ impl CodeEditorModel {
         } else if selection_model.all_single_cursors() && self.show_current_line_highlights {
             // When diff is not expanded, the only source of line decoration is highlights
             // from the active cursor, e.g. the current line highlight.
-            let overlay = Appearance::as_ref(ctx).theme().surface_2();
+            let overlay = crate::code::vscode_appearance::palette()
+                .and_then(|palette| palette.line_highlight)
+                .map(Fill::Solid)
+                .unwrap_or_else(|| Appearance::as_ref(ctx).theme().surface_2());
             Some(
                 selection_model
                     .selected_lines(ctx)

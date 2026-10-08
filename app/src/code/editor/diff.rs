@@ -23,12 +23,16 @@ use super::super::DiffResult;
 use crate::appearance::Appearance;
 use crate::code::editor::line::EditorLineLocation;
 use crate::code::editor::line_iterator::LineIterator;
+use crate::code::vscode_appearance;
 
 const OVERLAY_ALPHA: u8 = 56;
 const INLINE_OVERLAY_ALPHA: u8 = 71;
 
 /// Get the theme-appropriate add color
 pub(crate) fn add_color(appearance: &Appearance) -> ColorU {
+    if let Some(color) = vscode_appearance::palette().and_then(|palette| palette.gutter_added) {
+        return color;
+    }
     AnsiColorIdentifier::Green
         .to_ansi_color(&appearance.theme().terminal_colors().normal)
         .into()
@@ -36,6 +40,9 @@ pub(crate) fn add_color(appearance: &Appearance) -> ColorU {
 
 /// Get the theme-appropriate remove color
 pub(crate) fn remove_color(appearance: &Appearance) -> ColorU {
+    if let Some(color) = vscode_appearance::palette().and_then(|palette| palette.gutter_deleted) {
+        return color;
+    }
     AnsiColorIdentifier::Red
         .to_ansi_color(&appearance.theme().terminal_colors().normal)
         .into()
@@ -43,6 +50,9 @@ pub(crate) fn remove_color(appearance: &Appearance) -> ColorU {
 
 /// Get the theme-appropriate replace color
 pub(crate) fn replace_color(appearance: &Appearance) -> ColorU {
+    if let Some(color) = vscode_appearance::palette().and_then(|palette| palette.gutter_modified) {
+        return color;
+    }
     AnsiColorIdentifier::Yellow
         .to_ansi_color(&appearance.theme().terminal_colors().normal)
         .into()

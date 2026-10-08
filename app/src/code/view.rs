@@ -388,6 +388,7 @@ impl CodeView {
                             CodeEditorRenderOptions::new(VerticalExpansionBehavior::FillMaxHeight),
                             ctx,
                         )
+                        .with_minimap()
                         .with_horizontal_scrollbar_appearance(
                             warpui::elements::new_scrollable::ScrollableAppearance::new(
                                 warpui::elements::ScrollbarWidth::Auto,
@@ -413,6 +414,7 @@ impl CodeView {
                     ctx,
                 );
                 editor.add_footer(ctx);
+                editor.enable_git_head_diff(ctx);
                 editor
             } else {
                 editor

@@ -274,6 +274,8 @@ pub struct LocalCodeEditorView {
     pub(super) editor: ViewHandle<CodeEditorView>,
     metadata: Option<LoadedFileMetadata>,
     enable_diff_nav_by_default: bool,
+    /// Whether the gutter shows changes against the file at git HEAD.
+    diffs_against_git_head: bool,
     is_new_file: bool,
     diff_type: Option<DiffType>,
     selection_as_context_tooltip: Option<SelectionAsContextTooltip>,
@@ -519,6 +521,7 @@ impl LocalCodeEditorView {
             is_new_file,
             metadata: None,
             enable_diff_nav_by_default,
+            diffs_against_git_head: false,
             file_loaded: Condition::new(),
             selection_as_context_tooltip: None,
             was_edited: false,
@@ -1437,6 +1440,48 @@ impl LocalCodeEditorView {
     }
 
     /// Adds the LSP status footer to the editor view.
+    /// Makes the gutter mark lines changed since the last commit, like VS Code.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn enable_git_head_diff(&mut self, ctx: &mut ViewContext<Self>) {
+        self.diffs_against_git_head = true;
+        if self.file_loaded(ctx) {
+            self.refresh_git_head_base(ctx);
+        }
+    }
+
+    /// Uses the file's content at git HEAD as the diff base. Files outside a
+    /// repo or not committed yet keep no base, so nothing is marked.
+    fn refresh_git_head_base(&mut self, ctx: &mut ViewContext<Self>) {
+        // Agent diffs bring their own base; don't replace it.
+        if !self.diffs_against_git_head || self.diff_type.is_some() {
+            return;
+        }
+        let Some(path) = self.file_path() else {
+            return;
+        };
+        let (Some(directory), Some(file_name)) = (path.parent(), path.file_name()) else {
+            return;
+        };
+        let directory = directory.to_path_buf();
+        let spec = format!("HEAD:./{}", file_name.to_string_lossy());
+        ctx.spawn(
+            async move {
+                warp_util::git::run_git_command(&directory, &["show", &spec])
+                    .await
+                    .ok()
+            },
+            |me, head, ctx| {
+                let Some(head) = head else {
+                    return;
+                };
+                let recompute_diff = me.file_loaded(ctx);
+                me.editor.update(ctx, |editor, ctx| {
+                    editor.set_base(&head, recompute_diff, ctx);
+                });
+            },
+        );
+    }
+
     pub(crate) fn add_footer(&mut self, ctx: &mut ViewContext<Self>) {
         if let Some(path) = self.file_path() {
             let footer =
@@ -1662,6 +1707,7 @@ impl LocalCodeEditorView {
                     // set from the initial load. Accept the new version and
                     // clear any conflict flag.
                     me.has_remote_conflict = false;
+                    me.refresh_git_head_base(ctx);
                     if me.base_content_version.is_some() {
                         me.base_content_version = Some(*content_version);
                         ctx.notify();
@@ -1689,6 +1735,7 @@ impl LocalCodeEditorView {
                         ctx.notify();
                     } else {
                         me.base_content_version = Some(*content_version);
+                        me.refresh_git_head_base(ctx);
                     }
                 }
                 GlobalBufferModelEvent::FileSaved {
@@ -1699,6 +1746,8 @@ impl LocalCodeEditorView {
                     let auto_saved = std::mem::take(&mut me.auto_save_in_flight);
                     me.base_content_version = Some(*content_version);
                     me.has_remote_conflict = false;
+                    // A save may follow a commit made elsewhere; re-read HEAD.
+                    me.refresh_git_head_base(ctx);
                     ctx.emit(LocalCodeEditorEvent::FileSaved { auto_saved });
                 }
                 GlobalBufferModelEvent::FailedToSave { error, .. } => {
