@@ -203,9 +203,9 @@ pub async fn switch_branch(
     })
 }
 
-/// Creates `name` in the slot of every repo, starting from the freshly fetched
-/// base branch. Everything is validated before the first branch is created so a
-/// failure doesn't leave the repos on different branches.
+/// Creates `name` in the slot of every repo: checks out the base branch, pulls it
+/// from the remote and branches off it. Everything is validated before the first
+/// checkout so a failure doesn't leave the repos on different branches.
 pub async fn create_branch(
     workspace: WorktreeWorkspace,
     name: String,
@@ -224,20 +224,17 @@ pub async fn create_branch(
     ensure_slots(&workspace).await?;
     ensure_clean(&workspace.repos.iter().collect::<Vec<_>>()).await?;
 
-    let mut start_points = Vec::with_capacity(workspace.repos.len());
+    let mut plans = Vec::with_capacity(workspace.repos.len());
     for repo in &workspace.repos {
         let has_remote = git(&repo.main, &["remote", "get-url", DEFAULT_REMOTE])
             .await
             .is_ok();
-        if has_remote {
-            git(&repo.main, &["fetch", DEFAULT_REMOTE])
+
+        let exists_on_remote = has_remote
+            && remote_branch_exists(&repo.main, &name)
                 .await
                 .map_err(|err| format!("{}: {err}", repo.name))?;
-        }
-
-        let local_ref = format!("refs/heads/{name}");
-        let remote_ref = format!("refs/remotes/{DEFAULT_REMOTE}/{name}");
-        if ref_exists(&repo.main, &local_ref).await || ref_exists(&repo.main, &remote_ref).await {
+        if exists_on_remote || ref_exists(&repo.main, &format!("refs/heads/{name}")).await {
             return Err(format!(
                 "a branch {name} já existe em {}; busque por ela para abrir",
                 repo.name
@@ -250,37 +247,73 @@ pub async fn create_branch(
                 repo.name
             ));
         };
-        let remote_base = format!("{DEFAULT_REMOTE}/{base}");
-        let start =
-            if has_remote && ref_exists(&repo.main, &format!("refs/remotes/{remote_base}")).await {
-                remote_base
-            } else if ref_exists(&repo.main, &format!("refs/heads/{base}")).await {
-                base
-            } else {
-                return Err(format!("{}: a branch base {base} não existe", repo.name));
-            };
-        start_points.push(start);
+        plans.push((repo, base, has_remote));
     }
 
-    for (repo, start) in workspace.repos.iter().zip(&start_points) {
-        // `--no-track` keeps the new branch from tracking the base branch, so the
-        // first push creates `origin/<name>` instead of pushing to the base.
-        git(
-            &repo.worktree,
-            &["checkout", "--no-track", "-b", &name, start],
-        )
-        .await
-        .map_err(|err| format!("{}: {err}", repo.name))?;
+    for (repo, base, has_remote) in &plans {
+        branch_off_base(repo, base, *has_remote, &name)
+            .await
+            .map_err(|err| format!("{}: {err}", repo.name))?;
     }
 
-    let bases = start_points.join(", ");
+    let mut bases: Vec<&str> = plans.iter().map(|(_, base, _)| base.as_str()).collect();
+    bases.dedup();
     Ok(WorktreeOutcome {
         message: format!(
-            "{}: branch {name} criada a partir de {bases}",
-            workspace.name
+            "{}: branch {name} criada a partir da {}",
+            workspace.name,
+            bases.join(", ")
         ),
         worktree_root: workspace.worktree_root,
     })
+}
+
+/// Creates `name` in the slot of `repo` from the up-to-date `base`.
+///
+/// Only `base` is pulled: fetching every branch fails on case-insensitive
+/// filesystems when the remote has branches that differ only in casing.
+async fn branch_off_base(
+    repo: &RepoSlot,
+    base: &str,
+    has_remote: bool,
+    name: &str,
+) -> Result<(), String> {
+    let slot = &repo.worktree;
+    match git(slot, &["checkout", base]).await {
+        Ok(_) => {
+            if has_remote {
+                git(slot, &["pull", DEFAULT_REMOTE, base]).await?;
+            }
+            git(slot, &["checkout", "-b", name]).await?;
+        }
+        // Git won't check out `base` in the slot while the main checkout has it.
+        Err(err) if is_checked_out_elsewhere(&err) => {
+            let start = if has_remote {
+                git(slot, &["fetch", DEFAULT_REMOTE, base]).await?;
+                format!("{DEFAULT_REMOTE}/{base}")
+            } else {
+                base.to_owned()
+            };
+            // `--no-track` keeps the new branch from tracking the base branch, so the
+            // first push creates `origin/<name>` instead of pushing to the base.
+            git(slot, &["checkout", "--no-track", "-b", name, &start]).await?;
+        }
+        Err(err) => return Err(err),
+    }
+    Ok(())
+}
+
+fn is_checked_out_elsewhere(error: &str) -> bool {
+    error.contains("is already used by worktree") || error.contains("is already checked out at")
+}
+
+/// Asks the remote directly, without fetching into local refs.
+async fn remote_branch_exists(repo: &Path, name: &str) -> Result<bool, String> {
+    let refname = format!("refs/heads/{name}");
+    let heads = git(repo, &["ls-remote", "--heads", DEFAULT_REMOTE, &refname]).await?;
+    Ok(heads
+        .lines()
+        .any(|line| line.split('\t').nth(1) == Some(refname.as_str())))
 }
 
 fn workspace_from_config(cwd: &Path) -> Result<Option<WorktreeWorkspace>, String> {
@@ -479,20 +512,48 @@ async fn ref_exists(repo: &Path, refname: &str) -> bool {
         .is_ok()
 }
 
-/// Runs git and reduces a failure to the first meaningful line of its output.
+/// Runs git and reduces a failure to its error message.
 async fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
     run_git_command(repo, args).await.map_err(|err| {
         let message = err.to_string();
-        let message = message
-            .strip_prefix("Git command failed: ")
-            .unwrap_or(&message);
-        message
-            .lines()
-            .map(|line| line.trim().trim_end_matches(',').trim())
-            .find(|line| !line.is_empty())
-            .unwrap_or("erro desconhecido do git")
-            .to_owned()
+        summarize_git_error(
+            message
+                .strip_prefix("Git command failed: ")
+                .unwrap_or(&message),
+        )
     })
+}
+
+/// The `error:`/`fatal:` message of a failed git command, with its wrapped lines
+/// joined, or its first line when there is none. Progress lines like `From <url>`
+/// come before the error, so the first line alone can hide it.
+fn summarize_git_error(output: &str) -> String {
+    let lines: Vec<&str> = output
+        .lines()
+        .map(|line| line.trim().trim_end_matches(',').trim())
+        .collect();
+    let is_error = |line: &str| line.starts_with("error:") || line.starts_with("fatal:");
+    let Some(start) = lines
+        .iter()
+        .position(|line| is_error(line))
+        .or_else(|| lines.iter().position(|line| !line.is_empty()))
+    else {
+        return "erro desconhecido do git".to_owned();
+    };
+
+    let mut message = lines[start].to_owned();
+    for line in &lines[start + 1..] {
+        let starts_new_message = ["error:", "fatal:", "hint:", "warning:", "remote:"]
+            .iter()
+            .any(|prefix| line.starts_with(prefix));
+        // `run_git_command` appends stdout after the stderr as ", <stdout>".
+        if line.is_empty() || line.starts_with(',') || starts_new_message {
+            break;
+        }
+        message.push(' ');
+        message.push_str(line);
+    }
+    message
 }
 
 fn branch_name_from_ref(refname: &str) -> Option<&str> {
