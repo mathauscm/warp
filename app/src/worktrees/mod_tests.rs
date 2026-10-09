@@ -45,3 +45,40 @@ fn expand_home_resolves_tilde() {
     assert_eq!(expand_home("~/projects"), home.join("projects"));
     assert_eq!(expand_home("/abs/path"), PathBuf::from("/abs/path"));
 }
+
+#[test]
+fn summarize_git_error_skips_progress_and_joins_wrapped_lines() {
+    let output = "From github.com:kinboxapp/kinbox-api-v2\n\
+                  error: You're on a case-insensitive filesystem, and the remote you are\n\
+                  trying to fetch from has references that only differ in casing.\n\
+                  \n\
+                  hint: run git fetch --prune\n\
+                  , ";
+    assert_eq!(
+        summarize_git_error(output),
+        "error: You're on a case-insensitive filesystem, and the remote you are \
+         trying to fetch from has references that only differ in casing."
+    );
+}
+
+#[test]
+fn summarize_git_error_falls_back_to_first_line() {
+    assert_eq!(
+        summarize_git_error("\nsomething went wrong\n, "),
+        "something went wrong"
+    );
+    assert_eq!(summarize_git_error(", "), "erro desconhecido do git");
+}
+
+#[test]
+fn checked_out_elsewhere_matches_old_and_new_git_messages() {
+    assert!(is_checked_out_elsewhere(
+        "fatal: 'master' is already used by worktree at '/w/kinbox/kinbox-web'"
+    ));
+    assert!(is_checked_out_elsewhere(
+        "fatal: 'master' is already checked out at '/w/kinbox/kinbox-web'"
+    ));
+    assert!(!is_checked_out_elsewhere(
+        "error: pathspec 'master' did not match"
+    ));
+}
