@@ -1388,7 +1388,7 @@ impl SingleBlock {
                 &model.image_id_to_metadata,
                 None,
                 false, // hide_cursor_cell
-                &[],
+                grid_renderer::HiddenCells::NONE,
                 ctx,
                 app,
             );
@@ -1446,7 +1446,7 @@ impl SingleBlock {
                 &model.image_id_to_metadata,
                 None,
                 false, // hide_cursor_cell
-                &[],
+                grid_renderer::HiddenCells::NONE,
                 ctx,
                 app,
             );

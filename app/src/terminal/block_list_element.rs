@@ -3817,7 +3817,7 @@ impl Element for BlockListElement {
             use_ligature_rendering: self.use_ligature_rendering,
             hide_cursor_cell: self.hide_cursor_cell,
             beam_cursor: self.beam_cursor,
-            prompt_card: self.prompt_card,
+            prompt_card: self.prompt_card.clone(),
         };
         let block_grid_params = BlockGridParams {
             grid_render_params,

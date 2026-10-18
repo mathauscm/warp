@@ -428,6 +428,13 @@ impl CLIAgentSessionsModel {
         self.sessions.get(&terminal_view_id)
     }
 
+    /// Every running session, with the terminal it runs in.
+    pub fn sessions(&self) -> impl Iterator<Item = (EntityId, &CLIAgentSession)> {
+        self.sessions
+            .iter()
+            .map(|(terminal_view_id, session)| (*terminal_view_id, session))
+    }
+
     /// The terminal running the agent conversation with this session id (as
     /// reported by the agent's plugin), if any.
     pub fn session_by_agent_session_id(

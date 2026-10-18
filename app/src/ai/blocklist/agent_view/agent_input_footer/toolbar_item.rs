@@ -321,10 +321,8 @@ impl AgentToolbarItemKind {
         {
             items.push(Self::ShareSession);
         }
-        items.push(Self::FileExplorer);
-        if FeatureFlag::CLIAgentRichInput.is_enabled() {
-            items.push(Self::RichInput);
-        }
+        // The file explorer has its own button in the tab bar, and the rich input opens with
+        // ctrl-G.
         if cfg!(not(target_family = "wasm")) {
             items.push(Self::Worktree);
         }

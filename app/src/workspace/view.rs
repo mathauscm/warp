@@ -25015,6 +25015,9 @@ impl TypedActionView for Workspace {
                 session_id,
                 command,
             } => self.drop_thread(session_id, command.as_deref(), ctx),
+            CloseClaudeThreadPane { terminal_view_id } => {
+                self.close_thread_pane(*terminal_view_id, ctx);
+            }
             OpenFileInSplitPane { path } => {
                 self.open_file_with_target(
                     path.clone(),

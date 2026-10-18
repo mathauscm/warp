@@ -25,8 +25,11 @@ use crate::settings::{ClaudeTheme, ThemeSettings};
 use crate::terminal::CLIAgent;
 use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
 use crate::terminal::color::{self, BrightColors, Colors, NormalColors, PrimaryColors};
-use crate::terminal::prompt_card::PromptCardStyle;
+use crate::terminal::prompt_card::{PromptCardControls, PromptCardStyle};
 
+/// Horizontal padding of a Claude pane, wider than a terminal's so the prompt card has room on
+/// both sides.
+pub(super) const PADDING_X: f32 = 18.;
 /// Size of the X that closes a lone Claude pane.
 const CLOSE_ICON_SIZE: f32 = 14.;
 /// The Claude app's dark page background.
@@ -112,17 +115,11 @@ impl ClaudePalette {
         }
     }
 
-    /// The Claude app's message box: a raised surface with a hairline border.
-    fn prompt_card(self) -> PromptCardStyle {
+    /// Fill and border of the Claude app's message box: a raised surface with a hairline border.
+    fn prompt_card_colors(self) -> (ColorU, ColorU) {
         match self {
-            Self::Dark => PromptCardStyle {
-                fill: rgb(0x30302e),
-                border: rgb(0x45443f),
-            },
-            Self::Light => PromptCardStyle {
-                fill: rgb(0xffffff),
-                border: rgb(0xdedcd1),
-            },
+            Self::Dark => (rgb(0x30302e), rgb(0x45443f)),
+            Self::Light => (rgb(0xffffff), rgb(0xdedcd1)),
         }
     }
 
@@ -224,16 +221,34 @@ impl TerminalView {
         if !self.runs_claude(app) {
             return None;
         }
-        Some(match ClaudePalette::current(app) {
-            Some(palette) => palette.prompt_card(),
+        let (fill, border) = match ClaudePalette::current(app) {
+            Some(palette) => palette.prompt_card_colors(),
             None => {
                 let theme = Appearance::as_ref(app).theme();
-                PromptCardStyle {
-                    fill: internal_colors::fg_overlay_1(theme).into_solid(),
-                    border: internal_colors::fg_overlay_2(theme).into_solid(),
-                }
+                (
+                    internal_colors::fg_overlay_1(theme).into_solid(),
+                    internal_colors::fg_overlay_2(theme).into_solid(),
+                )
             }
+        };
+        Some(PromptCardStyle {
+            fill,
+            border,
+            controls: Some(PromptCardControls {
+                card_position_id: self.claude_card_position_id(),
+                controls_position_id: self.claude_controls_position_id(),
+            }),
         })
+    }
+
+    /// Save-position id of the card around Claude's prompt; the mention chips sit on top of it.
+    pub(super) fn claude_card_position_id(&self) -> String {
+        format!("terminal_view:claude_card_{}", self.view_id)
+    }
+
+    /// Save-position id of the card's controls row, in place of Claude's status line.
+    pub(super) fn claude_controls_position_id(&self) -> String {
+        format!("terminal_view:claude_controls_{}", self.view_id)
     }
 
     /// Whether Claude Code is the CLI agent running in this pane.

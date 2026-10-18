@@ -284,6 +284,28 @@ where
     None
 }
 
+/// Grid content left blank, e.g. the rules around Claude Code's prompt.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HiddenCells<'a> {
+    pub rows: &'a [usize],
+    pub cells: &'a [Point],
+}
+
+impl HiddenCells<'_> {
+    pub const NONE: HiddenCells<'static> = HiddenCells {
+        rows: &[],
+        cells: &[],
+    };
+
+    fn hides_row(&self, row: usize) -> bool {
+        self.rows.contains(&row)
+    }
+
+    fn hides_cell(&self, point: Point) -> bool {
+        self.cells.contains(&point)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn render_grid<'a>(
     grid: &GridHandler,
@@ -314,7 +336,7 @@ pub fn render_grid<'a>(
     image_metadata: &HashMap<u32, StoredImageMetadata>,
     bg_color_sampler: Option<&mut ColorSampler>,
     hide_cursor_cell: bool,
-    hidden_rows: &[usize], // Grid rows left blank.
+    hidden: HiddenCells<'_>,
     ctx: &mut PaintContext,
     app: &AppContext,
 ) {
@@ -353,7 +375,7 @@ pub fn render_grid<'a>(
                 image_metadata,
                 bg_color_sampler,
                 hide_cursor_cell,
-                hidden_rows,
+                hidden,
                 ctx,
                 app,
             );
@@ -387,7 +409,7 @@ pub fn render_grid<'a>(
                 image_metadata,
                 bg_color_sampler,
                 hide_cursor_cell,
-                hidden_rows,
+                hidden,
                 ctx,
                 app,
             );
@@ -423,7 +445,7 @@ pub fn render_grid<'a>(
                 image_metadata,
                 bg_color_sampler,
                 hide_cursor_cell,
-                hidden_rows,
+                hidden,
                 ctx,
                 app,
             );
@@ -458,7 +480,7 @@ pub fn render_grid<'a>(
                 image_metadata,
                 bg_color_sampler,
                 hide_cursor_cell,
-                hidden_rows,
+                hidden,
                 ctx,
                 app,
             );
@@ -497,7 +519,7 @@ fn render_grid_without_ligatures<'a>(
     image_metadata: &HashMap<u32, StoredImageMetadata>,
     mut bg_color_sampler: Option<&mut ColorSampler>,
     hide_cursor_cell: bool,
-    hidden_rows: &[usize],
+    hidden: HiddenCells<'_>,
     ctx: &mut PaintContext,
     app: &AppContext,
 ) {
@@ -628,7 +650,7 @@ fn render_grid_without_ligatures<'a>(
     }
 
     for (offset, row_idx) in visible_rows.enumerate() {
-        if hidden_rows.contains(&row_idx) {
+        if hidden.hides_row(row_idx) {
             continue;
         }
 
@@ -652,6 +674,10 @@ fn render_grid_without_ligatures<'a>(
 
         for col in 0..grid.columns() {
             let current_point = Point::new(row_idx, col);
+
+            if hidden.hides_cell(current_point) {
+                continue;
+            }
 
             // Skip the cursor cell when CLI agent rich input is open
             // AND the agent draws its own cursor (SHOW_CURSOR is off).
@@ -1015,7 +1041,7 @@ fn render_grid_with_ligatures<'a>(
     image_metadata: &HashMap<u32, StoredImageMetadata>,
     mut bg_color_sampler: Option<&mut ColorSampler>,
     hide_cursor_cell: bool,
-    hidden_rows: &[usize],
+    hidden: HiddenCells<'_>,
     ctx: &mut PaintContext,
     app: &AppContext,
 ) {
@@ -1142,7 +1168,7 @@ fn render_grid_with_ligatures<'a>(
     }
 
     for (offset, row_idx) in visible_rows.enumerate() {
-        if hidden_rows.contains(&row_idx) {
+        if hidden.hides_row(row_idx) {
             continue;
         }
 
@@ -1200,6 +1226,10 @@ fn render_grid_with_ligatures<'a>(
             let mut first_cell_in_secret = FirstCellInSecret::No;
 
             let current_point = Point::new(row_idx, col);
+
+            if hidden.hides_cell(current_point) {
+                continue;
+            }
 
             // Skip the cursor cell when CLI agent rich input is open
             // AND the agent draws its own cursor (SHOW_CURSOR is off).

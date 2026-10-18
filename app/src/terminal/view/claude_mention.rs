@@ -12,7 +12,6 @@ use std::time::Duration;
 use pathfinder_geometry::vector::vec2f;
 use warp_core::ui::Icon as WarpIcon;
 use warp_core::ui::theme::color::internal_colors;
-use warp_terminal::model::escape_sequences::{BRACKETED_PASTE_END, BRACKETED_PASTE_START};
 use warpui::r#async::Timer;
 use warpui::elements::{
     Border, ChildAnchor, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, DropShadow,
@@ -63,7 +62,7 @@ pub(super) struct ClaudeDrag {
 }
 
 /// The selection as a Markdown quote, followed by an empty line for the question about it.
-fn quote(text: &str) -> String {
+pub(super) fn quote(text: &str) -> String {
     let mut quoted = text
         .trim_matches('\n')
         .lines()
@@ -142,8 +141,12 @@ impl TerminalView {
             (MouseButton::Left, MouseAction::Released) => {
                 if let Some(drag) = self.claude_drag.take()
                     && drag.moved
-                    && let Some(anchor) = point
+                    && let Some(released_at) = point
                 {
+                    // A drag can go backwards; the pill belongs under the end of the selection.
+                    let anchor = drag
+                        .start
+                        .map_or(released_at, |start| start.max(released_at));
                     self.watch_for_claude_copy(drag.clipboard_before, anchor, 0, ctx);
                 }
             }
@@ -185,8 +188,8 @@ impl TerminalView {
         }
     }
 
-    /// Sends the selected text to Claude as a quote: into the rich input when it's open, or else
-    /// pasted into Claude's own prompt, which keeps it as an editable draft.
+    /// Mentions the selected text: as a quote in the rich input when it's open, or else as a chip in
+    /// the prompt card that's sent along with the next message.
     pub(super) fn mention_selection_in_claude(&mut self, ctx: &mut ViewContext<Self>) {
         if !self.runs_claude(ctx) {
             return;
@@ -199,23 +202,15 @@ impl TerminalView {
         let Some(text) = text.filter(|text| !text.trim().is_empty()) else {
             return;
         };
-        let quoted = quote(&text);
-
         if CLIAgentSessionsModel::as_ref(ctx).is_input_open(self.view_id) {
+            let quoted = quote(&text);
             self.input.update(ctx, |input, ctx| {
                 input.insert_into_cli_agent_rich_input(&quoted, ctx);
             });
             self.clear_selected_text(ctx);
             self.focus_input_box(ctx);
         } else {
-            // A bracketed paste keeps the line breaks from submitting the prompt.
-            let mut bytes = Vec::with_capacity(
-                BRACKETED_PASTE_START.len() + quoted.len() + BRACKETED_PASTE_END.len(),
-            );
-            bytes.extend_from_slice(BRACKETED_PASTE_START);
-            bytes.extend_from_slice(quoted.as_bytes());
-            bytes.extend_from_slice(BRACKETED_PASTE_END);
-            self.write_user_bytes_to_pty(bytes, ctx);
+            self.add_claude_mention(text, ctx);
             self.clear_selected_text(ctx);
             self.focus_terminal(ctx);
         }

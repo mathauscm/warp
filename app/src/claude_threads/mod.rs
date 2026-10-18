@@ -1,25 +1,30 @@
-//! Claude Code conversations ("threads") grouped by project folder, behind the
-//! Threads panel of the vertical tabs sidebar.
+//! Claude Code conversations ("threads") behind the Threads panel of the vertical tabs sidebar,
+//! sorted into pinned threads, project folders and the recent threads outside every project.
 //!
-//! Projects are folders the user picks. They live in
-//! `~/.warp-oss/claude_threads.toml`:
+//! Projects are folders the user picks. They live in `~/.warp-oss/claude_threads.toml`, with the
+//! pinned threads and the threads moved into a project:
 //!
 //! ```toml
+//! pinned = ["5f0c…"]
+//!
 //! [[project]]
 //! path      = "/Users/me/projects/kinbox"
 //! collapsed = false
+//!
+//! [moved]
+//! "9a1e…" = "/Users/me/projects/kinbox"
 //! ```
 //!
 //! Threads are read straight from Claude Code's transcripts at
 //! `~/.claude/projects/<slug>/<session id>.jsonl`, where the slug is the folder
 //! the conversation started in with every non-alphanumeric character replaced
 //! by `-`. A project lists the conversations started in its folder or in any
-//! folder below it. The only change made under `~/.claude` is deleting a
-//! thread, which moves its transcript to the macOS Trash.
+//! folder below it, plus the ones moved into it. The only changes made under `~/.claude` are
+//! renaming a thread and deleting one, which moves its transcript to the macOS Trash.
 
-use std::collections::{HashMap, HashSet};
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -60,35 +65,75 @@ impl ThreadProject {
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct ConfigFile {
+/// What the Threads panel keeps between launches.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreadsConfig {
+    /// Session ids of the threads listed under "Fixados", most recently pinned first.
+    #[serde(default)]
+    pub pinned: Vec<String>,
+    #[serde(default)]
+    pub pinned_collapsed: bool,
+    #[serde(default)]
+    pub projects_collapsed: bool,
+    #[serde(default)]
+    pub recent_collapsed: bool,
     #[serde(default, rename = "project")]
-    projects: Vec<ThreadProject>,
+    pub projects: Vec<ThreadProject>,
+    /// Project each moved thread is listed under instead of the one holding its folder, by session
+    /// id. The thread still resumes in its own folder.
+    #[serde(default)]
+    pub moved: BTreeMap<String, PathBuf>,
+}
+
+impl ThreadsConfig {
+    pub fn is_pinned(&self, session_id: &str) -> bool {
+        self.pinned.iter().any(|id| id == session_id)
+    }
+
+    /// The listed project a thread belongs to: the one it was moved to, else the one that most
+    /// closely contains its folder.
+    pub fn project_of(&self, thread: &ClaudeThread) -> Option<&Path> {
+        let moved = self
+            .moved
+            .get(&thread.session_id)
+            .and_then(|path| self.projects.iter().find(|project| &project.path == path));
+        if let Some(project) = moved {
+            return Some(&project.path);
+        }
+        self.projects
+            .iter()
+            .map(|project| project.path.as_path())
+            .filter(|path| thread.cwd.starts_with(path))
+            .max_by_key(|path| path.components().count())
+    }
+
+    /// Drops what the config remembers about a deleted thread.
+    pub fn forget_thread(&mut self, session_id: &str) {
+        self.pinned.retain(|id| id != session_id);
+        self.moved.remove(session_id);
+    }
 }
 
 fn config_path() -> PathBuf {
     warp_core::paths::data_dir().join(CONFIG_FILE_NAME)
 }
 
-pub fn load_projects() -> Vec<ThreadProject> {
+pub fn load_config() -> ThreadsConfig {
     let path = config_path();
     let Ok(contents) = std::fs::read_to_string(&path) else {
-        return Vec::new();
+        return ThreadsConfig::default();
     };
-    match toml::from_str::<ConfigFile>(&contents) {
-        Ok(config) => config.projects,
+    match toml::from_str(&contents) {
+        Ok(config) => config,
         Err(err) => {
             log::warn!("Failed to parse {}: {}", path.display(), err.message());
-            Vec::new()
+            ThreadsConfig::default()
         }
     }
 }
 
-pub fn save_projects(projects: &[ThreadProject]) -> std::io::Result<()> {
-    let config = ConfigFile {
-        projects: projects.to_vec(),
-    };
-    let contents = toml::to_string_pretty(&config).map_err(std::io::Error::other)?;
+pub fn save_config(config: &ThreadsConfig) -> std::io::Result<()> {
+    let contents = toml::to_string_pretty(config).map_err(std::io::Error::other)?;
     let path = config_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -133,9 +178,6 @@ pub struct TranscriptCacheEntry {
 
 pub type TranscriptCache = HashMap<PathBuf, TranscriptCacheEntry>;
 
-/// The threads of each project, newest first.
-pub type ProjectThreads = HashMap<PathBuf, Vec<ClaudeThread>>;
-
 /// The name Claude Code gives the transcript folder of `path`.
 pub fn project_slug(path: &Path) -> String {
     path.to_string_lossy()
@@ -144,67 +186,71 @@ pub fn project_slug(path: &Path) -> String {
         .collect()
 }
 
-/// Reads the threads of every project from `~/.claude/projects`.
-pub fn scan(projects: &[PathBuf], cache: &mut TranscriptCache) -> ProjectThreads {
+/// Reads every thread from `~/.claude/projects`, newest first.
+pub fn scan(cache: &mut TranscriptCache) -> Vec<ClaudeThread> {
     match dirs::home_dir() {
-        Some(home) => scan_in(&home.join(".claude").join("projects"), projects, cache),
-        None => projects.iter().map(|p| (p.clone(), Vec::new())).collect(),
+        Some(home) => scan_in(&home.join(".claude").join("projects"), cache),
+        None => Vec::new(),
     }
 }
 
-/// Reads the threads of every project from the transcript folders in `root`.
-pub fn scan_in(root: &Path, projects: &[PathBuf], cache: &mut TranscriptCache) -> ProjectThreads {
-    let mut result: ProjectThreads = projects.iter().map(|p| (p.clone(), Vec::new())).collect();
-    let slugs: Vec<String> = projects.iter().map(|p| project_slug(p)).collect();
+/// Reads every thread from the transcript folders in `root`, newest first.
+pub fn scan_in(root: &Path, cache: &mut TranscriptCache) -> Vec<ClaudeThread> {
+    let mut threads = Vec::new();
     let mut seen = HashSet::new();
-
-    if let Ok(entries) = std::fs::read_dir(root) {
-        for entry in entries.flatten() {
-            let dir_name = entry.file_name().to_string_lossy().into_owned();
-            // The project folder itself or one below it. Sibling folders that
-            // only share the prefix (`kinbox-worktree` for `kinbox`) are
-            // dropped by the `cwd` check below.
-            let is_candidate = slugs.iter().any(|slug| {
-                dir_name == *slug
-                    || dir_name
-                        .strip_prefix(slug.as_str())
-                        .is_some_and(|rest| rest.starts_with('-'))
-            });
-            if !is_candidate {
+    let folders = std::fs::read_dir(root).into_iter().flatten().flatten();
+    for folder in folders {
+        let Ok(files) = std::fs::read_dir(folder.path()) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let path = file.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
                 continue;
             }
-            let Ok(files) = std::fs::read_dir(entry.path()) else {
+            let Ok(metadata) = file.metadata() else {
                 continue;
             };
-            for file in files.flatten() {
-                let path = file.path();
-                if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
-                    continue;
-                }
-                let Ok(metadata) = file.metadata() else {
-                    continue;
-                };
-                seen.insert(path.clone());
-                let Some(thread) = cached_or_read(&path, &metadata, cache) else {
-                    continue;
-                };
-                for project in projects {
-                    if thread.cwd.starts_with(project) {
-                        result
-                            .entry(project.clone())
-                            .or_default()
-                            .push(thread.clone());
-                    }
-                }
-            }
+            seen.insert(path.clone());
+            threads.extend(cached_or_read(&path, &metadata, cache));
         }
     }
-
     cache.retain(|path, _| seen.contains(path));
-    for threads in result.values_mut() {
-        threads.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    threads.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    threads
+}
+
+/// Threads sorted into the sections of the panel.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ThreadGroups {
+    /// In the order of `ThreadsConfig::pinned`.
+    pub pinned: Vec<ClaudeThread>,
+    /// The threads of each listed project that aren't pinned.
+    pub by_project: HashMap<PathBuf, Vec<ClaudeThread>>,
+    /// Threads outside every project and not pinned.
+    pub recent: Vec<ClaudeThread>,
+}
+
+/// Sorts `threads` (newest first) into sections, keeping their order within each.
+pub fn group_threads(threads: Vec<ClaudeThread>, config: &ThreadsConfig) -> ThreadGroups {
+    let mut groups = ThreadGroups::default();
+    for thread in threads {
+        if config.is_pinned(&thread.session_id) {
+            groups.pinned.push(thread);
+        } else if let Some(project) = config.project_of(&thread) {
+            groups
+                .by_project
+                .entry(project.to_path_buf())
+                .or_default()
+                .push(thread);
+        } else {
+            groups.recent.push(thread);
+        }
     }
-    result
+    groups
+        .pinned
+        .sort_by_key(|thread| config.pinned.iter().position(|id| *id == thread.session_id));
+    groups
 }
 
 fn cached_or_read(
@@ -249,6 +295,39 @@ fn read_transcript(path: &Path, modified: SystemTime) -> Option<ClaudeThread> {
         transcript: path.to_path_buf(),
         git_branch,
     })
+}
+
+/// Renames a thread the way Claude Code's `/rename` does: a `custom-title` record appended to its
+/// transcript, which wins over every earlier title, also in `claude --resume`.
+pub fn rename_thread(thread: &ClaudeThread, title: &str) -> Result<String, String> {
+    let title = clean_title(title);
+    if title.is_empty() {
+        return Err("O nome não pode ficar vazio".to_owned());
+    }
+    let record = serde_json::json!({
+        "type": "custom-title",
+        "customTitle": title,
+        "sessionId": thread.session_id,
+    });
+    let mut file = OpenOptions::new()
+        .read(true)
+        .append(true)
+        .open(&thread.transcript)
+        .map_err(|err| err.to_string())?;
+    // Keep the record on its own line, even if the last one wasn't finished.
+    let len = file.metadata().map_err(|err| err.to_string())?.len();
+    let mut separator = "";
+    if len > 0 {
+        let mut last = [0u8; 1];
+        file.seek(SeekFrom::Start(len - 1))
+            .and_then(|_| file.read_exact(&mut last))
+            .map_err(|err| err.to_string())?;
+        if last[0] != b'\n' {
+            separator = "\n";
+        }
+    }
+    writeln!(file, "{separator}{record}").map_err(|err| err.to_string())?;
+    Ok(title)
 }
 
 /// Deletes a thread by moving its transcript, and the folder Claude Code keeps

@@ -9,15 +9,17 @@ use warpui::{AppContext, Element, EntityId, PaintContext};
 
 use super::model::SecretHandle;
 use super::model::ansi::{CursorShape, CursorStyle};
-use super::model::grid::{Dimensions as _, RespectDisplayedOutput};
+use super::model::grid::RespectDisplayedOutput;
 use super::model::image_map::StoredImageMetadata;
 use crate::settings::EnforceMinimumContrast;
-use crate::terminal::grid_renderer::{CellGlyphCache, render_cursor, render_grid};
+use crate::terminal::grid_renderer::{CellGlyphCache, HiddenCells, render_cursor, render_grid};
 use crate::terminal::model::ObfuscateSecrets;
 use crate::terminal::model::blockgrid::{BlockGrid, CursorDisplayPoint};
 use crate::terminal::model::grid::grid_handler::Link;
 use crate::terminal::model::index::Point;
-use crate::terminal::prompt_card::{PromptCardStyle, find_prompt_rules, paint_prompt_card};
+use crate::terminal::prompt_card::{
+    PromptCardFrame, PromptCardMask, PromptCardStyle, paint_prompt_card,
+};
 use crate::terminal::{SizeInfo, color};
 use crate::themes::theme::WarpTheme;
 
@@ -143,26 +145,19 @@ impl BlockGridRenderer for BlockGrid {
         let grid = self.grid_handler();
 
         let grid_render_params = &block_grid_params.grid_render_params;
-        let prompt_rules = grid_render_params
+        let prompt_card = grid_render_params
             .prompt_card
+            .as_ref()
             .filter(|_| grid.displayed_output_rows().is_none())
             .and_then(|style| {
-                let rules = find_prompt_rules(grid, 0..self.len_displayed())?;
-                Some((style, rules))
+                let frame = PromptCardFrame {
+                    grid_origin,
+                    padding_x: grid_render_params.size_info.padding_x_px().as_f32(),
+                    cell_size: grid_render_params.cell_size,
+                    bounds: block_grid_params.bounds,
+                };
+                paint_prompt_card(grid, 0..self.len_displayed(), style, &frame, ctx)
             });
-        let hidden_rows = prompt_rules.map(|(style, rules)| {
-            paint_prompt_card(
-                rules,
-                style,
-                grid_origin,
-                grid_render_params.size_info.padding_x_px().as_f32(),
-                grid_render_params.cell_size,
-                grid.columns(),
-                block_grid_params.bounds,
-                ctx,
-            );
-            rules.rows()
-        });
 
         let obfuscate_secrets = block_grid_params
             .grid_render_params
@@ -203,7 +198,9 @@ impl BlockGridRenderer for BlockGrid {
             image_metadata,
             None,
             block_grid_params.grid_render_params.hide_cursor_cell,
-            hidden_rows.as_ref().map_or(&[], |rows| rows.as_slice()),
+            prompt_card
+                .as_ref()
+                .map_or(HiddenCells::NONE, PromptCardMask::hidden_cells),
             ctx,
             app,
         );

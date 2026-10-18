@@ -21,6 +21,7 @@ use crate::terminal::input::{MenuPositioning, MenuPositioningProvider};
 use crate::ui_components::icons::Icon;
 use crate::view_components::action_button::{ActionButton, ButtonSize, TooltipAlignment};
 
+const LABEL: &str = "Tema";
 const TOOLTIP: &str = "Tema do Claude Code";
 const CHECK_ICON_SIZE: f32 = 14.;
 const THEMES: [ClaudeTheme; 4] = [
@@ -96,7 +97,7 @@ impl ClaudeThemeSelector {
     ) -> Self {
         let current = *ThemeSettings::as_ref(ctx).claude_theme.value();
         let button = ctx.add_typed_action_view(|_ctx| {
-            ActionButton::new(current.label(), AgentInputButtonTheme)
+            ActionButton::new(LABEL, AgentInputButtonTheme)
                 .with_icon(Icon::PaintBrush)
                 .with_tooltip(TOOLTIP)
                 .with_tooltip_alignment(TooltipAlignment::Left)
@@ -132,9 +133,6 @@ impl ClaudeThemeSelector {
 
     fn refresh(&mut self, ctx: &mut ViewContext<Self>) {
         let current = *ThemeSettings::as_ref(ctx).claude_theme.value();
-        self.button.update(ctx, |button, ctx| {
-            button.set_label(current.label(), ctx);
-        });
         self.menu.update(ctx, |menu, ctx| {
             menu.update_menu_items(menu_items(current), ctx);
         });

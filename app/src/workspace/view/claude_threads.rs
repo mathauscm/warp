@@ -1,6 +1,7 @@
-//! Threads panel of the vertical tabs sidebar: Claude Code conversations
-//! grouped by project folder (see `crate::claude_threads`). It takes the place
-//! of the tab list while the header "Threads" button is active.
+//! Threads panel of the vertical tabs sidebar: Claude Code conversations sorted into pinned
+//! threads, project folders and the recent threads outside every project (see
+//! `crate::claude_threads`). It takes the place of the tab list while the header "Threads" button
+//! is active.
 //!
 //! Clicking a thread focuses the tab already running it, or resumes it with
 //! `claude --resume` in a new tab; the `+` of a project starts a new thread in
@@ -12,17 +13,19 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
+use asset_macro::bundled_or_fetched_asset;
 use pathfinder_color::ColorU;
 use pathfinder_geometry::vector::vec2f;
 use warp_core::ui::Icon as WarpIcon;
+use warp_core::ui::theme::Fill as WarpThemeFill;
 use warp_core::ui::theme::color::internal_colors;
-use warp_core::ui::theme::{Fill as WarpThemeFill, HorizontalGradient};
 use warpui::r#async::Timer;
 use warpui::elements::{
-    ChildAnchor, Clipped, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox, Container,
-    CornerRadius, CrossAxisAlignment, DragAxis, Draggable, DraggableState, Element, Empty,
-    Fill as ElementFill, Flex, Hoverable, MainAxisAlignment, MainAxisSize, MouseStateHandle,
-    OffsetPositioning, Padding, ParentAnchor, ParentElement, ParentOffsetBounds, Radius,
+    CacheOption, ChildAnchor, ChildView, Clipped, ClippedScrollStateHandle, ClippedScrollable,
+    ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, DragAxis, Draggable,
+    DraggableState, Element, Empty, Fill as ElementFill, Flex, Hoverable, Image, MainAxisAlignment,
+    MainAxisSize, MouseStateHandle, OffsetPositioning, Padding, ParentAnchor, ParentElement,
+    ParentOffsetBounds, PositionedElementAnchor, PositionedElementOffsetBounds, Radius,
     SavePosition, ScrollbarWidth, Shrinkable, Stack, Text,
 };
 use warpui::fonts::{FamilyId, Properties, Weight};
@@ -39,9 +42,11 @@ use warpui::{
 
 use crate::appearance::Appearance;
 use crate::claude_threads::{
-    self, ClaudeThread, NEW_THREAD_COMMAND, ProjectThreads, ThreadProject, TranscriptCache,
+    self, ClaudeThread, NEW_THREAD_COMMAND, ThreadGroups, ThreadProject, ThreadsConfig,
+    TranscriptCache,
 };
 use crate::editor::{EditorView, Event as EditorEvent, SingleLineEditorOptions, TextOptions};
+use crate::menu::{Event as MenuEvent, Menu, MenuItem, MenuItemFields};
 use crate::terminal::CLIAgent;
 use crate::terminal::cli_agent_sessions::{CLIAgentSessionStatus, CLIAgentSessionsModel};
 use crate::workspace::WorkspaceAction;
@@ -50,13 +55,20 @@ use crate::workspace::util::get_context_target_terminal_view;
 /// How often the transcripts are re-read while the panel is visible, so new
 /// conversations and title changes show up.
 const POLL_INTERVAL: Duration = Duration::from_secs(4);
-/// Threads written to this recently may be open in another Warp window or
-/// app, so they can't be deleted.
-const RECENTLY_ACTIVE: Duration = Duration::from_secs(120);
-/// Threads listed per project until "Mostrar mais" is clicked.
+/// Time given to a deleted thread's Claude session to exit after its pane closes, before its
+/// transcript goes to the Trash.
+const SESSION_EXIT_GRACE: Duration = Duration::from_millis(800);
+/// Title of a thread whose first prompt hasn't been sent yet.
+const NEW_THREAD_TITLE: &str = "Nova thread";
+/// Threads listed per project, and under "Recentes", until "Mostrar mais" is clicked.
 const RECENT_THREAD_LIMIT: usize = 10;
+const MENU_WIDTH: f32 = 210.;
+/// Gap between a thread's "⋯" button and the menu opening to its right.
+const MENU_OFFSET: f32 = 8.;
 const PANEL_PADDING: f32 = 8.;
 const PROJECT_SPACING: f32 = 6.;
+/// Space above every section header but the first.
+const SECTION_SPACING: f32 = 14.;
 const ROW_SPACING: f32 = 1.;
 const ROW_HORIZONTAL_PADDING: f32 = 8.;
 const PROJECT_ROW_VERTICAL_PADDING: f32 = 5.;
@@ -66,49 +78,64 @@ const BUTTON_CORNER_RADIUS: f32 = 6.;
 /// Lines a thread's title up with its project's name, past the chevron.
 const THREAD_INDENT: f32 = CHEVRON_SIZE + ICON_TEXT_GAP;
 const CHEVRON_SIZE: f32 = 12.;
+const SECTION_CHEVRON_SIZE: f32 = 10.;
 const DETAIL_ICON_SIZE: f32 = 11.;
-const LOGO_SIZE: f32 = 13.;
-/// Centers the logo on the title line's text.
-const LOGO_TOP_OFFSET: f32 = 3.;
+const LOGO_SIZE: f32 = 12.;
 const DETAIL_ICON_GAP: f32 = 5.;
 const ACTION_ICON_SIZE: f32 = 14.;
 const ACTION_BUTTON_PADDING: f32 = 3.;
 const ICON_TEXT_GAP: f32 = 6.;
 /// Space between a thread's title and its branch line.
 const LINE_SPACING: f32 = 3.;
-const SECTION_FONT_SIZE: f32 = 11.;
-const BRAND_FONT_SIZE: f32 = 15.;
-const BRAND_HEIGHT: f32 = 46.;
+const SECTION_FONT_SIZE: f32 = 12.;
+const BRAND_FONT_SIZE: f32 = 16.;
+const BRAND_HEIGHT: f32 = 56.;
 const BRAND_ICON_SIZE: f32 = 16.;
-const BRAND_CORNER_RADIUS: f32 = 10.;
+const BRAND_BUTTON_SIZE: f32 = 26.;
 const BRAND_TEXT: ColorU = ColorU {
-    r: 0xf5,
+    r: 0xf4,
     g: 0xf7,
     b: 0xff,
     a: 0xff,
 };
-const BRAND_GRADIENT_LEFT: ColorU = ColorU {
-    r: 0x14,
-    g: 0x22,
-    b: 0x5a,
+/// The blue of "Code", light enough to read on the banner's blues.
+const BRAND_BLUE: ColorU = ColorU {
+    r: 0x7a,
+    g: 0xb0,
+    b: 0xff,
     a: 0xff,
 };
-const BRAND_GRADIENT_RIGHT: ColorU = ColorU {
-    r: 0x3a,
-    g: 0x6c,
-    b: 0xf4,
+const BRAND_BACKGROUND: ColorU = ColorU {
+    r: 0x02,
+    g: 0x07,
+    b: 0x17,
     a: 0xff,
 };
-/// Distances of the banner's vertical drafting lines from its right edge.
-const BRAND_VERTICAL_LINE_OFFSETS: [f32; 2] = [28., 84.];
-const BRAND_HORIZONTAL_LINE_WIDTH: f32 = 140.;
-const BRAND_HORIZONTAL_LINE_INSET: f32 = 12.;
+
 const PROJECT_FONT_SIZE: f32 = 13.;
 const TITLE_FONT_SIZE: f32 = 13.;
 const META_FONT_SIZE: f32 = 11.;
 /// Height of a row's right side, which swaps between the age, status, and
 /// buttons on hover; fixed so the swap doesn't move the row.
 const META_HEIGHT: f32 = ACTION_ICON_SIZE + 2. * ACTION_BUTTON_PADDING;
+
+/// The collapsible parts of the panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadSection {
+    Pinned,
+    Projects,
+    Recent,
+}
+
+impl ThreadSection {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Pinned => "Fixados",
+            Self::Projects => "Projetos",
+            Self::Recent => "Recentes",
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClaudeThreadsAction {
@@ -121,21 +148,45 @@ pub enum ClaudeThreadsAction {
     AddProject,
     RemoveProject(PathBuf),
     ToggleProjectCollapsed(PathBuf),
-    ToggleShowAllThreads(PathBuf),
+    ToggleSection(ThreadSection),
+    /// Shows every thread of a project, or of "Recentes" when `None`.
+    ToggleShowAllThreads(Option<PathBuf>),
     NewThread(PathBuf),
     OpenThread {
         session_id: String,
         cwd: PathBuf,
     },
-    /// First click on the trash button: ask for confirmation in the row.
+    ToggleThreadMenu(String),
+    /// Swaps the open "⋯" menu between its actions and the projects the thread can move to.
+    ShowThreadMenuPage {
+        session_id: String,
+        page: ThreadMenuPage,
+    },
+    TogglePinThread(String),
+    MoveThreadToProject {
+        session_id: String,
+        project: PathBuf,
+    },
+    /// Lists a moved thread under the project of its folder again.
+    ResetThreadProject(String),
+    /// Turns the thread's title into an editor for a new name.
+    StartRenameThread(String),
+    /// Asks for confirmation in the row before deleting.
     AskDeleteThread(String),
     ConfirmDeleteThread(String),
     CancelDeleteThread,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadMenuPage {
+    Actions,
+    Move,
+}
+
 pub struct ClaudeThreadsView {
-    projects: Vec<ThreadProject>,
-    threads: ProjectThreads,
+    config: ThreadsConfig,
+    /// Every thread read from the transcripts, newest first.
+    threads: Vec<ClaudeThread>,
     /// False until the first scan finishes, so empty projects don't flash
     /// "Nenhuma conversa" while loading.
     has_scanned: bool,
@@ -146,8 +197,17 @@ pub struct ClaudeThreadsView {
     is_visible: bool,
     /// Projects showing every thread instead of the latest `RECENT_THREAD_LIMIT`.
     show_all_threads: HashSet<PathBuf>,
-    /// The thread whose row is asking "Apagar?".
+    show_all_recent: bool,
+    /// The thread whose row is asking "Excluir?".
     pending_delete: Option<String>,
+    /// Threads on their way to the Trash, hidden from the list meanwhile.
+    deleting: HashSet<String>,
+    thread_menu: ViewHandle<Menu<ClaudeThreadsAction>>,
+    /// The thread whose "⋯" menu is open.
+    menu_open_for: Option<String>,
+    /// Set while the menu swaps to its projects page, so the close that follows selecting
+    /// "Mover para projeto" leaves it open.
+    keep_menu_open: bool,
     scroll_state: ClippedScrollStateHandle,
     /// Hover state of each row and button, keyed by what it belongs to.
     mouse_states: RefCell<HashMap<String, MouseStateHandle>>,
@@ -157,8 +217,11 @@ pub struct ClaudeThreadsView {
     /// The window whose focused pane gets its thread highlighted.
     window_id: WindowId,
     search_editor: ViewHandle<EditorView>,
+    rename_editor: ViewHandle<EditorView>,
+    /// The thread whose title is being edited.
+    renaming: Option<String>,
     /// Lowercased; while set, only the threads whose title or branch contain it are listed, with
-    /// every project expanded.
+    /// every section and project expanded.
     search_query: String,
 }
 
@@ -180,6 +243,35 @@ impl ClaudeThreadsView {
                 ctx.notify();
             }
         });
+        let rename_editor = ctx.add_typed_action_view(|ctx| {
+            let appearance = Appearance::as_ref(ctx);
+            let options = SingleLineEditorOptions {
+                text: TextOptions::ui_text(Some(TITLE_FONT_SIZE), appearance),
+                ..Default::default()
+            };
+            EditorView::single_line(options, ctx)
+        });
+        ctx.subscribe_to_view(&rename_editor, |me, _, event, ctx| match event {
+            EditorEvent::Enter => me.finish_rename(ctx),
+            EditorEvent::Escape | EditorEvent::Blurred => me.cancel_rename(ctx),
+            _ => {}
+        });
+        let thread_menu = ctx.add_typed_action_view(|_| {
+            Menu::new()
+                .prevent_interaction_with_other_elements()
+                .with_drop_shadow()
+                .with_width(MENU_WIDTH)
+        });
+        ctx.subscribe_to_view(&thread_menu, |me, _, event, ctx| match event {
+            MenuEvent::Close { via_select_item } => {
+                if *via_select_item && std::mem::take(&mut me.keep_menu_open) {
+                    return;
+                }
+                me.menu_open_for = None;
+                ctx.notify();
+            }
+            MenuEvent::ItemSelected | MenuEvent::ItemHovered => {}
+        });
         // Status dots follow the Claude sessions running in the tabs.
         ctx.subscribe_to_model(&CLIAgentSessionsModel::handle(ctx), |me, _, _, ctx| {
             if me.is_visible {
@@ -187,19 +279,26 @@ impl ClaudeThreadsView {
             }
         });
         Self {
-            projects: claude_threads::load_projects(),
-            threads: ProjectThreads::new(),
+            config: claude_threads::load_config(),
+            threads: Vec::new(),
             has_scanned: false,
             transcript_cache: Arc::new(Mutex::new(TranscriptCache::new())),
             scan_epoch: 0,
             is_visible: false,
             show_all_threads: HashSet::new(),
+            show_all_recent: false,
             pending_delete: None,
+            deleting: HashSet::new(),
+            thread_menu,
+            menu_open_for: None,
+            keep_menu_open: false,
             scroll_state: ClippedScrollStateHandle::default(),
             mouse_states: RefCell::new(HashMap::new()),
             drag_states: RefCell::new(HashMap::new()),
             window_id: ctx.window_id(),
             search_editor,
+            rename_editor,
+            renaming: None,
             search_query: String::new(),
         }
     }
@@ -226,13 +325,12 @@ impl ClaudeThreadsView {
     fn schedule_scan(&mut self, delay: Duration, ctx: &mut ViewContext<Self>) {
         self.scan_epoch += 1;
         let epoch = self.scan_epoch;
-        let projects: Vec<PathBuf> = self.projects.iter().map(|p| p.path.clone()).collect();
         let cache = self.transcript_cache.clone();
         ctx.spawn(
             async move {
                 Timer::after(delay).await;
                 let mut cache = cache.lock().unwrap_or_else(PoisonError::into_inner);
-                claude_threads::scan(&projects, &mut cache)
+                claude_threads::scan(&mut cache)
             },
             move |me, threads, ctx| {
                 if me.scan_epoch != epoch {
@@ -264,34 +362,89 @@ impl ClaudeThreadsView {
     }
 
     fn add_project(&mut self, path: PathBuf, ctx: &mut ViewContext<Self>) {
-        if self.projects.iter().any(|project| project.path == path) {
+        if self
+            .config
+            .projects
+            .iter()
+            .any(|project| project.path == path)
+        {
             return;
         }
-        self.projects.push(ThreadProject::new(path));
-        self.save_projects();
-        self.schedule_scan(Duration::ZERO, ctx);
+        self.config.projects.push(ThreadProject::new(path));
+        self.config.projects_collapsed = false;
+        self.save_config();
         ctx.notify();
     }
 
     fn remove_project(&mut self, path: &Path, ctx: &mut ViewContext<Self>) {
-        self.projects.retain(|project| project.path != path);
-        self.threads.remove(path);
+        self.config.projects.retain(|project| project.path != path);
+        self.config.moved.retain(|_, project| project != path);
         self.show_all_threads.remove(path);
-        self.save_projects();
+        self.save_config();
         ctx.notify();
     }
 
     fn toggle_project_collapsed(&mut self, path: &Path, ctx: &mut ViewContext<Self>) {
-        if let Some(project) = self.projects.iter_mut().find(|p| p.path == path) {
+        if let Some(project) = self.config.projects.iter_mut().find(|p| p.path == path) {
             project.collapsed = !project.collapsed;
-            self.save_projects();
+            self.save_config();
             ctx.notify();
         }
     }
 
-    fn save_projects(&self) {
-        if let Err(err) = claude_threads::save_projects(&self.projects) {
-            log::warn!("Failed to save Claude threads projects: {err}");
+    fn toggle_section(&mut self, section: ThreadSection, ctx: &mut ViewContext<Self>) {
+        let collapsed = match section {
+            ThreadSection::Pinned => &mut self.config.pinned_collapsed,
+            ThreadSection::Projects => &mut self.config.projects_collapsed,
+            ThreadSection::Recent => &mut self.config.recent_collapsed,
+        };
+        *collapsed = !*collapsed;
+        self.save_config();
+        ctx.notify();
+    }
+
+    fn is_section_collapsed(&self, section: ThreadSection) -> bool {
+        self.search_query.is_empty()
+            && match section {
+                ThreadSection::Pinned => self.config.pinned_collapsed,
+                ThreadSection::Projects => self.config.projects_collapsed,
+                ThreadSection::Recent => self.config.recent_collapsed,
+            }
+    }
+
+    fn toggle_pin(&mut self, session_id: &str, ctx: &mut ViewContext<Self>) {
+        if self.config.is_pinned(session_id) {
+            self.config.pinned.retain(|id| id != session_id);
+        } else {
+            self.config.pinned.insert(0, session_id.to_owned());
+            self.config.pinned_collapsed = false;
+        }
+        self.save_config();
+        ctx.notify();
+    }
+
+    fn move_to_project(&mut self, session_id: &str, project: &Path, ctx: &mut ViewContext<Self>) {
+        self.config
+            .moved
+            .insert(session_id.to_owned(), project.to_path_buf());
+        if let Some(project) = self.config.projects.iter_mut().find(|p| p.path == project) {
+            project.collapsed = false;
+        }
+        self.config.projects_collapsed = false;
+        self.save_config();
+        ctx.notify();
+    }
+
+    fn reset_project(&mut self, session_id: &str, ctx: &mut ViewContext<Self>) {
+        if self.config.moved.remove(session_id).is_some() {
+            self.save_config();
+            ctx.notify();
+        }
+    }
+
+    fn save_config(&self) {
+        if let Err(err) = claude_threads::save_config(&self.config) {
+            log::warn!("Failed to save the Claude threads config: {err}");
         }
     }
 
@@ -307,46 +460,235 @@ impl ClaudeThreadsView {
             });
             return;
         }
-        let Some((project, thread)) = self.threads.iter().find_map(|(project, threads)| {
-            let thread = threads
-                .iter()
-                .find(|thread| thread.session_id == session_id)?;
-            Some((project, thread))
-        }) else {
+        let Some(thread) = self.find_thread(session_id) else {
             return;
         };
         let Some(command) = thread.resume_command() else {
             return;
         };
+        let group = self.config.project_of(thread).map(project_group_name);
         ctx.dispatch_typed_action_deferred(WorkspaceAction::RunCommandInNewTab {
             directory: cwd.to_path_buf(),
             command,
-            group: Some(project_group_name(project)),
+            group,
         });
     }
 
-    /// Moves the thread's transcript to the Trash and drops it from the list.
+    /// Closes the tab running the thread, if any, then moves its transcript to the Trash.
     fn delete_thread(&mut self, session_id: &str, ctx: &mut ViewContext<Self>) {
         self.pending_delete = None;
-        let thread = self
-            .threads
-            .values()
-            .flatten()
-            .find(|thread| thread.session_id == session_id)
-            .cloned();
-        let Some(thread) = thread else {
+        self.config.forget_thread(session_id);
+        self.save_config();
+        let running_in = CLIAgentSessionsModel::as_ref(ctx)
+            .session_by_agent_session_id(session_id)
+            .map(|(terminal_view_id, _)| terminal_view_id);
+        if let Some(terminal_view_id) = running_in {
+            ctx.dispatch_typed_action_deferred(WorkspaceAction::CloseClaudeThreadPane {
+                terminal_view_id,
+            });
+        }
+        // A thread that hasn't written a transcript yet goes away with its tab.
+        let Some(thread) = self
+            .find_thread(session_id)
+            .filter(|thread| !thread.transcript.as_os_str().is_empty())
+            .cloned()
+        else {
             ctx.notify();
             return;
         };
-        match claude_threads::trash_thread(&thread) {
-            Ok(()) => {
-                for threads in self.threads.values_mut() {
-                    threads.retain(|t| t.session_id != session_id);
+        let delay = if running_in.is_some() {
+            SESSION_EXIT_GRACE
+        } else {
+            Duration::ZERO
+        };
+        let session_id = session_id.to_owned();
+        self.deleting.insert(session_id.clone());
+        ctx.spawn(
+            async move {
+                Timer::after(delay).await;
+                claude_threads::trash_thread(&thread)
+            },
+            move |me, result, ctx| {
+                me.deleting.remove(&session_id);
+                match result {
+                    Ok(()) => me.threads.retain(|t| t.session_id != session_id),
+                    Err(err) => log::warn!("Failed to move Claude thread to the Trash: {err}"),
                 }
+                ctx.notify();
+            },
+        );
+        ctx.notify();
+    }
+
+    fn find_thread(&self, session_id: &str) -> Option<&ClaudeThread> {
+        self.threads
+            .iter()
+            .find(|thread| thread.session_id == session_id)
+    }
+
+    fn start_rename(&mut self, session_id: &str, ctx: &mut ViewContext<Self>) {
+        let Some(title) = self
+            .find_thread(session_id)
+            .map(|thread| thread.title.clone())
+        else {
+            return;
+        };
+        self.pending_delete = None;
+        self.renaming = Some(session_id.to_owned());
+        self.rename_editor.update(ctx, |editor, ctx| {
+            editor.clear_buffer_and_reset_undo_stack(ctx);
+            editor.insert_selected_text(&title, ctx);
+        });
+        ctx.focus(&self.rename_editor);
+        ctx.notify();
+    }
+
+    fn finish_rename(&mut self, ctx: &mut ViewContext<Self>) {
+        let Some(session_id) = self.renaming.take() else {
+            return;
+        };
+        let name = self.rename_editor.as_ref(ctx).buffer_text(ctx);
+        if let Some(thread) = self.find_thread(&session_id).cloned()
+            && name.trim() != thread.title
+        {
+            match claude_threads::rename_thread(&thread, &name) {
+                // Shown right away; the next scan reads it back from the transcript.
+                Ok(title) => {
+                    for thread in &mut self.threads {
+                        if thread.session_id == session_id {
+                            thread.title = title.clone();
+                        }
+                    }
+                }
+                Err(err) => log::warn!("Failed to rename Claude thread: {err}"),
             }
-            Err(err) => log::warn!("Failed to move Claude thread to the Trash: {err}"),
         }
         ctx.notify();
+    }
+
+    fn cancel_rename(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.renaming.take().is_some() {
+            ctx.notify();
+        }
+    }
+
+    /// Opens the "⋯" menu of a thread, or closes it when it's already open there.
+    fn toggle_thread_menu(&mut self, session_id: &str, ctx: &mut ViewContext<Self>) {
+        if self.menu_open_for.as_deref() == Some(session_id) {
+            self.menu_open_for = None;
+            ctx.notify();
+            return;
+        }
+        let items = self.thread_menu_items(session_id, ctx);
+        self.thread_menu
+            .update(ctx, |menu, ctx| menu.set_items(items, ctx));
+        self.pending_delete = None;
+        self.keep_menu_open = false;
+        self.menu_open_for = Some(session_id.to_owned());
+        ctx.notify();
+    }
+
+    fn thread_menu_items(
+        &self,
+        session_id: &str,
+        app: &AppContext,
+    ) -> Vec<MenuItem<ClaudeThreadsAction>> {
+        let id = session_id.to_owned();
+        let thread = self.find_thread(session_id);
+        let mut items = Vec::new();
+        // Threads that haven't written a transcript yet have nothing to store a name in.
+        if thread.is_some_and(|thread| !thread.transcript.as_os_str().is_empty()) {
+            items.push(
+                MenuItemFields::new("Renomear")
+                    .with_icon(WarpIcon::Pencil)
+                    .with_on_select_action(ClaudeThreadsAction::StartRenameThread(id.clone()))
+                    .into_item(),
+            );
+        }
+        let pin_label = if self.config.is_pinned(session_id) {
+            "Desafixar"
+        } else {
+            "Fixar"
+        };
+        items.push(
+            MenuItemFields::new(pin_label)
+                .with_icon(WarpIcon::Pin)
+                .with_on_select_action(ClaudeThreadsAction::TogglePinThread(id.clone()))
+                .into_item(),
+        );
+        if !self.move_destinations(session_id).is_empty()
+            || self.config.moved.contains_key(session_id)
+        {
+            items.push(
+                MenuItemFields::new("Mover para projeto")
+                    .with_icon(WarpIcon::Folder)
+                    .with_right_side_icon(WarpIcon::ChevronRight)
+                    .with_on_select_action(ClaudeThreadsAction::ShowThreadMenuPage {
+                        session_id: id.clone(),
+                        page: ThreadMenuPage::Move,
+                    })
+                    .into_item(),
+            );
+        }
+        items.push(MenuItem::Separator);
+        let red = Appearance::as_ref(app).theme().ansi_fg_red();
+        items.push(
+            MenuItemFields::new("Excluir")
+                .with_icon(WarpIcon::Trash)
+                .with_override_text_color(red)
+                .with_override_icon_color(WarpThemeFill::Solid(red))
+                .with_on_select_action(ClaudeThreadsAction::AskDeleteThread(id))
+                .into_item(),
+        );
+        items
+    }
+
+    /// The projects a thread can move to: every project but the one it's listed under.
+    fn move_destinations(&self, session_id: &str) -> Vec<&ThreadProject> {
+        let current_project = self
+            .find_thread(session_id)
+            .and_then(|thread| self.config.project_of(thread));
+        self.config
+            .projects
+            .iter()
+            .filter(|project| Some(project.path.as_path()) != current_project)
+            .collect()
+    }
+
+    /// The second page of the "⋯" menu: back to the first page, then the projects.
+    fn move_menu_items(&self, session_id: &str) -> Vec<MenuItem<ClaudeThreadsAction>> {
+        let id = session_id.to_owned();
+        let mut items = vec![
+            MenuItemFields::new("Mover para projeto")
+                .with_icon(WarpIcon::ChevronLeft)
+                .with_on_select_action(ClaudeThreadsAction::ShowThreadMenuPage {
+                    session_id: id.clone(),
+                    page: ThreadMenuPage::Actions,
+                })
+                .into_item(),
+            MenuItem::Separator,
+        ];
+        for project in self.move_destinations(session_id) {
+            items.push(
+                MenuItemFields::new(project.name())
+                    .with_icon(WarpIcon::Folder)
+                    .with_on_select_action(ClaudeThreadsAction::MoveThreadToProject {
+                        session_id: id.clone(),
+                        project: project.path.clone(),
+                    })
+                    .into_item(),
+            );
+        }
+        if self.config.moved.contains_key(session_id) {
+            items.push(MenuItem::Separator);
+            items.push(
+                MenuItemFields::new("Voltar para a pasta de origem")
+                    .with_icon(WarpIcon::ReverseLeft)
+                    .with_on_select_action(ClaudeThreadsAction::ResetThreadProject(id))
+                    .into_item(),
+            );
+        }
+        items
     }
 
     fn mouse_state(&self, key: String) -> MouseStateHandle {
@@ -368,19 +710,20 @@ impl ClaudeThreadsView {
     /// Moves the dragged project to the slot of the project block under the
     /// cursor. The order is saved when the drag ends.
     fn drag_project(&mut self, path: &Path, position: RectF, ctx: &mut ViewContext<Self>) {
-        let Some(from) = self.projects.iter().position(|p| p.path == path) else {
+        let projects = &mut self.config.projects;
+        let Some(from) = projects.iter().position(|p| p.path == path) else {
             return;
         };
         let cursor_y = position.center().y();
-        let to = self.projects.iter().position(|project| {
+        let to = projects.iter().position(|project| {
             ctx.element_position_by_id(project_block_position_id(&project.path))
                 .is_some_and(|rect| rect.min_y() <= cursor_y && cursor_y < rect.max_y())
         });
         if let Some(to) = to
             && to != from
         {
-            let project = self.projects.remove(from);
-            self.projects.insert(to, project);
+            let project = projects.remove(from);
+            projects.insert(to, project);
             ctx.notify();
         }
     }
@@ -390,6 +733,11 @@ impl ClaudeThreadsView {
 /// where a dragged project would land.
 fn project_block_position_id(path: &Path) -> String {
     format!("claude_threads_project_block:{}", path.display())
+}
+
+/// Save-position id of a thread's "⋯" button, which its menu hangs from.
+fn thread_menu_button_position_id(session_id: &str) -> String {
+    format!("claude_threads_menu_button:{session_id}")
 }
 
 /// Quotes `path` for a POSIX shell.
@@ -417,10 +765,15 @@ impl TypedActionView for ClaudeThreadsView {
             ClaudeThreadsAction::ToggleProjectCollapsed(path) => {
                 self.toggle_project_collapsed(path, ctx);
             }
-            ClaudeThreadsAction::ToggleShowAllThreads(path) => {
+            ClaudeThreadsAction::ToggleSection(section) => self.toggle_section(*section, ctx),
+            ClaudeThreadsAction::ToggleShowAllThreads(Some(path)) => {
                 if !self.show_all_threads.remove(path) {
                     self.show_all_threads.insert(path.clone());
                 }
+                ctx.notify();
+            }
+            ClaudeThreadsAction::ToggleShowAllThreads(None) => {
+                self.show_all_recent = !self.show_all_recent;
                 ctx.notify();
             }
             ClaudeThreadsAction::NewThread(path) => {
@@ -434,6 +787,30 @@ impl TypedActionView for ClaudeThreadsView {
                 self.pending_delete = None;
                 self.open_thread(session_id, cwd, ctx);
             }
+            ClaudeThreadsAction::ToggleThreadMenu(session_id) => {
+                self.toggle_thread_menu(session_id, ctx);
+            }
+            ClaudeThreadsAction::ShowThreadMenuPage { session_id, page } => {
+                let items = match page {
+                    ThreadMenuPage::Actions => self.thread_menu_items(session_id, ctx),
+                    ThreadMenuPage::Move => self.move_menu_items(session_id),
+                };
+                self.thread_menu
+                    .update(ctx, |menu, ctx| menu.set_items(items, ctx));
+                self.keep_menu_open = true;
+                ctx.notify();
+            }
+            ClaudeThreadsAction::TogglePinThread(session_id) => self.toggle_pin(session_id, ctx),
+            ClaudeThreadsAction::MoveThreadToProject {
+                session_id,
+                project,
+            } => self.move_to_project(session_id, project, ctx),
+            ClaudeThreadsAction::ResetThreadProject(session_id) => {
+                self.reset_project(session_id, ctx);
+            }
+            ClaudeThreadsAction::StartRenameThread(session_id) => {
+                self.start_rename(session_id, ctx);
+            }
             ClaudeThreadsAction::AskDeleteThread(session_id) => {
                 self.pending_delete = Some(session_id.clone());
                 ctx.notify();
@@ -445,7 +822,7 @@ impl TypedActionView for ClaudeThreadsView {
                 self.drag_project(path, *position, ctx);
             }
             ClaudeThreadsAction::DropProject => {
-                self.save_projects();
+                self.save_config();
                 ctx.notify();
             }
             ClaudeThreadsAction::CancelDeleteThread => {
@@ -511,6 +888,17 @@ impl Fonts {
     }
 }
 
+/// What every row of a render needs.
+#[derive(Clone, Copy)]
+struct RowContext<'a> {
+    now: SystemTime,
+    active_terminal_id: Option<EntityId>,
+    palette: Palette,
+    fonts: Fonts,
+    appearance: &'a Appearance,
+    app: &'a AppContext,
+}
+
 impl View for ClaudeThreadsView {
     fn ui_name() -> &'static str {
         "ClaudeThreadsView"
@@ -519,52 +907,61 @@ impl View for ClaudeThreadsView {
     fn render(&self, app: &AppContext) -> Box<dyn Element> {
         let appearance = Appearance::as_ref(app);
         let theme = appearance.theme();
-        let palette = Palette::new(appearance);
-        let fonts = Fonts::new(appearance);
-        let active_terminal_id =
-            get_context_target_terminal_view(self.window_id, app).map(|view| view.id());
+        let rows = RowContext {
+            now: SystemTime::now(),
+            active_terminal_id: get_context_target_terminal_view(self.window_id, app)
+                .map(|view| view.id()),
+            palette: Palette::new(appearance),
+            fonts: Fonts::new(appearance),
+            appearance,
+            app,
+        };
+        let groups =
+            claude_threads::group_threads(self.listed_threads(rows.now, app), &self.config);
+        let is_searching = !self.search_query.is_empty();
 
         let mut list = Flex::column()
             .with_main_axis_size(MainAxisSize::Min)
             .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
-            .with_spacing(PROJECT_SPACING);
-        if self.projects.is_empty() {
-            list.add_child(render_empty_state(palette, fonts));
-        }
-        let now = SystemTime::now();
-        let is_searching = !self.search_query.is_empty();
-        let mut has_matches = false;
-        for project in &self.projects {
-            let matches = self.matching_threads(project);
-            if is_searching && matches.is_empty() {
-                continue;
+            .with_spacing(ROW_SPACING);
+        let mut is_first_section = true;
+        let mut add_section_header = |list: &mut Flex, section| {
+            list.add_child(self.render_section_header(section, is_first_section, rows));
+            is_first_section = false;
+        };
+
+        if !groups.pinned.is_empty() {
+            add_section_header(&mut list, ThreadSection::Pinned);
+            if !self.is_section_collapsed(ThreadSection::Pinned) {
+                for thread in &groups.pinned {
+                    let project = self.config.project_of(thread);
+                    list.add_child(self.render_thread_row(thread, project, 0., rows));
+                }
             }
-            has_matches = true;
-            let mut block = Flex::column()
-                .with_main_axis_size(MainAxisSize::Min)
-                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
-                .with_spacing(ROW_SPACING)
-                .with_child(self.render_project_row(project, palette, fonts, appearance));
-            if is_searching || !project.collapsed {
-                self.add_thread_rows(
-                    &mut block,
-                    project,
-                    &matches,
-                    now,
-                    active_terminal_id,
-                    palette,
-                    fonts,
-                    appearance,
-                    app,
-                );
-            }
-            list.add_child(
-                SavePosition::new(block.finish(), &project_block_position_id(&project.path))
-                    .finish(),
-            );
         }
+
+        let has_project_matches = groups
+            .by_project
+            .values()
+            .any(|threads| !threads.is_empty());
+        if !is_searching || has_project_matches {
+            add_section_header(&mut list, ThreadSection::Projects);
+            if !self.is_section_collapsed(ThreadSection::Projects) {
+                list.add_child(self.render_projects(&groups, rows));
+            }
+        }
+
+        if !groups.recent.is_empty() {
+            add_section_header(&mut list, ThreadSection::Recent);
+            if !self.is_section_collapsed(ThreadSection::Recent) {
+                self.add_thread_rows(&mut list, &groups.recent, None, 0., rows);
+            }
+        }
+
+        let has_matches =
+            !groups.pinned.is_empty() || has_project_matches || !groups.recent.is_empty();
         if is_searching && !has_matches {
-            list.add_child(render_note("Nenhuma thread encontrada", palette, fonts));
+            list.add_child(render_note("Nenhuma thread encontrada", 0., rows));
         }
 
         let scrollable = ClippedScrollable::vertical(
@@ -581,36 +978,74 @@ impl View for ClaudeThreadsView {
         .with_overlayed_scrollbar()
         .finish();
 
-        Flex::column()
+        let panel = Flex::column()
             .with_main_axis_size(MainAxisSize::Max)
             .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
-            .with_child(self.render_brand(fonts))
-            .with_child(self.render_search_bar(palette))
-            .with_child(self.render_header(palette, fonts, appearance))
+            .with_child(self.render_brand(rows.fonts))
+            .with_child(self.render_search_bar(rows.palette))
             .with_child(Shrinkable::new(1., scrollable).finish())
-            .finish()
+            .finish();
+        let mut stack = Stack::new().with_child(panel);
+        if let Some(session_id) = &self.menu_open_for {
+            stack.add_positioned_overlay_child(
+                ChildView::new(&self.thread_menu).finish(),
+                OffsetPositioning::offset_from_save_position_element(
+                    thread_menu_button_position_id(session_id),
+                    vec2f(MENU_OFFSET, 0.),
+                    PositionedElementOffsetBounds::WindowByPosition,
+                    PositionedElementAnchor::TopRight,
+                    ChildAnchor::TopLeft,
+                ),
+            );
+        }
+        stack.finish()
     }
 }
 
 impl ClaudeThreadsView {
-    /// A project's threads, narrowed down to the search query.
-    fn matching_threads(&self, project: &ThreadProject) -> Vec<&ClaudeThread> {
-        let threads = self
-            .threads
-            .get(&project.path)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        if self.search_query.is_empty() {
-            return threads.iter().collect();
-        }
-        threads
-            .iter()
-            .filter(|thread| {
+    /// The scanned threads narrowed down to the search query, minus the ones being deleted.
+    /// Claude sessions that just started come first, before Claude writes their transcript, so a
+    /// new thread is in the list right away.
+    fn listed_threads(&self, now: SystemTime, app: &AppContext) -> Vec<ClaudeThread> {
+        let mut threads = self.pending_threads(now, app);
+        threads.extend(self.threads.iter().cloned());
+        threads.retain(|thread| !self.deleting.contains(&thread.session_id));
+        if !self.search_query.is_empty() {
+            threads.retain(|thread| {
                 thread.title.to_lowercase().contains(&self.search_query)
                     || thread
                         .git_branch
                         .as_ref()
                         .is_some_and(|branch| branch.to_lowercase().contains(&self.search_query))
+            });
+        }
+        threads
+    }
+
+    /// Claude sessions running in a tab that no scanned thread covers yet.
+    fn pending_threads(&self, now: SystemTime, app: &AppContext) -> Vec<ClaudeThread> {
+        CLIAgentSessionsModel::as_ref(app)
+            .sessions()
+            .filter(|(_, session)| session.agent == CLIAgent::Claude)
+            .filter_map(|(_, session)| {
+                let context = &session.session_context;
+                let session_id = context.session_id.clone()?;
+                let cwd = PathBuf::from(context.cwd.as_deref()?);
+                let is_scanned = self.find_thread(&session_id).is_some();
+                (!is_scanned).then(|| ClaudeThread {
+                    title: context
+                        .query
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|query| !query.is_empty())
+                        .unwrap_or(NEW_THREAD_TITLE)
+                        .to_owned(),
+                    session_id,
+                    cwd,
+                    updated_at: now,
+                    transcript: PathBuf::new(),
+                    git_branch: None,
+                })
             })
             .collect()
     }
@@ -654,61 +1089,162 @@ impl ClaudeThreadsView {
         .finish()
     }
 
-    /// "Threads" title with the button that adds a project folder.
-    fn render_header(
+    /// The name of a section with a chevron after it; clicking it collapses or expands the
+    /// section. "Projetos" also gets the button that adds a project folder, shown on hover.
+    fn render_section_header(
         &self,
-        palette: Palette,
-        fonts: Fonts,
-        appearance: &Appearance,
+        section: ThreadSection,
+        is_first: bool,
+        rows: RowContext<'_>,
     ) -> Box<dyn Element> {
-        let title = Text::new_inline("THREADS", fonts.family, SECTION_FONT_SIZE)
-            .with_style(fonts.medium)
-            .with_color(palette.detail_text.into())
-            .finish();
-        let add_button = render_icon_button(
-            WarpIcon::Plus,
-            "Adicionar pasta",
-            self.mouse_state("header:add".to_owned()),
-            ClaudeThreadsAction::AddProject,
+        let RowContext {
             palette,
+            fonts,
             appearance,
-        );
-        Container::new(
-            Flex::row()
-                .with_main_axis_size(MainAxisSize::Max)
-                .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
-                .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                .with_child(title)
-                .with_child(add_button)
-                .finish(),
+            ..
+        } = rows;
+        let chevron = if self.is_section_collapsed(section) {
+            WarpIcon::ChevronRight
+        } else {
+            WarpIcon::ChevronDown
+        };
+        let add_button = (section == ThreadSection::Projects).then(|| {
+            render_icon_button(
+                WarpIcon::Plus,
+                "Adicionar pasta",
+                self.mouse_state("header:add".to_owned()),
+                ClaudeThreadsAction::AddProject,
+                palette,
+                appearance,
+            )
+        });
+        let header = Hoverable::new(
+            self.mouse_state(format!("section:{section:?}")),
+            move |hover_state| {
+                let color = if hover_state.is_hovered() {
+                    palette.main_text
+                } else {
+                    palette.sub_text
+                };
+                let label = Flex::row()
+                    .with_main_axis_size(MainAxisSize::Min)
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_spacing(4.)
+                    .with_child(
+                        Text::new_inline(section.label(), fonts.family, SECTION_FONT_SIZE)
+                            .with_style(fonts.medium)
+                            .with_color(color.into())
+                            .finish(),
+                    )
+                    .with_child(render_icon(chevron, color, SECTION_CHEVRON_SIZE))
+                    .finish();
+                let mut row = Flex::row()
+                    .with_main_axis_size(MainAxisSize::Max)
+                    .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_child(label);
+                let trailing = add_button.filter(|_| hover_state.is_hovered());
+                row.add_child(
+                    ConstrainedBox::new(trailing.unwrap_or_else(|| Empty::new().finish()))
+                        .with_height(META_HEIGHT)
+                        .finish(),
+                );
+                Container::new(row.finish())
+                    .with_horizontal_padding(ROW_HORIZONTAL_PADDING)
+                    .with_vertical_padding(3.)
+                    .finish()
+            },
         )
-        .with_padding_bottom(4.)
-        .with_horizontal_padding(PANEL_PADDING + ROW_HORIZONTAL_PADDING)
-        .finish()
+        .with_cursor(Cursor::PointingHand)
+        .on_click(move |ctx, _, _| {
+            ctx.dispatch_typed_action(ClaudeThreadsAction::ToggleSection(section));
+        })
+        .with_defer_events_to_children()
+        .finish();
+        Container::new(header)
+            .with_padding_top(if is_first { 0. } else { SECTION_SPACING })
+            .finish()
     }
 
-    /// The app's name on a blueprint-blue banner, with the button that hides the sidebar.
+    /// Every project folder with its threads; while searching, only the projects with matches,
+    /// expanded.
+    fn render_projects(&self, groups: &ThreadGroups, rows: RowContext<'_>) -> Box<dyn Element> {
+        let is_searching = !self.search_query.is_empty();
+        let mut list = Flex::column()
+            .with_main_axis_size(MainAxisSize::Min)
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_spacing(PROJECT_SPACING);
+        if self.config.projects.is_empty() {
+            list.add_child(render_empty_state(rows));
+        }
+        for project in &self.config.projects {
+            let threads = groups
+                .by_project
+                .get(&project.path)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            if is_searching && threads.is_empty() {
+                continue;
+            }
+            let mut block = Flex::column()
+                .with_main_axis_size(MainAxisSize::Min)
+                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                .with_spacing(ROW_SPACING)
+                .with_child(self.render_project_row(project, threads.len(), rows));
+            if is_searching || !project.collapsed {
+                if threads.is_empty() {
+                    if self.has_scanned {
+                        block.add_child(render_note("Nenhuma conversa ainda", THREAD_INDENT, rows));
+                    }
+                } else {
+                    self.add_thread_rows(
+                        &mut block,
+                        threads,
+                        Some(&project.path),
+                        THREAD_INDENT,
+                        rows,
+                    );
+                }
+            }
+            list.add_child(
+                SavePosition::new(block.finish(), &project_block_position_id(&project.path))
+                    .finish(),
+            );
+        }
+        list.finish()
+    }
+
+    /// The button that hides the sidebar and the app's name, on the banner image across the top
+    /// of the panel.
     fn render_brand(&self, fonts: Fonts) -> Box<dyn Element> {
         let toggle_button = Hoverable::new(self.mouse_state("brand:toggle".to_owned()), |state| {
-            let alpha = if state.is_hovered() { 100 } else { 75 };
+            let (icon_opacity, background_opacity) = if state.is_hovered() {
+                (100, 16)
+            } else {
+                (72, 0)
+            };
             let icon = ConstrainedBox::new(
                 WarpIcon::LeftSidebarClose
-                    .to_warpui_icon(WarpThemeFill::Solid(BRAND_TEXT).with_opacity(alpha))
+                    .to_warpui_icon(brand_color(BRAND_TEXT, icon_opacity))
                     .finish(),
             )
             .with_width(BRAND_ICON_SIZE)
             .with_height(BRAND_ICON_SIZE)
             .finish();
-            let mut button = Container::new(icon)
-                .with_padding(Padding::uniform(4.))
-                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(BUTTON_CORNER_RADIUS)));
-            if state.is_hovered() {
-                button = button.with_background(WarpThemeFill::Solid(BRAND_TEXT).with_opacity(14));
-            }
-            button.finish()
+            ConstrainedBox::new(
+                Container::new(Align::new(icon).finish())
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(
+                        BUTTON_CORNER_RADIUS,
+                    )))
+                    .with_background(brand_color(BRAND_TEXT, background_opacity))
+                    .finish(),
+            )
+            .with_width(BRAND_BUTTON_SIZE)
+            .with_height(BRAND_BUTTON_SIZE)
+            .finish()
         })
         .with_cursor(Cursor::PointingHand)
-        .on_click(|ctx, _, _| ctx.dispatch_typed_action(WorkspaceAction::ToggleVerticalTabsPanel))
+        .on_click(|ctx, _, _| ctx.dispatch_typed_action(WorkspaceAction::ToggleClaudeThreadsPanel))
         .finish();
 
         let name = Flex::row()
@@ -717,78 +1253,51 @@ impl ClaudeThreadsView {
             .with_spacing(5.)
             .with_child(
                 Text::new_inline("Picolas", fonts.family, BRAND_FONT_SIZE)
-                    .with_style(Properties::default().weight(Weight::Bold))
+                    .with_style(Properties::default().weight(Weight::Semibold))
                     .with_color(BRAND_TEXT)
                     .finish(),
             )
             .with_child(
                 Text::new_inline("Code", fonts.family, BRAND_FONT_SIZE)
-                    .with_color(WarpThemeFill::Solid(BRAND_TEXT).with_opacity(78).into())
+                    .with_style(Properties::default().weight(Weight::Semibold))
+                    .with_color(BRAND_BLUE)
                     .finish(),
             )
             .finish();
-        let content = Flex::row()
-            .with_main_axis_size(MainAxisSize::Max)
-            .with_cross_axis_alignment(CrossAxisAlignment::Center)
-            .with_spacing(10.)
-            .with_child(toggle_button)
-            .with_child(name)
-            .finish();
         let content = ConstrainedBox::new(
-            Container::new(content)
-                .with_horizontal_padding(10.)
-                .finish(),
+            Container::new(
+                Flex::row()
+                    .with_main_axis_size(MainAxisSize::Max)
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_spacing(10.)
+                    .with_child(toggle_button)
+                    .with_child(name)
+                    .finish(),
+            )
+            .with_padding_left(PANEL_PADDING + 4.)
+            .with_padding_right(PANEL_PADDING)
+            .finish(),
         )
         .with_height(BRAND_HEIGHT)
         .finish();
 
-        // Faint drafting lines over the gradient, like a blueprint.
-        let line = WarpThemeFill::Solid(BRAND_TEXT).with_opacity(10);
-        let mut banner = Stack::new().with_child(content);
-        for offset in BRAND_VERTICAL_LINE_OFFSETS {
-            banner.add_positioned_child(
-                ConstrainedBox::new(
-                    Container::new(Empty::new().finish())
-                        .with_background(line)
-                        .finish(),
-                )
-                .with_width(1.)
-                .with_height(BRAND_HEIGHT)
-                .finish(),
-                OffsetPositioning::offset_from_parent(
-                    vec2f(-offset, 0.),
-                    ParentOffsetBounds::Unbounded,
-                    ParentAnchor::TopRight,
-                    ChildAnchor::TopRight,
-                ),
-            );
-        }
-        banner.add_positioned_child(
-            ConstrainedBox::new(
-                Container::new(Empty::new().finish())
-                    .with_background(line)
+        let background = Image::new(
+            bundled_or_fetched_asset!("png/picolas_banner.png"),
+            CacheOption::Original,
+        )
+        .cover()
+        .finish();
+        let banner = Stack::new()
+            .with_child(
+                ConstrainedBox::new(background)
+                    .with_height(BRAND_HEIGHT)
                     .finish(),
             )
-            .with_width(BRAND_HORIZONTAL_LINE_WIDTH)
-            .with_height(1.)
-            .finish(),
-            OffsetPositioning::offset_from_parent(
-                vec2f(0., -BRAND_HORIZONTAL_LINE_INSET),
-                ParentOffsetBounds::Unbounded,
-                ParentAnchor::BottomRight,
-                ChildAnchor::BottomRight,
-            ),
-        );
+            .with_child(content);
 
-        let banner = Container::new(Clipped::new(banner.finish()).finish())
-            .with_background(WarpThemeFill::HorizontalGradient(HorizontalGradient::new(
-                BRAND_GRADIENT_LEFT,
-                BRAND_GRADIENT_RIGHT,
-            )))
-            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(BRAND_CORNER_RADIUS)))
-            .finish();
-        Container::new(banner)
-            .with_uniform_padding(PANEL_PADDING)
+        Container::new(Clipped::new(banner.finish()).finish())
+            .with_background(WarpThemeFill::Solid(BRAND_BACKGROUND))
+            .with_margin_bottom(PANEL_PADDING)
             .finish()
     }
 
@@ -798,15 +1307,19 @@ impl ClaudeThreadsView {
     fn render_project_row(
         &self,
         project: &ThreadProject,
-        palette: Palette,
-        fonts: Fonts,
-        appearance: &Appearance,
+        thread_count: usize,
+        rows: RowContext<'_>,
     ) -> Box<dyn Element> {
+        let RowContext {
+            palette,
+            fonts,
+            appearance,
+            ..
+        } = rows;
         let path = project.path.clone();
         let key = path.display().to_string();
         let name = project.name();
-        let thread_count = self.threads.get(&project.path).map_or(0, Vec::len);
-        let chevron = if project.collapsed {
+        let chevron = if project.collapsed && self.search_query.is_empty() {
             WarpIcon::ChevronRight
         } else {
             WarpIcon::ChevronDown
@@ -901,117 +1414,93 @@ impl ClaudeThreadsView {
             .finish()
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// The latest `RECENT_THREAD_LIMIT` threads of a project (or of "Recentes", when `project` is
+    /// `None`) and the toggle that shows the rest.
     fn add_thread_rows(
         &self,
         list: &mut Flex,
-        project: &ThreadProject,
-        threads: &[&ClaudeThread],
-        now: SystemTime,
-        active_terminal_id: Option<EntityId>,
-        palette: Palette,
-        fonts: Fonts,
-        appearance: &Appearance,
-        app: &AppContext,
+        threads: &[ClaudeThread],
+        project: Option<&Path>,
+        indent: f32,
+        rows: RowContext<'_>,
     ) {
-        if threads.is_empty() {
-            if self.has_scanned {
-                list.add_child(render_note("Nenhuma conversa ainda", palette, fonts));
-            }
-            return;
-        }
-
-        let show_all =
-            !self.search_query.is_empty() || self.show_all_threads.contains(&project.path);
+        let show_all = !self.search_query.is_empty()
+            || match project {
+                Some(path) => self.show_all_threads.contains(path),
+                None => self.show_all_recent,
+            };
         let shown = if show_all {
             threads.len()
         } else {
             threads.len().min(RECENT_THREAD_LIMIT)
         };
         for thread in &threads[..shown] {
-            list.add_child(self.render_thread_row(
-                thread,
-                project,
-                now,
-                active_terminal_id,
-                palette,
-                fonts,
-                appearance,
-                app,
-            ));
+            list.add_child(self.render_thread_row(thread, project, indent, rows));
         }
 
-        if self.search_query.is_empty() && threads.len() > RECENT_THREAD_LIMIT {
-            let (label, icon) = if show_all {
-                ("Mostrar menos".to_owned(), WarpIcon::ChevronUp)
-            } else {
-                (
-                    format!("Mostrar mais ({})", threads.len() - RECENT_THREAD_LIMIT),
-                    WarpIcon::ChevronDown,
-                )
-            };
-            let path = project.path.clone();
-            let mouse_state = self.mouse_state(format!("show-all:{}", path.display()));
-            list.add_child(
-                Hoverable::new(mouse_state, move |hover_state| {
-                    let color = if hover_state.is_hovered() {
-                        palette.main_text
-                    } else {
-                        palette.sub_text
-                    };
-                    let content = Flex::row()
-                        .with_main_axis_size(MainAxisSize::Max)
-                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                        .with_spacing(ICON_TEXT_GAP)
-                        .with_child(render_icon(icon, color, CHEVRON_SIZE))
-                        .with_child(
-                            Text::new_inline(label, fonts.family, META_FONT_SIZE)
-                                .with_color(color.into())
-                                .finish(),
-                        )
-                        .finish();
-                    let content = Container::new(content)
-                        .with_padding_left(THREAD_INDENT)
-                        .finish();
-                    render_row_container(content, PROJECT_ROW_VERTICAL_PADDING, None)
-                })
-                .with_cursor(Cursor::PointingHand)
-                .on_click(move |ctx, _, _| {
-                    ctx.dispatch_typed_action(ClaudeThreadsAction::ToggleShowAllThreads(
-                        path.clone(),
-                    ));
-                })
-                .finish(),
-            );
+        if !self.search_query.is_empty() || threads.len() <= RECENT_THREAD_LIMIT {
+            return;
         }
+        let RowContext { palette, fonts, .. } = rows;
+        let (label, icon) = if show_all {
+            ("Mostrar menos".to_owned(), WarpIcon::ChevronUp)
+        } else {
+            (
+                format!("Mostrar mais ({})", threads.len() - RECENT_THREAD_LIMIT),
+                WarpIcon::ChevronDown,
+            )
+        };
+        let key = project.map(PathBuf::from);
+        let mouse_state = self.mouse_state(format!("show-all:{key:?}"));
+        list.add_child(
+            Hoverable::new(mouse_state, move |hover_state| {
+                let color = if hover_state.is_hovered() {
+                    palette.main_text
+                } else {
+                    palette.sub_text
+                };
+                let content = Flex::row()
+                    .with_main_axis_size(MainAxisSize::Max)
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_spacing(ICON_TEXT_GAP)
+                    .with_child(render_icon(icon, color, CHEVRON_SIZE))
+                    .with_child(
+                        Text::new_inline(label, fonts.family, META_FONT_SIZE)
+                            .with_color(color.into())
+                            .finish(),
+                    )
+                    .finish();
+                let content = Container::new(content).with_padding_left(indent).finish();
+                render_row_container(content, PROJECT_ROW_VERTICAL_PADDING, None)
+            })
+            .with_cursor(Cursor::PointingHand)
+            .on_click(move |ctx, _, _| {
+                ctx.dispatch_typed_action(ClaudeThreadsAction::ToggleShowAllThreads(key.clone()));
+            })
+            .finish(),
+        );
     }
 
-    /// Two lines: the title with its age (or what the session is doing), and
-    /// the branch it runs on. The thread open in the focused pane gets a
-    /// raised card. On hover the age gives way to a trash button, which asks
-    /// for confirmation in the row before moving the conversation to the
-    /// Trash.
-    #[allow(clippy::too_many_arguments)]
+    /// Two lines: the title with its age (or what the session is doing), and the branch it runs
+    /// on. The thread open in the focused pane gets a raised card. On hover the age gives way to
+    /// the "⋯" menu and the pin button; deleting asks for confirmation in the row.
     fn render_thread_row(
         &self,
         thread: &ClaudeThread,
-        project: &ThreadProject,
-        now: SystemTime,
-        active_terminal_id: Option<EntityId>,
-        palette: Palette,
-        fonts: Fonts,
-        appearance: &Appearance,
-        app: &AppContext,
+        project: Option<&Path>,
+        indent: f32,
+        rows: RowContext<'_>,
     ) -> Box<dyn Element> {
+        let RowContext {
+            now,
+            active_terminal_id,
+            palette,
+            fonts,
+            appearance,
+            app,
+        } = rows;
         let running_session =
             CLIAgentSessionsModel::as_ref(app).session_by_agent_session_id(&thread.session_id);
-        // A thread open in a tab, or written to moments ago (maybe by another
-        // app), is in use and can't be deleted.
-        let recently_active = now
-            .duration_since(thread.updated_at)
-            .is_ok_and(|age| age < RECENTLY_ACTIVE)
-            || thread.updated_at > now;
-        let can_delete = running_session.is_none() && !recently_active;
         let is_active = running_session
             .is_some_and(|(terminal_view_id, _)| Some(terminal_view_id) == active_terminal_id);
         let status = running_session.map(|(_, session)| {
@@ -1025,10 +1514,11 @@ impl ClaudeThreadsView {
         });
         let title = thread.title.clone();
         let age = claude_threads::format_age(thread.updated_at, now);
-        // Threads in a subfolder or a worktree of the project say where they run.
+        // Threads outside their project's folder, in a subfolder, or in a worktree say where they
+        // run.
         let detail = match &thread.git_branch {
             Some(branch) => Some((WarpIcon::GitBranch, branch.clone())),
-            None => (thread.cwd != project.path)
+            None => (Some(thread.cwd.as_path()) != project)
                 .then(|| ThreadProject::new(thread.cwd.clone()).name())
                 .map(|folder| (WarpIcon::Folder, folder)),
         };
@@ -1038,21 +1528,48 @@ impl ClaudeThreadsView {
         };
         let session_id = &thread.session_id;
         let is_confirming = self.pending_delete.as_deref() == Some(session_id.as_str());
-        let trash_button = can_delete.then(|| {
+        let is_menu_open = self.menu_open_for.as_deref() == Some(session_id.as_str());
+        let is_pinned = self.config.is_pinned(session_id);
+        let rename_input = (self.renaming.as_deref() == Some(session_id.as_str())).then(|| {
+            TextInput::new(
+                self.rename_editor.clone(),
+                UiComponentStyles::default()
+                    .set_background(ElementFill::None)
+                    .set_border_radius(CornerRadius::with_all(Radius::Pixels(0.)))
+                    .set_border_width(0.),
+            )
+            .build()
+            .finish()
+        });
+        let menu_button = SavePosition::new(
             render_icon_button(
-                WarpIcon::Trash,
-                "Apagar conversa",
-                self.mouse_state(format!("thread-delete:{session_id}")),
-                ClaudeThreadsAction::AskDeleteThread(session_id.clone()),
+                WarpIcon::DotsHorizontal,
+                "Mais opções",
+                self.mouse_state(format!("thread-menu:{session_id}")),
+                ClaudeThreadsAction::ToggleThreadMenu(session_id.clone()),
                 palette,
                 appearance,
-            )
-        });
+            ),
+            &thread_menu_button_position_id(session_id),
+        )
+        .finish();
+        let pin_button = render_icon_button(
+            if is_pinned {
+                WarpIcon::PinFilled
+            } else {
+                WarpIcon::Pin
+            },
+            if is_pinned { "Desafixar" } else { "Fixar" },
+            self.mouse_state(format!("thread-pin:{session_id}")),
+            ClaudeThreadsAction::TogglePinThread(session_id.clone()),
+            palette,
+            appearance,
+        );
         let confirm_buttons = is_confirming.then(|| {
             [
                 render_icon_button(
                     WarpIcon::Check,
-                    "Mover para a Lixeira",
+                    "Fechar e mover para a Lixeira",
                     self.mouse_state(format!("thread-confirm:{session_id}")),
                     ClaudeThreadsAction::ConfirmDeleteThread(session_id.clone()),
                     palette,
@@ -1081,24 +1598,31 @@ impl ClaudeThreadsView {
                 let mut meta = Flex::row()
                     .with_main_axis_size(MainAxisSize::Min)
                     .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                    .with_spacing(4.);
+                    .with_spacing(2.);
                 if let Some(buttons) = confirm_buttons {
                     meta.add_child(
-                        Text::new_inline("Apagar?", fonts.family, META_FONT_SIZE)
-                            .with_color(palette.main_text.into())
-                            .finish(),
+                        Container::new(
+                            Text::new_inline("Excluir?", fonts.family, META_FONT_SIZE)
+                                .with_color(palette.main_text.into())
+                                .finish(),
+                        )
+                        .with_padding_right(2.)
+                        .finish(),
                     );
                     for button in buttons {
                         meta.add_child(button);
                     }
-                } else if let Some(button) = trash_button.filter(|_| hover_state.is_hovered()) {
-                    meta.add_child(button);
+                } else if rename_input.is_some() {
+                    // The editor takes the whole line.
+                } else if hover_state.is_hovered() || is_menu_open {
+                    meta.add_child(menu_button);
+                    meta.add_child(pin_button);
                 } else {
                     match status {
                         Some(status @ (ThreadStatus::Working | ThreadStatus::Blocked)) => {
                             let color = status.color(palette);
                             meta.add_child(
-                                Text::new_inline("●", fonts.family, META_FONT_SIZE)
+                                Text::new_inline("● ", fonts.family, META_FONT_SIZE)
                                     .with_color(color.into())
                                     .finish(),
                             );
@@ -1112,7 +1636,7 @@ impl ClaudeThreadsView {
                         Some(ThreadStatus::Open) | None => {
                             if status.is_some() {
                                 meta.add_child(
-                                    Text::new_inline("●", fonts.family, META_FONT_SIZE)
+                                    Text::new_inline("● ", fonts.family, META_FONT_SIZE)
                                         .with_color(palette.sub_text.into())
                                         .finish(),
                                 );
@@ -1142,24 +1666,26 @@ impl ClaudeThreadsView {
                     .with_child(
                         Shrinkable::new(
                             1.,
-                            Text::new_inline(title, fonts.family, TITLE_FONT_SIZE)
-                                .with_style(fonts.medium)
-                                .with_clip(ClipConfig::ellipsis())
-                                .with_color(title_color.into())
-                                .finish(),
+                            rename_input.unwrap_or_else(|| {
+                                Text::new_inline(title, fonts.family, TITLE_FONT_SIZE)
+                                    .with_style(fonts.medium)
+                                    .with_clip(ClipConfig::ellipsis())
+                                    .with_color(title_color.into())
+                                    .finish()
+                            }),
                         )
                         .finish(),
                     )
                     .with_child(meta)
                     .finish();
 
-                let mut detail_line = Flex::row()
-                    .with_main_axis_size(MainAxisSize::Max)
+                let mut details = Flex::row()
+                    .with_main_axis_size(MainAxisSize::Min)
                     .with_cross_axis_alignment(CrossAxisAlignment::Center)
                     .with_spacing(DETAIL_ICON_GAP);
                 if let Some((icon, text)) = detail {
-                    detail_line.add_child(render_icon(icon, palette.detail_text, DETAIL_ICON_SIZE));
-                    detail_line.add_child(
+                    details.add_child(render_icon(icon, palette.detail_text, DETAIL_ICON_SIZE));
+                    details.add_child(
                         Shrinkable::new(
                             1.,
                             Text::new_inline(text, fonts.family, META_FONT_SIZE)
@@ -1169,39 +1695,28 @@ impl ClaudeThreadsView {
                         )
                         .finish(),
                     );
-                } else {
-                    detail_line.add_child(
-                        Text::new_inline("Claude Code", fonts.family, META_FONT_SIZE)
-                            .with_color(palette.detail_text.into())
-                            .finish(),
-                    );
                 }
-
-                let lines = Flex::column()
+                // The agent's logo closes the branch line, under the age or status.
+                let detail_line = Flex::row()
+                    .with_main_axis_size(MainAxisSize::Max)
+                    .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_spacing(ICON_TEXT_GAP)
+                    .with_child(Shrinkable::new(1., details.finish()).finish())
+                    .with_child(render_icon(WarpIcon::ClaudeLogo, palette.claude, LOGO_SIZE))
+                    .finish();
+                let content = Flex::column()
                     .with_main_axis_size(MainAxisSize::Min)
                     .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
                     .with_spacing(LINE_SPACING)
                     .with_child(title_line)
-                    .with_child(detail_line.finish())
+                    .with_child(detail_line)
                     .finish();
-                // The logo sits in the indent, under the project's chevron, level with the title.
-                let logo = ConstrainedBox::new(
-                    Container::new(render_icon(WarpIcon::ClaudeLogo, palette.claude, LOGO_SIZE))
-                        .with_padding_top(LOGO_TOP_OFFSET)
-                        .finish(),
-                )
-                .with_width(THREAD_INDENT)
-                .finish();
-                let content = Flex::row()
-                    .with_main_axis_size(MainAxisSize::Max)
-                    .with_cross_axis_alignment(CrossAxisAlignment::Start)
-                    .with_child(logo)
-                    .with_child(Shrinkable::new(1., lines).finish())
-                    .finish();
+                let content = Container::new(content).with_padding_left(indent).finish();
                 let background = if is_active {
                     Some(palette.row_active)
                 } else {
-                    hover_state.is_hovered().then_some(palette.row_hover)
+                    (hover_state.is_hovered() || is_menu_open).then_some(palette.row_hover)
                 };
                 render_row_container(content, THREAD_ROW_VERTICAL_PADDING, background)
             },
@@ -1261,13 +1776,18 @@ impl ThreadStatus {
     }
 }
 
-fn render_empty_state(palette: Palette, fonts: Fonts) -> Box<dyn Element> {
+/// `color` at `opacity` percent.
+fn brand_color(color: ColorU, opacity: u8) -> WarpThemeFill {
+    WarpThemeFill::Solid(color).with_opacity(opacity)
+}
+
+fn render_empty_state(rows: RowContext<'_>) -> Box<dyn Element> {
     let hint = Text::new(
-        "Adicione uma pasta com o botão acima para ver as conversas do Claude Code feitas nela.",
-        fonts.family,
+        "Adicione uma pasta com o + de Projetos para ver as conversas do Claude Code feitas nela.",
+        rows.fonts.family,
         META_FONT_SIZE,
     )
-    .with_color(palette.sub_text.into())
+    .with_color(rows.palette.sub_text.into())
     .finish();
     Container::new(hint)
         .with_horizontal_padding(ROW_HORIZONTAL_PADDING)
@@ -1275,13 +1795,13 @@ fn render_empty_state(palette: Palette, fonts: Fonts) -> Box<dyn Element> {
         .finish()
 }
 
-fn render_note(text: &'static str, palette: Palette, fonts: Fonts) -> Box<dyn Element> {
+fn render_note(text: &'static str, indent: f32, rows: RowContext<'_>) -> Box<dyn Element> {
     Container::new(
-        Text::new_inline(text, fonts.family, META_FONT_SIZE)
-            .with_color(palette.detail_text.into())
+        Text::new_inline(text, rows.fonts.family, META_FONT_SIZE)
+            .with_color(rows.palette.detail_text.into())
             .finish(),
     )
-    .with_padding_left(THREAD_INDENT + ROW_HORIZONTAL_PADDING)
+    .with_padding_left(indent + ROW_HORIZONTAL_PADDING)
     .with_vertical_padding(PROJECT_ROW_VERTICAL_PADDING)
     .finish()
 }
