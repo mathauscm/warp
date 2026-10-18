@@ -5673,6 +5673,8 @@ impl Workspace {
         };
 
         self.active_tab_index = index;
+        self.claude_threads_view
+            .update(ctx, |view, ctx| view.active_pane_changed(ctx));
 
         // The range selection's anchor is the active tab, so any change to
         // the active tab makes the existing selection stale; clear it.
@@ -16520,6 +16522,8 @@ impl Workspace {
             }
             pane_group::Event::ActiveSessionChanged => {
                 self.update_active_session(ctx);
+                self.claude_threads_view
+                    .update(ctx, |view, ctx| view.active_pane_changed(ctx));
                 // ctx.notify();
             }
             pane_group::Event::Escape => {
@@ -25011,6 +25015,9 @@ impl TypedActionView for Workspace {
                 session_id,
                 command,
             } => self.drop_thread(session_id, command.as_deref(), ctx),
+            CloseClaudeThreadPane { terminal_view_id } => {
+                self.close_thread_pane(*terminal_view_id, ctx);
+            }
             OpenFileInSplitPane { path } => {
                 self.open_file_with_target(
                     path.clone(),

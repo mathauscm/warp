@@ -74,18 +74,18 @@ jobs:
           DMG="WarpOss-${TAG}-arm64.dmg"
           cp target/release-lto/bundle/osx/WarpOss.dmg "$DMG"
           cat > notes.md <<'EOF'
-          WarpOss para Mac com chip Apple (M1 ou mais novo).
+          Picolas Code para Mac com chip Apple (M1 ou mais novo).
 
           **Como instalar**
-          1. Baixe o `.dmg` abaixo, abra e arraste o **WarpOss** para **Aplicativos**.
+          1. Baixe o `.dmg` abaixo, abra e arraste o **Picolas Code** para **Aplicativos**.
           2. O app não é assinado pela Apple, então o macOS bloqueia a primeira abertura.
              Libere uma vez com **um** destes jeitos:
              - Tente abrir o app, vá em **Ajustes do Sistema → Privacidade e Segurança** e clique em **Abrir Mesmo Assim**; ou
-             - No Terminal: `xattr -dr com.apple.quarantine /Applications/WarpOss.app`
+             - No Terminal: `xattr -dr com.apple.quarantine "/Applications/Picolas Code.app"`
           3. Pronto: dali em diante ele abre normalmente.
           EOF
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" "$DMG" --clobber
           else
-            gh release create "$TAG" "$DMG" --title "WarpOss $TAG" --notes-file notes.md
+            gh release create "$TAG" "$DMG" --title "Picolas Code $TAG" --notes-file notes.md
           fi

@@ -51,6 +51,7 @@ use super::model::image_map::StoredImageMetadata;
 use super::model::mouse::{MouseAction, MouseButton, MouseState};
 use super::model::session::SessionId;
 use super::model::terminal_model::{SelectedBlocks, WithinBlock, WithinModel};
+use super::prompt_card::PromptCardStyle;
 use super::shared_session::presence_manager::{
     MUTED_PARTICIPANT_COLOR, PresenceManager, text_selection_color,
 };
@@ -717,6 +718,8 @@ pub struct BlockListElement {
     /// (SHOW_CURSOR on), the `draw_cursor` call and cursor contrast colouring
     /// are suppressed instead.
     hide_cursor_cell: bool,
+    beam_cursor: bool,
+    prompt_card: Option<PromptCardStyle>,
 
     /// Child Elements to use for rich content inserted into the block list
     rich_content_elements: HashMap<EntityId, Box<dyn Element>>,
@@ -959,6 +962,8 @@ impl BlockListElement {
             hovered_secret: terminal_view_render_context.hovered_secret,
             use_ligature_rendering: false,
             hide_cursor_cell: false,
+            beam_cursor: false,
+            prompt_card: None,
             active_filter_editor_block_index: None,
             filtered_blocks: None,
             rich_content_elements: HashMap::new(),
@@ -1002,6 +1007,16 @@ impl BlockListElement {
 
     pub fn with_hide_cursor_cell(mut self) -> Self {
         self.hide_cursor_cell = true;
+        self
+    }
+
+    pub fn with_beam_cursor(mut self) -> Self {
+        self.beam_cursor = true;
+        self
+    }
+
+    pub fn with_prompt_card(mut self, style: PromptCardStyle) -> Self {
+        self.prompt_card = Some(style);
         self
     }
 
@@ -2127,6 +2142,22 @@ impl BlockListElement {
             color,
             ctx,
         );
+        // Anchors the pill that mentions the selection in a Claude Code prompt.
+        if let Some(last_line) = grid_renderer::calculate_selection_bounds(
+            &start,
+            &end,
+            &self.size_info,
+            viewport.scroll_top_in_lines(),
+            selection_origin,
+        )
+        .into_iter()
+        .max_by(|a, b| a.max_y().total_cmp(&b.max_y()))
+        {
+            ctx.position_cache.cache_position_indefinitely(
+                format!("terminal_view:selection_end_{}", self.terminal_view_id),
+                last_line,
+            );
+        }
         match selection_cursor_render_location {
             SelectionCursorRenderLocation::Start => {
                 let mut cursor_color = color;
@@ -3785,6 +3816,8 @@ impl Element for BlockListElement {
             cell_size,
             use_ligature_rendering: self.use_ligature_rendering,
             hide_cursor_cell: self.hide_cursor_cell,
+            beam_cursor: self.beam_cursor,
+            prompt_card: self.prompt_card.clone(),
         };
         let block_grid_params = BlockGridParams {
             grid_render_params,

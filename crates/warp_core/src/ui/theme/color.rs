@@ -352,9 +352,13 @@ impl WarpTheme {
     }
 
     /// Background color for tooltips.
-    /// Uses neutral_6 for better contrast with text.
+    /// Uses neutral_6 for better contrast with text. Always opaque, so a translucent window
+    /// background doesn't let the content under the tooltip show through it.
     pub fn tooltip_background(&self) -> ColorU {
-        internal_colors::neutral_6(self)
+        ColorU {
+            a: u8::MAX,
+            ..internal_colors::neutral_6(self)
+        }
     }
 }
 

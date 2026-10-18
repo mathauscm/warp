@@ -21,6 +21,24 @@ fn user_line(cwd: &str, text: &str) -> String {
 }
 
 #[test]
+fn git_branch_comes_from_the_latest_prompt() {
+    let prompt = |branch: &str| {
+        serde_json::json!({
+            "type": "user",
+            "cwd": "/w/kinbox",
+            "gitBranch": branch,
+            "message": { "role": "user", "content": "oi" },
+        })
+        .to_string()
+    };
+    let mut summary = TranscriptSummary::default();
+    for line in [prompt("main"), prompt("feat/login"), prompt("")] {
+        summary.add_line(&line);
+    }
+    assert_eq!(summary.git_branch.as_deref(), Some("feat/login"));
+}
+
+#[test]
 fn project_slug_replaces_every_non_alphanumeric_character() {
     assert_eq!(
         project_slug(Path::new("/Users/me/projects/aldeia/kinbox-worktree")),
@@ -111,6 +129,7 @@ fn resume_command_rejects_unsafe_session_ids() {
         cwd: PathBuf::from("/w"),
         updated_at: SystemTime::UNIX_EPOCH,
         transcript: PathBuf::from("/w/a.jsonl"),
+        git_branch: None,
     };
     assert_eq!(
         thread("80870f2f-fdc6-49d4-a6b3-90cd2c3d3b1c").resume_command(),
@@ -131,8 +150,19 @@ fn format_age_uses_short_relative_labels() {
     assert_eq!(ago(3 * 24 * 3600), "3 d");
 }
 
+fn thread(session_id: &str, cwd: &str) -> ClaudeThread {
+    ClaudeThread {
+        session_id: session_id.to_owned(),
+        title: session_id.to_owned(),
+        cwd: PathBuf::from(cwd),
+        updated_at: SystemTime::UNIX_EPOCH,
+        transcript: PathBuf::new(),
+        git_branch: None,
+    }
+}
+
 #[test]
-fn scan_groups_threads_by_project_and_skips_sibling_folders() {
+fn scan_reads_every_transcript_folder() {
     let root = tempfile::tempdir().unwrap();
     let write = |cwd: &str, session_id: &str, prompt: &str| {
         let dir = root.path().join(project_slug(Path::new(cwd)));
@@ -147,16 +177,113 @@ fn scan_groups_threads_by_project_and_skips_sibling_folders() {
     write("/w/kinbox/kinbox-web", "s2", "no subprojeto");
     write("/w/kinbox-worktree", "s3", "no worktree");
 
-    let kinbox = PathBuf::from("/w/kinbox");
     let mut cache = TranscriptCache::new();
-    let threads = scan_in(root.path(), std::slice::from_ref(&kinbox), &mut cache);
-
-    let mut ids: Vec<&str> = threads[&kinbox]
-        .iter()
-        .map(|thread| thread.session_id.as_str())
+    let mut ids: Vec<String> = scan_in(root.path(), &mut cache)
+        .into_iter()
+        .map(|thread| thread.session_id)
         .collect();
     ids.sort();
-    assert_eq!(ids, ["s1", "s2"]);
-    // The worktree folder shares the slug prefix, so it is read but not listed.
+    assert_eq!(ids, ["s1", "s2", "s3"]);
     assert_eq!(cache.len(), 3);
+}
+
+#[test]
+fn threads_are_grouped_into_pinned_projects_and_recent() {
+    let config = ThreadsConfig {
+        pinned: vec!["pinned-2".to_owned(), "pinned-1".to_owned()],
+        projects: vec![
+            ThreadProject::new(PathBuf::from("/w/kinbox")),
+            ThreadProject::new(PathBuf::from("/w/kinbox/web")),
+            ThreadProject::new(PathBuf::from("/w/payflow")),
+        ],
+        moved: [("moved".to_owned(), PathBuf::from("/w/payflow"))].into(),
+        ..Default::default()
+    };
+    let groups = group_threads(
+        vec![
+            thread("pinned-1", "/w/kinbox"),
+            thread("root", "/w/kinbox"),
+            thread("nested", "/w/kinbox/web/src"),
+            thread("sibling", "/w/kinbox-worktree"),
+            thread("moved", "/tmp"),
+            thread("pinned-2", "/tmp"),
+        ],
+        &config,
+    );
+    let ids = |threads: &[ClaudeThread]| {
+        threads
+            .iter()
+            .map(|thread| thread.session_id.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&groups.pinned), ["pinned-2", "pinned-1"]);
+    assert_eq!(ids(&groups.by_project[Path::new("/w/kinbox")]), ["root"]);
+    assert_eq!(
+        ids(&groups.by_project[Path::new("/w/kinbox/web")]),
+        ["nested"]
+    );
+    assert_eq!(ids(&groups.by_project[Path::new("/w/payflow")]), ["moved"]);
+    assert_eq!(ids(&groups.recent), ["sibling"]);
+}
+
+#[test]
+fn threads_moved_to_a_removed_project_go_back_to_their_folder() {
+    let config = ThreadsConfig {
+        projects: vec![ThreadProject::new(PathBuf::from("/w/kinbox"))],
+        moved: [("s1".to_owned(), PathBuf::from("/w/gone"))].into(),
+        ..Default::default()
+    };
+    assert_eq!(
+        config.project_of(&thread("s1", "/w/kinbox/app")),
+        Some(Path::new("/w/kinbox"))
+    );
+    assert_eq!(config.project_of(&thread("s2", "/elsewhere")), None);
+}
+
+#[test]
+fn config_round_trips_through_toml() {
+    let config = ThreadsConfig {
+        pinned: vec!["a".to_owned()],
+        recent_collapsed: true,
+        projects: vec![ThreadProject::new(PathBuf::from("/w/kinbox"))],
+        moved: [("b".to_owned(), PathBuf::from("/w/kinbox"))].into(),
+        ..Default::default()
+    };
+    let text = toml::to_string_pretty(&config).unwrap();
+    assert_eq!(toml::from_str::<ThreadsConfig>(&text).unwrap(), config);
+    // Configs written before pinning existed still load.
+    let old: ThreadsConfig =
+        toml::from_str("[[project]]\npath = \"/w/kinbox\"\ncollapsed = true\n").unwrap();
+    assert!(old.projects[0].collapsed && old.pinned.is_empty());
+}
+
+#[test]
+fn rename_appends_a_custom_title_that_wins() {
+    let dir = tempfile::tempdir().unwrap();
+    let transcript = dir.path().join("abc.jsonl");
+    let prompt = user_line("/w/kinbox", "corrige o bug do login");
+    let ai_title = r#"{"type":"ai-title","aiTitle":"Bug do login","sessionId":"abc"}"#;
+    // The last line is left unfinished, as when Claude is still writing it.
+    std::fs::write(&transcript, format!("{prompt}\n{ai_title}")).unwrap();
+    let thread = ClaudeThread {
+        session_id: "abc".to_owned(),
+        title: "Bug do login".to_owned(),
+        cwd: PathBuf::from("/w/kinbox"),
+        updated_at: SystemTime::UNIX_EPOCH,
+        transcript: transcript.clone(),
+        git_branch: None,
+    };
+
+    assert_eq!(
+        rename_thread(&thread, "  Login   do app ").as_deref(),
+        Ok("Login do app")
+    );
+    let contents = std::fs::read_to_string(&transcript).unwrap();
+    let lines: Vec<&str> = contents.lines().collect();
+    assert_eq!(lines.len(), 3);
+    assert_eq!(
+        summary_of(&lines).map(|(title, _)| title).as_deref(),
+        Some("Login do app")
+    );
+    assert!(rename_thread(&thread, "   ").is_err());
 }

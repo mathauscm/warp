@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use settings::macros::define_settings_group;
 use settings::{RespectUserSyncSetting, Setting, SupportedPlatforms, SyncToCloud};
 use warpui::AppContext;
@@ -48,7 +49,57 @@ define_settings_group!(ThemeSettings, settings: [
         max_table_depth: 0,
         description: "The themes to use for system light and dark modes.",
     },
+    claude_theme: ClaudeThemeSetting {
+        type: ClaudeTheme,
+        default: ClaudeTheme::default(),
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Never,
+        surface: settings::SettingSurfaces::GUI,
+        private: false,
+        toml_path: "appearance.themes.claude_theme",
+        description: "The colors of panes running Claude Code.",
+    },
 ]);
+
+/// The colors a pane takes while Claude Code runs in it.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(
+    description = "The colors of panes running Claude Code.",
+    rename_all = "snake_case"
+)]
+pub enum ClaudeTheme {
+    /// The Claude desktop app's warm dark palette.
+    #[default]
+    ClaudeDark,
+    /// The Claude desktop app's light palette.
+    ClaudeLight,
+    /// The Claude palette matching the system's light or dark mode.
+    System,
+    /// The Warp theme, like any other pane.
+    Warp,
+}
+
+impl ClaudeTheme {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ClaudeDark => "Claude escuro",
+            Self::ClaudeLight => "Claude claro",
+            Self::System => "Sistema",
+            Self::Warp => "Tema do Warp",
+        }
+    }
+}
 
 impl Theme {
     fn current_value_is_syncable(&self) -> bool {

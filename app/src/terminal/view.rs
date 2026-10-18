@@ -5,7 +5,9 @@ mod block_banner;
 pub mod block_onboarding;
 pub(crate) mod blocklist_filter;
 mod bookmarks;
+mod claude_composer;
 mod claude_look;
+mod claude_mention;
 mod context_menu;
 pub mod init;
 pub mod inline_banner;
@@ -374,7 +376,8 @@ use crate::settings::{
     DebugSettingsChangedEvent, EmacsBindingsSettings, FontSettings, FontSettingsChangedEvent,
     InputModeSettings, InputModeSettingsChangedEvent, InputSettings, PaneSettings,
     PaneSettingsChangedEvent, PrivacySettings, PrivacySettingsChangedEvent,
-    PrivacySettingsSnapshot, SelectionSettings, VimBannerSettings,
+    PrivacySettingsSnapshot, SelectionSettings, ThemeSettings, ThemeSettingsChangedEvent,
+    VimBannerSettings,
 };
 use crate::settings_view::keybindings::KeybindingChangedNotifier;
 use crate::settings_view::mcp_servers_page::MCPServersSettingsPage;
@@ -750,6 +753,8 @@ fn ctrl_t_apply_mode(shell_type: ShellType) -> ShellWidgetApplyMode {
 }
 
 pub const LONG_RUNNING_AGENT_REQUESTED_COMMAND_CONTEXT_KEY: &str = "LongRunningRequestedCommand";
+/// Set while the pane offers to mention a selection in Claude Code's prompt.
+pub const CLAUDE_MENTION_CONTEXT_KEY: &str = "ClaudeMention";
 pub const LONG_RUNNING_AGENT_REQUESTED_COMMAND_USER_TOOK_OVER_CONTEXT_KEY: &str =
     "LongRunningRequestedUserTookOverCommand";
 
@@ -1244,6 +1249,18 @@ impl SizeUpdateBuilder {
             ),
             ctx,
         );
+        // Claude panes keep their text clear of the prompt card's side margins.
+        let new_size = if claude_font.is_some() {
+            SizeInfo::new(
+                self.new_pane_size_px,
+                new_size.cell_width_px(),
+                new_size.cell_height_px(),
+                claude_look::PADDING_X.into_pixels(),
+                new_size.padding_y_px(),
+            )
+        } else {
+            new_size
+        };
 
         // Capture the pane-computed natural size before shared session adjustments.
         let natural_rows = new_size.rows;
@@ -2727,6 +2744,13 @@ pub struct TerminalView {
     hidden_pending_command: Option<String>,
     /// Close button floating over a lone Claude pane; see `claude_look`.
     claude_close_button_mouse_state: MouseStateHandle,
+    /// What the "Mencionar" pill would send to Claude, while it shows; see `claude_mention`.
+    claude_mention: Option<claude_mention::ClaudeMention>,
+    /// A left-button drag being forwarded to Claude, which may select and copy text.
+    claude_drag: Option<claude_mention::ClaudeDrag>,
+    claude_mention_button_mouse_state: MouseStateHandle,
+    /// Mention chips, model and send button in the card around Claude's prompt.
+    claude_composer: claude_composer::ClaudeComposer,
 
     /// This field is an "&&" combination of two other pieces of state:
     ///   1. Whether this View (or one of its children) is the focused View.
@@ -3707,6 +3731,12 @@ impl TerminalView {
             },
         );
 
+        ctx.subscribe_to_model(&ThemeSettings::handle(ctx), |me, _, event, ctx| {
+            if matches!(event, ThemeSettingsChangedEvent::ClaudeThemeSetting { .. }) {
+                me.handle_theme_change(ctx);
+            }
+        });
+
         ctx.subscribe_to_model(&FontSettings::handle(ctx), |_, _, event, ctx| {
             if matches!(
                 event,
@@ -4375,6 +4405,7 @@ impl TerminalView {
             }
         });
 
+        let claude_composer = claude_composer::ClaudeComposer::new(ctx);
         let window_id = ctx.window_id();
         let mut terminal_view = Self {
             model,
@@ -4452,6 +4483,10 @@ impl TerminalView {
             did_notify_long_running: false,
             hidden_pending_command: None,
             claude_close_button_mouse_state: Default::default(),
+            claude_mention: None,
+            claude_drag: None,
+            claude_mention_button_mouse_state: Default::default(),
+            claude_composer,
             is_focused_and_active: true,
             current_prompt,
             model_event_sender,
@@ -9874,6 +9909,7 @@ impl TerminalView {
     fn typed_characters_on_terminal(&mut self, characters: &str, ctx: &mut ViewContext<Self>) {
         if self.should_write_typed_chars_to_pty(ctx) {
             self.highlighted_link.invalidate();
+            self.dismiss_claude_mention(ctx);
             self.report_possible_typeahead(characters);
             self.write_user_bytes_to_pty(characters.as_bytes().to_vec(), ctx);
         } else {
@@ -10003,6 +10039,10 @@ impl TerminalView {
         data: B,
         ctx: &mut ViewContext<Self>,
     ) -> bool {
+        let bytes = data.into();
+        if self.submit_with_claude_mentions(&bytes, ctx) {
+            return true;
+        }
         {
             let mut terminal_model = self.model.lock();
             let active_block = terminal_model.block_list().active_block();
@@ -10018,7 +10058,6 @@ impl TerminalView {
             }
         }
 
-        let bytes = data.into();
         let bytes_vec = bytes.to_vec();
         self.clear_selected_blocks(ctx);
         self.update_scroll_position_locking(ScrollPositionUpdate::AfterWriteUserBytesToPty, ctx);
@@ -14079,6 +14118,10 @@ impl TerminalView {
                 self.apply_claude_look(false, ctx);
             }
             _ => {}
+        }
+        // The model or effort may have changed with the latest turn.
+        if event.terminal_view_id() == self.view_id && self.runs_claude(ctx) {
+            self.refresh_claude_model(ctx);
         }
         if event.terminal_view_id() == self.view_id
             && matches!(
@@ -18699,6 +18742,7 @@ impl TerminalView {
     }
 
     fn alt_mouse_action(&mut self, mouse_state: &MouseState, ctx: &mut ViewContext<Self>) {
+        self.track_claude_mouse(mouse_state, ctx);
         let escape_sequences = mouse_state
             .to_escape_sequence(self.model.lock().deref())
             .unwrap();
@@ -18737,6 +18781,7 @@ impl TerminalView {
             subagent_view.update(ctx, |view, ctx| view.clear_all_selections(ctx));
         }
         self.model.lock().alt_screen_mut().clear_selection();
+        self.update_claude_mention(false, ctx);
         self.model
             .lock()
             .alt_screen_mut()
@@ -18763,6 +18808,8 @@ impl TerminalView {
     fn end_alt_selection(&mut self, ctx: &mut ViewContext<Self>) {
         if self.is_selecting {
             self.is_selecting = false;
+            let has_selection = self.selected_text(ctx).is_some_and(|text| !text.is_empty());
+            self.update_claude_mention(has_selection, ctx);
             self.maybe_copy_selection_to_clipboard(ctx);
             ctx.notify();
         } else {
@@ -18791,6 +18838,7 @@ impl TerminalView {
 
             // A text selection might be a byproduct of a block selection.
             // If there's no renderable text selection, we should clear the text selection.
+            self.update_claude_mention(selected_text.is_some(), ctx);
             if selected_text.is_none() {
                 self.clear_selected_text(ctx);
             } else {
@@ -19482,6 +19530,7 @@ impl TerminalView {
         }
 
         self.block_text_selection_start_position = Some(position);
+        self.update_claude_mention(false, ctx);
 
         self.model
             .lock()
@@ -21017,6 +21066,7 @@ impl TerminalView {
         // **all** selected text; because rich content text copying will stop working otherwise.
         if exempt_rich_content_view_id.is_none() {
             self.model.lock().block_list_mut().clear_selection();
+            self.update_claude_mention(false, ctx);
         }
 
         // Clear all selected text within CLI subagent views,
@@ -25081,6 +25131,15 @@ impl TerminalView {
             alt_screen_element =
                 alt_screen_element.with_font(font.family, font.size, font.line_height_ratio);
         }
+        if self.runs_claude(app) {
+            alt_screen_element = alt_screen_element.with_beam_cursor();
+        }
+        if let Some(style) = self.claude_prompt_card(app) {
+            alt_screen_element = alt_screen_element.with_prompt_card(style);
+        }
+        if let Some(anchor) = self.claude_mention_anchor() {
+            alt_screen_element = alt_screen_element.with_mention_anchor(anchor);
+        }
         if self.should_hide_cli_agent_cursor_cell(app) {
             alt_screen_element = alt_screen_element.with_hide_cursor_cell();
         }
@@ -25352,6 +25411,12 @@ impl TerminalView {
         }
         if let Some(font) = self.claude_font(app) {
             element = element.with_font(font.family, font.size, font.line_height_ratio);
+        }
+        if self.runs_claude(app) {
+            element = element.with_beam_cursor();
+        }
+        if let Some(style) = self.claude_prompt_card(app) {
+            element = element.with_prompt_card(style);
         }
 
         if self.should_hide_cli_agent_cursor_cell(app) {
@@ -27593,6 +27658,12 @@ impl TypedActionView for TerminalView {
             | CyclePreviousOrchestrationChildAgent
             | CycleNextOrchestrationChildAgent
             | ToggleCLIAgentRichInput
+            | MentionSelectionInClaude
+            | SubmitClaudePrompt
+            | InterruptClaude
+            | RemoveClaudeMention(_)
+            | ToggleClaudeModelMenu
+            | CycleClaudeMode
             | ToggleSessionRecording
             | Osc52AllowBlockedClipboardOperation => Empty,
         }
@@ -28742,6 +28813,12 @@ impl TypedActionView for TerminalView {
                     recorder.toggle_recording(ctx);
                 });
             }
+            MentionSelectionInClaude => self.mention_selection_in_claude(ctx),
+            SubmitClaudePrompt => self.submit_claude_prompt(ctx),
+            InterruptClaude => self.interrupt_claude(ctx),
+            RemoveClaudeMention(index) => self.remove_claude_mention(*index, ctx),
+            ToggleClaudeModelMenu => self.toggle_claude_model_menu(ctx),
+            CycleClaudeMode => self.cycle_claude_mode(ctx),
             ToggleCLIAgentRichInput => {
                 if self.has_active_cli_agent_input_session(ctx) {
                     self.close_cli_agent_rich_input_and_disable_auto_toggle(ctx);
@@ -28954,6 +29031,20 @@ impl View for TerminalView {
                     ChildAnchor::Center,
                 ),
             );
+        }
+
+        if self.context_menu_state.is_none()
+            && let Some((button, positioning)) = self.render_claude_mention_button(app)
+        {
+            stack.add_positioned_overlay_child(button, positioning);
+        }
+        // The composer's controls stay out of the overlay layers, so the footer's tooltips and
+        // menus show above them.
+        for (control, positioning) in self.render_claude_composer(&model, app) {
+            stack.add_positioned_child(control, positioning);
+        }
+        if let Some((menu, positioning)) = self.render_claude_model_menu(app) {
+            stack.add_positioned_overlay_child(menu, positioning);
         }
 
         self.maybe_render_onboarding_callout(
@@ -29365,6 +29456,10 @@ impl View for TerminalView {
 
         if model_lock.block_list().selection().is_some() {
             context.set.insert("ActiveBlockTextSelection");
+        }
+
+        if self.claude_mention.is_some() {
+            context.set.insert(CLAUDE_MENTION_CONTEXT_KEY);
         }
 
         if model_lock.alt_screen().selection().is_some() {

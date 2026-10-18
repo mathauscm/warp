@@ -892,6 +892,10 @@ pub enum WorkspaceAction {
         session_id: String,
         command: Option<String>,
     },
+    /// Closes the pane running a Claude thread that is being deleted, in whichever window holds it.
+    CloseClaudeThreadPane {
+        terminal_view_id: EntityId,
+    },
     /// Open a file in the code editor, split to the right of the active pane
     /// (so it gets a close button even while the tab list is hidden).
     OpenFileInSplitPane {
@@ -1169,6 +1173,7 @@ impl WorkspaceAction {
             | OpenProjectInNewWindow { .. }
             | DragClaudeThread { .. }
             | DropClaudeThread { .. }
+            | CloseClaudeThreadPane { .. }
             | OpenFileInSplitPane { .. }
             | OpenWorktreeAddRepoPicker
             | Crash

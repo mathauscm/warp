@@ -431,6 +431,9 @@ elif [[ $RELEASE_CHANNEL = "oss" ]]; then
     WARP_BIN="warp-oss"
     BUNDLE_ID="dev.warp.WarpOss"
     WARP_APP_NAME="WarpOss"
+    # The name people see: the .app in the DMG, the menu bar and the Dock. The bundle id and
+    # data directories keep the WarpOss name so existing settings carry over.
+    WARP_DISPLAY_NAME="Picolas Code"
     WARP_SCHEME_NAME="warposs"
     # The OSS channel does not ship Sentry, so drop the cocoa_sentry feature
     # (which would otherwise pull in the Sentry framework dependency).
@@ -549,6 +552,8 @@ if [[ "$CHECK_ONLY" == "true" ]]; then
   exit 0
 fi
 
+WARP_DISPLAY_NAME="${WARP_DISPLAY_NAME:-$WARP_APP_NAME}"
+
 DMG_DIR="$BUNDLE_DIR/dmg/$WARP_BIN"
 DMG_NAME="$WARP_APP_NAME.dmg"
 if [[ -z "$FINAL_DMG_NAME" && -n "$DMG_NAME_SUFFIX" ]]; then
@@ -560,6 +565,9 @@ fi
 # First clean up and prep the outdir
 mkdir -p "$OUT_DIR"
 rm -R "$OUT_DIR/$WARP_APP_NAME.app" || echo "No old app to remove"
+if [[ "$WARP_DISPLAY_NAME" != "$WARP_APP_NAME" ]]; then
+  rm -R "$OUT_DIR/$WARP_DISPLAY_NAME.app" || echo "No old $WARP_DISPLAY_NAME.app to remove"
+fi
 rm -R "$OUT_DIR/$FINAL_DMG_NAME" || echo "No old dmg to remove"
 
 ###########################
@@ -590,7 +598,7 @@ if [[ "$ARTIFACT" == "app" ]]; then
         <key>NSMenuItem</key>
         <dict>
           <key>default</key>
-          <string>New $WARP_APP_NAME Tab Here</string>
+          <string>New $WARP_DISPLAY_NAME Tab Here</string>
         </dict>
         <key>NSMessage</key>
         <string>openTab</string>
@@ -609,7 +617,7 @@ if [[ "$ARTIFACT" == "app" ]]; then
         <key>NSMenuItem</key>
         <dict>
           <key>default</key>
-          <string>New $WARP_APP_NAME Window Here</string>
+          <string>New $WARP_DISPLAY_NAME Window Here</string>
         </dict>
         <key>NSMessage</key>
         <string>openWindow</string>
@@ -906,6 +914,17 @@ if [[ $CODESIGN = true ]]; then
   security set-key-partition-list -S "apple-tool:,apple:" -s -k "$WARP_CODESIGN_KEYCHAIN_PASSWORD" $CODESIGN_KEYCHAIN_NAME
 fi
 
+# cargo-bundle names the app after the binary's bundle metadata; give it its display name
+# before signing, since renaming afterwards would break the signature.
+if [[ "$ARTIFACT" == app && "$WARP_DISPLAY_NAME" != "$WARP_APP_NAME" ]]; then
+  APP_PLIST="$BUNDLE_DIR/$WARP_APP_NAME.app/Contents/Info.plist"
+  plutil -replace CFBundleName -string "$WARP_DISPLAY_NAME" "$APP_PLIST"
+  plutil -replace CFBundleDisplayName -string "$WARP_DISPLAY_NAME" "$APP_PLIST"
+  rm -rf "$BUNDLE_DIR/$WARP_DISPLAY_NAME.app"
+  mv "$BUNDLE_DIR/$WARP_APP_NAME.app" "$BUNDLE_DIR/$WARP_DISPLAY_NAME.app"
+  WARP_APP_NAME="$WARP_DISPLAY_NAME"
+fi
+
 ##############################
 ## Step 3: Codesign the app ##
 ##############################
@@ -962,7 +981,7 @@ if [[ "$ARTIFACT" = app ]]; then
     local source_folder="$1"
 
     local args=(
-      --volname Warp
+      --volname "$WARP_DISPLAY_NAME"
       # For --no-internet-enable, see https://github.com/create-dmg/create-dmg/issues/179
       --no-internet-enable
       --background app/assets/resources/mac/warp_install_image.png

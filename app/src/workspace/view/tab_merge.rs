@@ -10,16 +10,30 @@ use warpui::elements::{
     Border, ChildAnchor, ConstrainedBox, Container, Element, Empty, OffsetPositioning,
     PositionedElementAnchor, PositionedElementOffsetBounds,
 };
-use warpui::{AppContext, EntityId, SingletonEntity, ViewContext};
+use warpui::{AppContext, EntityId, SingletonEntity, ViewContext, ViewHandle};
 
 use super::Workspace;
 use crate::appearance::Appearance;
-use crate::pane_group::{Direction, PaneId};
+use crate::pane_group::{Direction, PaneGroup, PaneId};
 use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
+use crate::workspace::WorkspaceRegistry;
 use crate::workspace::tab_group::TabGroupId;
 
 const PREVIEW_FILL_ALPHA: u8 = 40;
 const PREVIEW_BORDER_WIDTH: f32 = 2.;
+
+fn find_terminal_pane(
+    groups: impl IntoIterator<Item = ViewHandle<PaneGroup>>,
+    terminal_view_id: EntityId,
+    ctx: &AppContext,
+) -> Option<(ViewHandle<PaneGroup>, PaneId)> {
+    groups.into_iter().find_map(|group| {
+        let pane_id = group
+            .as_ref(ctx)
+            .find_pane_id_for_terminal_view(terminal_view_id, ctx)?;
+        Some((group, pane_id))
+    })
+}
 
 /// Where the dragged tab would land if it were dropped now.
 #[derive(Debug, Clone, Copy)]
@@ -163,6 +177,39 @@ impl Workspace {
         }
         ctx.dispatch_global_action("workspace:save_app", ());
         ctx.notify();
+    }
+
+    /// Closes the pane showing `terminal_view_id` in any window. Its process is shut down first,
+    /// so a Claude session can't write back the transcript of a thread being deleted while the
+    /// pane waits out the undo-close grace period.
+    pub(super) fn close_thread_pane(
+        &mut self,
+        terminal_view_id: EntityId,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let local = find_terminal_pane(
+            self.tabs.iter().map(|tab| tab.pane_group.clone()),
+            terminal_view_id,
+            ctx,
+        );
+        let current_window = ctx.window_id();
+        let found = local.or_else(|| {
+            WorkspaceRegistry::as_ref(ctx)
+                .all_workspaces(ctx)
+                .iter()
+                .filter(|(window_id, _)| *window_id != current_window)
+                .find_map(|(_, workspace)| {
+                    let groups = workspace.as_ref(ctx).tab_views().cloned();
+                    find_terminal_pane(groups, terminal_view_id, ctx)
+                })
+        });
+        let Some((group, pane_id)) = found else {
+            return;
+        };
+        if let Some(terminal) = group.as_ref(ctx).terminal_view_from_pane_id(pane_id, ctx) {
+            terminal.update(ctx, |terminal, ctx| terminal.shutdown_pty(ctx));
+        }
+        group.update(ctx, |group, ctx| group.close_pane(pane_id, ctx));
     }
 
     /// Moves the pane showing `terminal_view_id`, from whichever tab of this

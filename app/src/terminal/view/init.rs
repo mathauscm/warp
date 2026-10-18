@@ -27,7 +27,7 @@ use crate::terminal::model::selection::SelectionDirection;
 use crate::terminal::shared_session::{SharedSessionActionSource, SharedSessionStatus};
 use crate::terminal::view::passive_suggestions::PromptSuggestionResolution;
 use crate::terminal::view::{
-    LONG_RUNNING_AGENT_REQUESTED_COMMAND_CONTEXT_KEY,
+    CLAUDE_MENTION_CONTEXT_KEY, LONG_RUNNING_AGENT_REQUESTED_COMMAND_CONTEXT_KEY,
     LONG_RUNNING_AGENT_REQUESTED_COMMAND_USER_TOOK_OVER_CONTEXT_KEY,
 };
 use crate::util::bindings;
@@ -68,6 +68,12 @@ fn init_overlapping_keybindings(app: &mut AppContext) {
     use warpui::keymap::macros::*;
 
     let escape_key: &str = "escape";
+
+    app.register_fixed_bindings([FixedBinding::new(
+        "cmd-l",
+        TerminalAction::MentionSelectionInClaude,
+        id!("Terminal") & !id!("IMEOpen") & id!(CLAUDE_MENTION_CONTEXT_KEY),
+    )]);
 
     // No Active Block Context
     app.register_fixed_bindings([FixedBinding::new(

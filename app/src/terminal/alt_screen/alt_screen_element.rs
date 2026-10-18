@@ -29,6 +29,7 @@ use crate::settings::EnforceMinimumContrast;
 use crate::terminal::blockgrid_renderer::GridRenderParams;
 use crate::terminal::find::TerminalFindModel;
 use crate::terminal::grid_renderer::CellGlyphCache;
+use crate::terminal::grid_renderer::HiddenCells;
 use crate::terminal::meta_shortcuts::handle_keystroke_despite_composing;
 use crate::terminal::model::SecretHandle;
 use crate::terminal::model::escape_sequences::{
@@ -40,6 +41,9 @@ use crate::terminal::model::index::Point;
 use crate::terminal::model::mouse::{MouseAction, MouseButton, MouseState};
 use crate::terminal::model::selection::{SelectAction, SelectionPoint};
 use crate::terminal::model::terminal_model::WithinModel;
+use crate::terminal::prompt_card::{
+    PromptCardFrame, PromptCardMask, PromptCardStyle, paint_prompt_card,
+};
 use crate::terminal::safe_mode_settings::get_secret_obfuscation_mode;
 use crate::terminal::shared_session::presence_manager::{
     MUTED_PARTICIPANT_COLOR, PresenceManager, text_selection_color,
@@ -51,6 +55,8 @@ use crate::terminal::{
     SizeInfo, TerminalModel, grid_renderer, heights_approx_eq, should_right_click_paste,
 };
 
+/// Width the "Mencionar" pill needs to the left of the cell it hangs from.
+const MENTION_PILL_ROOM: f32 = 150.;
 const CLI_SUBAGENT_HORIZONTAL_MARGIN: f32 = 8.;
 const CLI_SUBAGENT_VERTICAL_MARGIN: f32 = 8.;
 
@@ -75,6 +81,9 @@ pub struct AltScreenElement {
     pane_state: SplitPaneState,
     active_session_state: ActiveSessionState,
     selection_range: Option<Vec1<Range<Point>>>,
+    /// The cell under which the pill that mentions a selection in Claude Code goes, when Claude
+    /// made the selection itself. Warp's own selections anchor the pill at their end instead.
+    mention_anchor: Option<Point>,
 
     presence_manager: Option<ModelHandle<PresenceManager>>,
 
@@ -122,6 +131,7 @@ impl AltScreenElement {
             is_terminal_selecting: terminal_view_render_context.is_terminal_selecting,
             terminal_view_id: terminal_view_render_context.terminal_view_id,
             selection_range,
+            mention_anchor: None,
             size: None,
             bounds: None,
             origin: None,
@@ -151,6 +161,8 @@ impl AltScreenElement {
                 ),
                 use_ligature_rendering: false,
                 hide_cursor_cell: false,
+                beam_cursor: false,
+                prompt_card: None,
             },
             presence_manager: None,
             scroll_top,
@@ -183,6 +195,21 @@ impl AltScreenElement {
 
     pub fn with_hide_cursor_cell(mut self) -> Self {
         self.grid_render_params.hide_cursor_cell = true;
+        self
+    }
+
+    pub fn with_beam_cursor(mut self) -> Self {
+        self.grid_render_params.beam_cursor = true;
+        self
+    }
+
+    pub fn with_prompt_card(mut self, style: PromptCardStyle) -> Self {
+        self.grid_render_params.prompt_card = Some(style);
+        self
+    }
+
+    pub fn with_mention_anchor(mut self, point: Point) -> Self {
+        self.mention_anchor = Some(point);
         self
     }
 
@@ -551,6 +578,27 @@ impl AltScreenElement {
                 );
             }
         };
+
+        // Anchors the pill that mentions the selection in a Claude Code prompt.
+        let anchor = self.mention_anchor.or_else(|| {
+            self.selection_range
+                .as_ref()
+                .map(|ranges| ranges.last().end)
+        });
+        if let Some(anchor) = anchor {
+            let cell_size = self.grid_render_params.cell_size;
+            let grid_left = origin.x() + size_info.padding_x_px().as_f32();
+            let cell_origin = origin
+                + vec2f(size_info.padding_x_px().as_f32(), 0.)
+                + cell_size * vec2f(anchor.col as f32, anchor.row as f32);
+            // The pill hangs right-aligned from this cell, so near the left edge it's pushed
+            // right to stay inside the pane.
+            let shift = (grid_left + MENTION_PILL_ROOM - cell_origin.x() - cell_size.x()).max(0.);
+            ctx.position_cache.cache_position_indefinitely(
+                format!("terminal_view:selection_end_{}", self.terminal_view_id),
+                RectF::new(cell_origin + vec2f(shift, 0.), cell_size),
+            );
+        }
     }
 
     /// Renders any shared session participants' selections.
@@ -741,6 +789,19 @@ impl Element for AltScreenElement {
         .min(grid.visible_rows() as f64);
         let adjusted_grid_origin = origin - self.vertical_scroll_pixels();
         let cursor_visible = model.alt_screen().is_mode_set(TermMode::SHOW_CURSOR);
+        let prompt_card = self
+            .grid_render_params
+            .prompt_card
+            .as_ref()
+            .and_then(|style| {
+                let frame = PromptCardFrame {
+                    grid_origin: adjusted_grid_origin,
+                    padding_x: padding_x.as_f32(),
+                    cell_size,
+                    bounds: RectF::new(origin, self.size.unwrap_or_default()),
+                };
+                paint_prompt_card(grid, 0..grid.visible_rows(), style, &frame, ctx)
+            });
         grid_renderer::render_grid(
             grid,
             start_row.floor() as usize,
@@ -765,11 +826,17 @@ impl Element for AltScreenElement {
             obfuscate_secrets,
             self.hovered_secret,
             self.grid_render_params.use_ligature_rendering,
-            cursor_visible.then(|| model.alt_screen().cursor_style().shape),
+            cursor_visible.then(|| {
+                self.grid_render_params
+                    .cursor_shape(model.alt_screen().cursor_style().shape)
+            }),
             RespectDisplayedOutput::Yes,
             &model.image_id_to_metadata,
             Some(&mut sampler),
             self.grid_render_params.hide_cursor_cell,
+            prompt_card
+                .as_ref()
+                .map_or(HiddenCells::NONE, PromptCardMask::hidden_cells),
             ctx,
             app,
         );

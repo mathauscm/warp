@@ -465,6 +465,18 @@ pub enum TerminalAction {
     /// Toggle the rich input editor for composing a prompt to send to a CLI agent.
     /// Triggered by Ctrl-G when a CLI agent is detected, or from the footer button.
     ToggleCLIAgentRichInput,
+    /// Quote the selected text into the prompt of the Claude Code session running here.
+    MentionSelectionInClaude,
+    /// Send the prompt of the Claude Code session running here, with its pending mentions.
+    SubmitClaudePrompt,
+    /// Stop the turn of the Claude Code session running here.
+    InterruptClaude,
+    /// Drop a mention waiting to be sent to Claude Code, by its index.
+    RemoveClaudeMention(usize),
+    /// Open or close the menu that switches Claude Code's model and effort.
+    ToggleClaudeModelMenu,
+    /// Move Claude Code to its next permission mode, like Shift+Tab.
+    CycleClaudeMode,
 
     /// Allow the blocked clipboard operation by adjusting the OSC 52 clipboard access setting.
     Osc52AllowBlockedClipboardOperation,
@@ -750,6 +762,12 @@ impl fmt::Debug for TerminalAction {
             CycleNextOrchestrationChildAgent => write!(f, "CycleNextOrchestrationChildAgent"),
             ToggleSessionRecording => write!(f, "ToggleSessionRecording"),
             ToggleCLIAgentRichInput => write!(f, "ToggleCLIAgentRichInput"),
+            MentionSelectionInClaude => write!(f, "MentionSelectionInClaude"),
+            SubmitClaudePrompt => write!(f, "SubmitClaudePrompt"),
+            InterruptClaude => write!(f, "InterruptClaude"),
+            RemoveClaudeMention(index) => write!(f, "RemoveClaudeMention({index})"),
+            ToggleClaudeModelMenu => write!(f, "ToggleClaudeModelMenu"),
+            CycleClaudeMode => write!(f, "CycleClaudeMode"),
             Osc52AllowBlockedClipboardOperation => {
                 write!(f, "Osc52AllowBlockedClipboardOperation")
             }

@@ -284,6 +284,28 @@ where
     None
 }
 
+/// Grid content left blank, e.g. the rules around Claude Code's prompt.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HiddenCells<'a> {
+    pub rows: &'a [usize],
+    pub cells: &'a [Point],
+}
+
+impl HiddenCells<'_> {
+    pub const NONE: HiddenCells<'static> = HiddenCells {
+        rows: &[],
+        cells: &[],
+    };
+
+    fn hides_row(&self, row: usize) -> bool {
+        self.rows.contains(&row)
+    }
+
+    fn hides_cell(&self, point: Point) -> bool {
+        self.cells.contains(&point)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn render_grid<'a>(
     grid: &GridHandler,
@@ -314,6 +336,7 @@ pub fn render_grid<'a>(
     image_metadata: &HashMap<u32, StoredImageMetadata>,
     bg_color_sampler: Option<&mut ColorSampler>,
     hide_cursor_cell: bool,
+    hidden: HiddenCells<'_>,
     ctx: &mut PaintContext,
     app: &AppContext,
 ) {
@@ -352,6 +375,7 @@ pub fn render_grid<'a>(
                 image_metadata,
                 bg_color_sampler,
                 hide_cursor_cell,
+                hidden,
                 ctx,
                 app,
             );
@@ -385,6 +409,7 @@ pub fn render_grid<'a>(
                 image_metadata,
                 bg_color_sampler,
                 hide_cursor_cell,
+                hidden,
                 ctx,
                 app,
             );
@@ -420,6 +445,7 @@ pub fn render_grid<'a>(
                 image_metadata,
                 bg_color_sampler,
                 hide_cursor_cell,
+                hidden,
                 ctx,
                 app,
             );
@@ -454,6 +480,7 @@ pub fn render_grid<'a>(
                 image_metadata,
                 bg_color_sampler,
                 hide_cursor_cell,
+                hidden,
                 ctx,
                 app,
             );
@@ -492,6 +519,7 @@ fn render_grid_without_ligatures<'a>(
     image_metadata: &HashMap<u32, StoredImageMetadata>,
     mut bg_color_sampler: Option<&mut ColorSampler>,
     hide_cursor_cell: bool,
+    hidden: HiddenCells<'_>,
     ctx: &mut PaintContext,
     app: &AppContext,
 ) {
@@ -622,6 +650,10 @@ fn render_grid_without_ligatures<'a>(
     }
 
     for (offset, row_idx) in visible_rows.enumerate() {
+        if hidden.hides_row(row_idx) {
+            continue;
+        }
+
         let offset_row = start_row + offset;
 
         let Some(row) = grid.row(row_idx) else {
@@ -642,6 +674,10 @@ fn render_grid_without_ligatures<'a>(
 
         for col in 0..grid.columns() {
             let current_point = Point::new(row_idx, col);
+
+            if hidden.hides_cell(current_point) {
+                continue;
+            }
 
             // Skip the cursor cell when CLI agent rich input is open
             // AND the agent draws its own cursor (SHOW_CURSOR is off).
@@ -1005,6 +1041,7 @@ fn render_grid_with_ligatures<'a>(
     image_metadata: &HashMap<u32, StoredImageMetadata>,
     mut bg_color_sampler: Option<&mut ColorSampler>,
     hide_cursor_cell: bool,
+    hidden: HiddenCells<'_>,
     ctx: &mut PaintContext,
     app: &AppContext,
 ) {
@@ -1131,6 +1168,10 @@ fn render_grid_with_ligatures<'a>(
     }
 
     for (offset, row_idx) in visible_rows.enumerate() {
+        if hidden.hides_row(row_idx) {
+            continue;
+        }
+
         let offset_row = start_row + offset;
         let mut string_builder =
             AttributedStringBuilder::new(font_family, font_family, grid.columns());
@@ -1185,6 +1226,10 @@ fn render_grid_with_ligatures<'a>(
             let mut first_cell_in_secret = FirstCellInSecret::No;
 
             let current_point = Point::new(row_idx, col);
+
+            if hidden.hides_cell(current_point) {
+                continue;
+            }
 
             // Skip the cursor cell when CLI agent rich input is open
             // AND the agent draws its own cursor (SHOW_CURSOR is off).
@@ -2445,7 +2490,7 @@ pub fn render_cursor(
 
     let thickness =
         CURSOR_THICKNESS_SCALE_FACTOR * grid_render_params.cell_size.x().round().max(1.);
-    match cursor_style.shape {
+    match grid_render_params.cursor_shape(cursor_style.shape) {
         CursorShape::Block => {
             ctx.scene
                 .draw_rect_with_hit_recording(RectF::new(cursor_top_origin, cursor_block_size))
