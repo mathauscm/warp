@@ -9,7 +9,7 @@ use warpui::{AppContext, Element, EntityId, PaintContext};
 
 use super::model::SecretHandle;
 use super::model::ansi::{CursorShape, CursorStyle};
-use super::model::grid::RespectDisplayedOutput;
+use super::model::grid::{Dimensions as _, RespectDisplayedOutput};
 use super::model::image_map::StoredImageMetadata;
 use crate::settings::EnforceMinimumContrast;
 use crate::terminal::grid_renderer::{CellGlyphCache, render_cursor, render_grid};
@@ -17,6 +17,7 @@ use crate::terminal::model::ObfuscateSecrets;
 use crate::terminal::model::blockgrid::{BlockGrid, CursorDisplayPoint};
 use crate::terminal::model::grid::grid_handler::Link;
 use crate::terminal::model::index::Point;
+use crate::terminal::prompt_card::{PromptCardStyle, find_prompt_rules, paint_prompt_card};
 use crate::terminal::{SizeInfo, color};
 use crate::themes::theme::WarpTheme;
 
@@ -36,6 +37,24 @@ pub struct GridRenderParams {
     /// (SHOW_CURSOR on), the `draw_cursor` call and cursor contrast colouring
     /// are suppressed instead.
     pub hide_cursor_cell: bool,
+    /// Draws a thin bar where the program asked for a block cursor.
+    pub beam_cursor: bool,
+    /// Replaces the rules around Claude Code's prompt with a rounded card.
+    pub prompt_card: Option<PromptCardStyle>,
+}
+
+impl GridRenderParams {
+    /// The shape to draw for a cursor the program asked to show as `shape`.
+    pub fn cursor_shape(&self, shape: CursorShape) -> CursorShape {
+        match shape {
+            CursorShape::Block | CursorShape::HollowBlock if self.beam_cursor => CursorShape::Beam,
+            CursorShape::Block
+            | CursorShape::HollowBlock
+            | CursorShape::Underline
+            | CursorShape::Beam
+            | CursorShape::Hidden => shape,
+        }
+    }
 }
 
 pub struct BlockGridParams {
@@ -123,6 +142,28 @@ impl BlockGridRenderer for BlockGrid {
 
         let grid = self.grid_handler();
 
+        let grid_render_params = &block_grid_params.grid_render_params;
+        let prompt_rules = grid_render_params
+            .prompt_card
+            .filter(|_| grid.displayed_output_rows().is_none())
+            .and_then(|style| {
+                let rules = find_prompt_rules(grid, 0..self.len_displayed())?;
+                Some((style, rules))
+            });
+        let hidden_rows = prompt_rules.map(|(style, rules)| {
+            paint_prompt_card(
+                rules,
+                style,
+                grid_origin,
+                grid_render_params.size_info.padding_x_px().as_f32(),
+                grid_render_params.cell_size,
+                grid.columns(),
+                block_grid_params.bounds,
+                ctx,
+            );
+            rules.rows()
+        });
+
         let obfuscate_secrets = block_grid_params
             .grid_render_params
             .obfuscate_secrets
@@ -156,11 +197,13 @@ impl BlockGridRenderer for BlockGrid {
             obfuscate_secrets,
             hovered_secret,
             block_grid_params.grid_render_params.use_ligature_rendering,
-            visible_cursor_shape,
+            visible_cursor_shape
+                .map(|shape| block_grid_params.grid_render_params.cursor_shape(shape)),
             RespectDisplayedOutput::Yes,
             image_metadata,
             None,
             block_grid_params.grid_render_params.hide_cursor_cell,
+            hidden_rows.as_ref().map_or(&[], |rows| rows.as_slice()),
             ctx,
             app,
         );

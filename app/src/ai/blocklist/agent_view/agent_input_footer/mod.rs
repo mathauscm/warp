@@ -1,4 +1,5 @@
 pub(super) mod chips;
+pub(crate) mod claude_theme_selector;
 pub mod editor;
 mod environment_selector;
 pub mod toolbar_item;
@@ -49,6 +50,7 @@ use warpui::{
     ViewHandle,
 };
 
+use self::claude_theme_selector::{ClaudeThemeSelector, ClaudeThemeSelectorEvent};
 pub(crate) use self::environment_selector::{
     EnvironmentSelector, EnvironmentSelectorEvent, EnvironmentSelectorTarget,
 };
@@ -218,6 +220,7 @@ pub struct AgentInputFooter {
     environment_selector: Option<ViewHandle<EnvironmentSelector>>,
     handoff_environment_selector: ViewHandle<EnvironmentSelector>,
     worktree_selector: ViewHandle<WorktreeSelector>,
+    claude_theme_selector: ViewHandle<ClaudeThemeSelector>,
     prompt_alert: ViewHandle<PromptAlertView>,
     ambient_agent_view_model: Option<ModelHandle<AmbientAgentViewModel>>,
     handoff_compose_state: ModelHandle<HandoffComposeState>,
@@ -834,6 +837,15 @@ impl AgentInputFooter {
             }
         });
 
+        let claude_theme_selector = ctx.add_typed_action_view(|ctx| {
+            ClaudeThemeSelector::new(menu_positioning_provider.clone(), ctx)
+        });
+        ctx.subscribe_to_view(&claude_theme_selector, |_, _, event, ctx| match event {
+            ClaudeThemeSelectorEvent::MenuVisibilityChanged { open } => {
+                ctx.emit(AgentInputFooterEvent::ToggledChipMenu { open: *open });
+            }
+        });
+
         let prompt_alert = ctx.add_typed_action_view(PromptAlertView::new);
         ctx.subscribe_to_view(&prompt_alert, |_, _, event, ctx| {
             ctx.emit(AgentInputFooterEvent::PromptAlert(event.clone()));
@@ -1023,6 +1035,7 @@ impl AgentInputFooter {
             environment_selector,
             handoff_environment_selector,
             worktree_selector,
+            claude_theme_selector,
             prompt_alert,
             terminal_model,
             handoff_compose_state,
@@ -1674,6 +1687,8 @@ impl AgentInputFooter {
             AgentToolbarItemKind::Worktree => item
                 .is_available(app)
                 .then(|| ChildView::new(&self.worktree_selector).finish()),
+            AgentToolbarItemKind::ClaudeTheme => (self.cli_agent(app) == Some(CLIAgent::Claude))
+                .then(|| ChildView::new(&self.claude_theme_selector).finish()),
             // Handled by the available_in() guard above; included for exhaustiveness.
             AgentToolbarItemKind::ModelSelector
             | AgentToolbarItemKind::NLDToggle
@@ -1862,11 +1877,13 @@ impl AgentInputFooter {
         let has_open_handoff_env_selector =
             self.handoff_environment_selector.as_ref(app).is_menu_open();
         let has_open_worktree_selector = self.worktree_selector.as_ref(app).is_menu_open();
+        let has_open_claude_theme_selector = self.claude_theme_selector.as_ref(app).is_menu_open();
 
         has_open_display_chip
             || has_open_env_selector
             || has_open_handoff_env_selector
             || has_open_worktree_selector
+            || has_open_claude_theme_selector
     }
 
     pub fn is_model_selector_open(&self, app: &AppContext) -> bool {
@@ -2516,7 +2533,9 @@ impl AgentInputFooter {
                 .is_available(app)
                 .then(|| ChildView::new(&self.worktree_selector).finish()),
             // Handled by the available_in() guard above; included for exhaustiveness.
-            AgentToolbarItemKind::RichInput | AgentToolbarItemKind::Settings => None,
+            AgentToolbarItemKind::RichInput
+            | AgentToolbarItemKind::Settings
+            | AgentToolbarItemKind::ClaudeTheme => None,
         }
     }
 

@@ -106,6 +106,8 @@ pub struct ClaudeThread {
     pub updated_at: SystemTime,
     /// The `<session id>.jsonl` file holding the conversation.
     pub transcript: PathBuf,
+    /// The git branch checked out in `cwd` when the last prompt was sent.
+    pub git_branch: Option<String>,
 }
 
 impl ClaudeThread {
@@ -237,6 +239,7 @@ fn read_transcript(path: &Path, modified: SystemTime) -> Option<ClaudeThread> {
     for line in head.lines().chain(tail.lines()) {
         summary.add_line(line);
     }
+    let git_branch = summary.git_branch.clone();
     let (title, cwd) = summary.finish()?;
     Some(ClaudeThread {
         session_id,
@@ -244,6 +247,7 @@ fn read_transcript(path: &Path, modified: SystemTime) -> Option<ClaudeThread> {
         cwd,
         updated_at: modified,
         transcript: path.to_path_buf(),
+        git_branch,
     })
 }
 
@@ -314,6 +318,8 @@ pub(crate) struct TranscriptSummary {
     summary: Option<String>,
     first_prompt: Option<String>,
     cwd: Option<PathBuf>,
+    /// Later prompts win, since the branch can change during the conversation.
+    git_branch: Option<String>,
 }
 
 impl TranscriptSummary {
@@ -356,6 +362,13 @@ impl TranscriptSummary {
         let is_flagged = |name: &str| record.get(name).and_then(Value::as_bool) == Some(true);
         if is_flagged("isSidechain") || is_flagged("isMeta") || is_flagged("isCompactSummary") {
             return;
+        }
+        if let Some(branch) = record
+            .get("gitBranch")
+            .and_then(Value::as_str)
+            .filter(|branch| !branch.is_empty())
+        {
+            self.git_branch = Some(branch.to_owned());
         }
         if self.cwd.is_none()
             && let Some(cwd) = record.get("cwd").and_then(Value::as_str)

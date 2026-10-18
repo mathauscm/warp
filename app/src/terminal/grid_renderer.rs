@@ -314,6 +314,7 @@ pub fn render_grid<'a>(
     image_metadata: &HashMap<u32, StoredImageMetadata>,
     bg_color_sampler: Option<&mut ColorSampler>,
     hide_cursor_cell: bool,
+    hidden_rows: &[usize], // Grid rows left blank.
     ctx: &mut PaintContext,
     app: &AppContext,
 ) {
@@ -352,6 +353,7 @@ pub fn render_grid<'a>(
                 image_metadata,
                 bg_color_sampler,
                 hide_cursor_cell,
+                hidden_rows,
                 ctx,
                 app,
             );
@@ -385,6 +387,7 @@ pub fn render_grid<'a>(
                 image_metadata,
                 bg_color_sampler,
                 hide_cursor_cell,
+                hidden_rows,
                 ctx,
                 app,
             );
@@ -420,6 +423,7 @@ pub fn render_grid<'a>(
                 image_metadata,
                 bg_color_sampler,
                 hide_cursor_cell,
+                hidden_rows,
                 ctx,
                 app,
             );
@@ -454,6 +458,7 @@ pub fn render_grid<'a>(
                 image_metadata,
                 bg_color_sampler,
                 hide_cursor_cell,
+                hidden_rows,
                 ctx,
                 app,
             );
@@ -492,6 +497,7 @@ fn render_grid_without_ligatures<'a>(
     image_metadata: &HashMap<u32, StoredImageMetadata>,
     mut bg_color_sampler: Option<&mut ColorSampler>,
     hide_cursor_cell: bool,
+    hidden_rows: &[usize],
     ctx: &mut PaintContext,
     app: &AppContext,
 ) {
@@ -622,6 +628,10 @@ fn render_grid_without_ligatures<'a>(
     }
 
     for (offset, row_idx) in visible_rows.enumerate() {
+        if hidden_rows.contains(&row_idx) {
+            continue;
+        }
+
         let offset_row = start_row + offset;
 
         let Some(row) = grid.row(row_idx) else {
@@ -1005,6 +1015,7 @@ fn render_grid_with_ligatures<'a>(
     image_metadata: &HashMap<u32, StoredImageMetadata>,
     mut bg_color_sampler: Option<&mut ColorSampler>,
     hide_cursor_cell: bool,
+    hidden_rows: &[usize],
     ctx: &mut PaintContext,
     app: &AppContext,
 ) {
@@ -1131,6 +1142,10 @@ fn render_grid_with_ligatures<'a>(
     }
 
     for (offset, row_idx) in visible_rows.enumerate() {
+        if hidden_rows.contains(&row_idx) {
+            continue;
+        }
+
         let offset_row = start_row + offset;
         let mut string_builder =
             AttributedStringBuilder::new(font_family, font_family, grid.columns());
@@ -2445,7 +2460,7 @@ pub fn render_cursor(
 
     let thickness =
         CURSOR_THICKNESS_SCALE_FACTOR * grid_render_params.cell_size.x().round().max(1.);
-    match cursor_style.shape {
+    match grid_render_params.cursor_shape(cursor_style.shape) {
         CursorShape::Block => {
             ctx.scene
                 .draw_rect_with_hit_recording(RectF::new(cursor_top_origin, cursor_block_size))

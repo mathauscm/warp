@@ -79,6 +79,9 @@ pub enum AgentToolbarItemKind {
 
     // Both – switches or creates a branch in the workspace's worktree slot.
     Worktree,
+
+    // CLI agent only – picks the colors of Claude Code panes. Only shown while Claude Code runs.
+    ClaudeTheme,
 }
 
 impl AgentToolbarItemKind {
@@ -96,7 +99,9 @@ impl AgentToolbarItemKind {
             | Self::UsageSummary
             | Self::FastForwardToggle
             | Self::HandoffToCloud => ToolbarAvailability::AgentViewOnly,
-            Self::RichInput | Self::Settings => ToolbarAvailability::CLIAgentOnly,
+            Self::RichInput | Self::Settings | Self::ClaudeTheme => {
+                ToolbarAvailability::CLIAgentOnly
+            }
         }
     }
 
@@ -109,9 +114,11 @@ impl AgentToolbarItemKind {
         is_cloud_mode: bool,
     ) -> bool {
         match self {
-            Self::Settings | Self::ShareSession | Self::FileExplorer | Self::Worktree => {
-                !status.is_viewer()
-            }
+            Self::Settings
+            | Self::ShareSession
+            | Self::FileExplorer
+            | Self::Worktree
+            | Self::ClaudeTheme => !status.is_viewer(),
             Self::FileAttach => !status.is_viewer() || is_cloud_mode,
             Self::FastForwardToggle => !status.is_viewer() || status.is_executor(),
             // Handoff is host-initiated; viewers cannot hand off another user's conversation.
@@ -142,6 +149,7 @@ impl AgentToolbarItemKind {
             Self::FastForwardToggle => "Fast Forward",
             Self::HandoffToCloud => "Hand off to cloud",
             Self::Worktree => "Worktree",
+            Self::ClaudeTheme => "Claude Theme",
         }
     }
 
@@ -163,6 +171,7 @@ impl AgentToolbarItemKind {
             // closest fit among the existing icons for V0; design may swap it later.
             Self::HandoffToCloud => Some(Icon::UploadCloud),
             Self::Worktree => Some(Icon::GitBranch),
+            Self::ClaudeTheme => Some(Icon::PaintBrush),
         }
     }
 
@@ -184,7 +193,8 @@ impl AgentToolbarItemKind {
             | Self::FileExplorer
             | Self::RichInput
             | Self::Settings
-            | Self::Worktree => false,
+            | Self::Worktree
+            | Self::ClaudeTheme => false,
         }
     }
 
@@ -318,6 +328,7 @@ impl AgentToolbarItemKind {
         if cfg!(not(target_family = "wasm")) {
             items.push(Self::Worktree);
         }
+        items.push(Self::ClaudeTheme);
         items
     }
 
@@ -342,6 +353,7 @@ impl AgentToolbarItemKind {
             Self::FileAttach,
             Self::VoiceInput,
             Self::Settings,
+            Self::ClaudeTheme,
         ]);
         if cfg!(not(target_family = "wasm")) {
             items.push(Self::Worktree);

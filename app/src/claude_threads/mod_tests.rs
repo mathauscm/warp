@@ -21,6 +21,24 @@ fn user_line(cwd: &str, text: &str) -> String {
 }
 
 #[test]
+fn git_branch_comes_from_the_latest_prompt() {
+    let prompt = |branch: &str| {
+        serde_json::json!({
+            "type": "user",
+            "cwd": "/w/kinbox",
+            "gitBranch": branch,
+            "message": { "role": "user", "content": "oi" },
+        })
+        .to_string()
+    };
+    let mut summary = TranscriptSummary::default();
+    for line in [prompt("main"), prompt("feat/login"), prompt("")] {
+        summary.add_line(&line);
+    }
+    assert_eq!(summary.git_branch.as_deref(), Some("feat/login"));
+}
+
+#[test]
 fn project_slug_replaces_every_non_alphanumeric_character() {
     assert_eq!(
         project_slug(Path::new("/Users/me/projects/aldeia/kinbox-worktree")),
@@ -111,6 +129,7 @@ fn resume_command_rejects_unsafe_session_ids() {
         cwd: PathBuf::from("/w"),
         updated_at: SystemTime::UNIX_EPOCH,
         transcript: PathBuf::from("/w/a.jsonl"),
+        git_branch: None,
     };
     assert_eq!(
         thread("80870f2f-fdc6-49d4-a6b3-90cd2c3d3b1c").resume_command(),

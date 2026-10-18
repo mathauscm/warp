@@ -33,8 +33,8 @@ use warp_core::ui::appearance::Appearance;
 use warp_core::ui::color::contrast::{
     MinimumAllowedContrast, high_enough_contrast, pick_best_foreground_color,
 };
-use warp_core::ui::theme::Fill as ThemeFill;
 use warp_core::ui::theme::color::internal_colors;
+use warp_core::ui::theme::{ColorScheme, Fill as ThemeFill};
 use warp_errors::report_error;
 use warp_terminal::model::escape_sequences::{BRACKETED_PASTE_END, BRACKETED_PASTE_START};
 use warpify_footer::{WarpifyFooterView, WarpifyFooterViewEvent};
@@ -48,6 +48,7 @@ use warpui::{
     ViewContext, ViewHandle,
 };
 
+use super::claude_look::ClaudePalette;
 use super::{RichContentInsertionPosition, TerminalAction, TerminalView};
 use crate::ai::blocklist::block::cli_controller::CLISubagentEvent;
 use crate::cmd_or_ctrl_shift;
@@ -1468,6 +1469,16 @@ impl View for UseAgentToolbar {
                 && let Some(bg_color) = terminal_model.alt_screen().inferred_bg_color()
             {
                 container = container.with_background(bg_color);
+            } else if cli_agent == CLIAgent::Claude
+                && let Some(palette) = ClaudePalette::current(app)
+            {
+                // The footer's chips take the Warp theme's colors, so they need the Warp
+                // background when the Claude palette is the opposite brightness.
+                let theme = Appearance::as_ref(app).theme();
+                let warp_theme_is_dark = theme.inferred_color_scheme() == ColorScheme::LightOnDark;
+                if palette.is_dark() != warp_theme_is_dark {
+                    container = container.with_background(theme.background());
+                }
             }
 
             return container.finish();
