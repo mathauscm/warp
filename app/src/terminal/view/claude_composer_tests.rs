@@ -91,3 +91,51 @@ fn plan_mode_is_teal_and_auto_modes_amber() {
     assert_eq!(mode_color("Accept edits"), Some(AUTO_MODE_COLOR));
     assert_eq!(mode_color("Something else"), None);
 }
+
+#[test]
+fn erasing_the_prompt_moves_to_its_end_then_backspaces_every_character() {
+    let rows = vec!["hello".to_owned(), "wor".to_owned()];
+    // Cursor after "he": 3 characters, a line break and 3 more to its right.
+    let keys = erase_prompt_keys(&rows, Some((0, 2)));
+    assert_eq!(keys.len(), 7 + 9);
+    assert!(keys[..7].iter().all(|key| *key == CURSOR_RIGHT));
+    assert!(keys[7..].iter().all(|key| *key == BACKSPACE));
+}
+
+#[test]
+fn erasing_the_prompt_from_its_end_only_backspaces() {
+    let rows = vec!["abc".to_owned()];
+    assert_eq!(erase_prompt_keys(&rows, Some((0, 3))), vec![BACKSPACE; 3]);
+    assert_eq!(erase_prompt_keys(&rows, None), vec![BACKSPACE; 3]);
+}
+
+#[test]
+fn slider_positions_map_onto_the_nearest_effort_level() {
+    // A 100px track whose knob stops `SLIDER_INSET` short of each end.
+    let left = 10.;
+    let right = 110.;
+    assert_eq!(slider_position(0., left, right), 0.);
+    assert_eq!(slider_position(500., left, right), 1.);
+    let middle = slider_position(60., left, right);
+    assert!((middle - 0.5).abs() < f32::EPSILON);
+    assert_eq!(nearest_effort(middle), 2);
+    assert_eq!(nearest_effort(0.1), 0);
+    assert_eq!(nearest_effort(0.9), EFFORTS.len() - 1);
+    assert_eq!(effort_position(nearest_effort(0.74)), 0.75);
+}
+
+#[test]
+fn a_settling_knob_ends_on_its_level() {
+    let settle = SliderSettle {
+        from: 0.4,
+        to: 0.5,
+        started_at: Instant::now() - SLIDER_SETTLE_DURATION,
+    };
+    assert_eq!(settle.position(), None);
+    let settle = SliderSettle {
+        started_at: Instant::now(),
+        ..settle
+    };
+    let position = settle.position().expect("still settling");
+    assert!((0.4..=0.5).contains(&position));
+}

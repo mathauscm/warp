@@ -7,6 +7,7 @@
 //! Mentions stay out of Claude's prompt until the message is sent: pressing Enter with the prompt
 //! showing pastes them as quotes after the typed text, then submits.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -17,24 +18,23 @@ use warp_core::ui::theme::{ColorScheme, Fill as WarpThemeFill};
 use warp_terminal::model::escape_sequences::{BRACKETED_PASTE_END, BRACKETED_PASTE_START};
 use warpui::r#async::Timer;
 use warpui::elements::{
-    Border, ChildAnchor, ChildView, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment,
-    Element, Flex, Hoverable, MainAxisSize, MouseStateHandle, OffsetPositioning, Padding,
-    ParentElement, PositionedElementAnchor, PositionedElementOffsetBounds, Radius, SavePosition,
-    Text,
+    Align, Border, ChildAnchor, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment,
+    Dismiss, DispatchEventResult, DragAxis, Draggable, DraggableState, DropShadow, Element, Empty,
+    EventHandler, Expanded, Flex, Hoverable, Icon as SvgIcon, MainAxisAlignment, MainAxisSize,
+    MouseStateHandle, OffsetPositioning, Padding, ParentElement, PositionedElementAnchor,
+    PositionedElementOffsetBounds, Radius, SavePosition, Stack, Text,
 };
 use warpui::fonts::{FamilyId, Properties, Weight};
 use warpui::geometry::vector::vec2f;
 use warpui::platform::Cursor;
-use warpui::{AppContext, SingletonEntity, ViewContext, ViewHandle};
+use warpui::{AppContext, SingletonEntity, ViewContext};
 
 use super::claude_look::ClaudePalette;
 use super::claude_mention::quote;
 use super::{TerminalAction, TerminalView};
 use crate::appearance::Appearance;
 use crate::claude_threads::project_slug;
-use crate::context_chips::display_menu::{
-    ChipMenuType, DisplayChipMenu, GenericMenuItem, PromptDisplayMenuEvent,
-};
+use crate::settings::AppEditorSettings;
 use crate::terminal::TerminalModel;
 use crate::terminal::cli_agent_sessions::{CLIAgentSessionStatus, CLIAgentSessionsModel};
 use crate::terminal::model::cell::Flags;
@@ -74,6 +74,22 @@ const TRANSCRIPT_TAIL_BYTES: u64 = 256 * 1024;
 const MODE_HINT: &str = "(shift+tab to cycle)";
 /// What Shift+Tab sends, which cycles Claude's permission mode.
 const SHIFT_TAB: &[u8] = b"\x1b[Z";
+const BACKSPACE: &[u8] = b"\x7f";
+/// How long the cursor stays on, and then off, while it blinks.
+const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
+/// Time between the keys that erase the prompt.
+const KEY_SPACING: Duration = Duration::from_millis(3);
+const CURSOR_RIGHT: &[u8] = b"\x1b[C";
+/// Backspace and Delete, as the legacy encoding and the kitty keyboard protocol (which Claude
+/// turns on) send them.
+const ERASE_KEYS: [&[u8]; 6] = [
+    b"\x7f",
+    b"\x08",
+    b"\x1b[127u",
+    b"\x1b[127;1u",
+    b"\x1b[3~",
+    b"\x1b[3;1~",
+];
 
 /// Models offered in the model menu, with the id `/model` takes.
 const MODELS: [(&str, &str); 4] = [
@@ -82,8 +98,31 @@ const MODELS: [(&str, &str); 4] = [
     ("Haiku 4.5", "claude-haiku-4-5-20251001"),
     ("Fable 5.1", "claude-fable-5-1"),
 ];
-/// Effort levels offered in the model menu, as `/effort` takes them.
+/// Effort levels on the picker's slider, as `/effort` takes them.
 const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+/// What `/effort` takes to go back to the model's default.
+const DEFAULT_EFFORT: &str = "auto";
+const PICKER_WIDTH: f32 = 236.;
+const PICKER_PADDING: f32 = 12.;
+const PICKER_CORNER_RADIUS: f32 = 12.;
+/// Space between the model chip and the picker above it.
+const PICKER_OFFSET: f32 = 8.;
+const PICKER_TITLE_FONT_SIZE: f32 = 13.;
+const PICKER_FONT_SIZE: f32 = 12.;
+const SLIDER_HEIGHT: f32 = 18.;
+const SLIDER_KNOB_SIZE: f32 = 14.;
+const SLIDER_DOT_SIZE: f32 = 3.;
+/// How far from each end of the track the knob's middle stops.
+const SLIDER_INSET: f32 = SLIDER_HEIGHT / 2.;
+/// Time given to one `/model` or `/effort` before the next is typed.
+const COMMAND_SPACING: Duration = Duration::from_millis(400);
+/// How long the knob takes to settle on a level after it's let go.
+const SLIDER_SETTLE_DURATION: Duration = Duration::from_millis(160);
+const SLIDER_FRAME: Duration = Duration::from_millis(16);
+const PICKER_ICON_SIZE: f32 = 13.;
+const RESET_ICON: &str = "bundled/svg/picolas-reset.svg";
+const CHEVRON_RIGHT_ICON: &str = "bundled/svg/picolas-chevron-right.svg";
+const CHECK_ICON: &str = "bundled/svg/picolas-check.svg";
 
 /// Accent of quote chips, the same blue as quotes in a chat app.
 const QUOTE_ACCENT: ColorU = ColorU {
@@ -144,36 +183,50 @@ pub(super) struct ClaudeComposer {
     mentions: Vec<PendingMention>,
     model: Option<ClaudeModelLabel>,
     model_refreshed_at: Option<Instant>,
-    model_menu: ViewHandle<DisplayChipMenu>,
-    is_model_menu_open: bool,
+    /// The page of the model and effort picker, while it's open.
+    picker: Option<PickerPage>,
+    /// Set by ⌘A: the next key replaces everything typed in the prompt.
+    is_prompt_selected: bool,
+    /// The off half of the cursor's blink.
+    is_cursor_blinked_off: bool,
+    /// Bumped whenever the blink restarts; ticks of an older blink stop.
+    cursor_blink_epoch: usize,
+    /// Where the knob of the effort slider is held, from 0 (left end) to 1, while it's pressed.
+    slider_drag: Option<f32>,
+    /// The effort let go at on the slider, which Claude switches to when the picker closes.
+    pending_effort: Option<usize>,
+    /// The knob gliding onto the level it was let go at.
+    slider_settle: Option<SliderSettle>,
+    slider_drag_state: DraggableState,
     model_chip_mouse_state: MouseStateHandle,
+    picker_mouse_states: PickerMouseStates,
     mode_pill_mouse_state: MouseStateHandle,
     send_button_mouse_state: MouseStateHandle,
 }
 
 impl ClaudeComposer {
-    pub(super) fn new(ctx: &mut ViewContext<TerminalView>) -> Self {
-        // `CodeReview` is the menu type without a search input.
-        let model_menu = ctx.add_typed_action_view(|ctx| {
-            DisplayChipMenu::new(model_menu_items(None), None, ChipMenuType::CodeReview, ctx)
-        });
-        ctx.subscribe_to_view(&model_menu, |me, _, event, ctx| {
-            me.handle_claude_model_menu_event(event, ctx);
-        });
+    pub(super) fn new() -> Self {
         Self {
             mentions: Vec::new(),
             model: None,
             model_refreshed_at: None,
-            model_menu,
-            is_model_menu_open: false,
+            picker: None,
+            is_prompt_selected: false,
+            is_cursor_blinked_off: false,
+            cursor_blink_epoch: 0,
+            slider_drag: None,
+            pending_effort: None,
+            slider_settle: None,
+            slider_drag_state: Default::default(),
             model_chip_mouse_state: Default::default(),
+            picker_mouse_states: Default::default(),
             mode_pill_mouse_state: Default::default(),
             send_button_mouse_state: Default::default(),
         }
     }
 }
 
-/// A choice in the model menu.
+/// A choice in the model and effort picker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModelChoice {
     Model {
@@ -183,51 +236,75 @@ enum ModelChoice {
     Effort(&'static str),
 }
 
-#[derive(Debug, Clone)]
-struct ModelMenuItem {
-    choice: ModelChoice,
-    is_current: bool,
+/// The two pages of the model and effort picker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PickerPage {
+    /// The effort slider, under the model's name.
+    Effort,
+    /// The list of models.
+    Models,
 }
 
-impl GenericMenuItem for ModelMenuItem {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
+/// Something done in the model and effort picker.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ClaudePickerAction {
+    ShowModels,
+    /// The model at this index of `MODELS`.
+    ChooseModel(usize),
+    /// The effort slider is pressed, or dragged, at this window x.
+    PressSlider(f32),
+    DragSlider(f32),
+    /// The effort slider is let go: its knob settles on the nearest level, which Claude switches
+    /// to.
+    ReleaseSlider,
+    ResetEffort,
+    Close,
+}
 
-    fn name(&self) -> String {
-        match self.choice {
-            ModelChoice::Model { label, .. } => label.to_owned(),
-            ModelChoice::Effort(effort) => {
-                format!("Esforço {}", effort_label(effort).to_lowercase())
-            }
-        }
-    }
+/// The knob of the effort slider moving from where it was let go to its level.
+#[derive(Debug, Clone, Copy)]
+struct SliderSettle {
+    from: f32,
+    to: f32,
+    started_at: Instant,
+}
 
-    fn icon(&self, _app: &AppContext) -> Option<warp_core::ui::Icon> {
-        Some(match (self.is_current, self.choice) {
-            (true, _) => WarpIcon::Check,
-            (false, ModelChoice::Model { .. }) => WarpIcon::ClaudeLogo,
-            (false, ModelChoice::Effort(_)) => WarpIcon::Lightning,
+impl SliderSettle {
+    fn position(&self) -> Option<f32> {
+        let progress =
+            self.started_at.elapsed().as_secs_f32() / SLIDER_SETTLE_DURATION.as_secs_f32();
+        (progress < 1.).then(|| {
+            let eased = 1. - (1. - progress).powi(3);
+            self.from + (self.to - self.from) * eased
         })
     }
-
-    fn action_data(&self) -> String {
-        self.name()
-    }
 }
 
-fn model_menu_items(current: Option<&ClaudeModelLabel>) -> Vec<ModelMenuItem> {
-    let models = MODELS.into_iter().map(|(label, id)| ModelMenuItem {
-        choice: ModelChoice::Model { label, id },
-        is_current: current.is_some_and(|current| current.model == label),
-    });
-    let efforts = EFFORTS.into_iter().map(|effort| ModelMenuItem {
-        choice: ModelChoice::Effort(effort),
-        is_current: current
-            .and_then(|current| current.effort.as_deref())
-            .is_some_and(|current| current == effort_label(effort)),
-    });
-    models.chain(efforts).collect()
+/// Where the knob sits for the effort at `index`, from 0 to 1.
+fn effort_position(index: usize) -> f32 {
+    index as f32 / (EFFORTS.len() - 1) as f32
+}
+
+/// The effort level nearest to a knob position.
+fn nearest_effort(position: f32) -> usize {
+    (position.clamp(0., 1.) * (EFFORTS.len() - 1) as f32).round() as usize
+}
+
+/// A knob position for window x `x` on a track spanning `track_left..track_right`.
+fn slider_position(x: f32, track_left: f32, track_right: f32) -> f32 {
+    let span = track_right - track_left - 2. * SLIDER_INSET;
+    if span <= 0. {
+        return 0.;
+    }
+    ((x - track_left - SLIDER_INSET) / span).clamp(0., 1.)
+}
+
+#[derive(Default)]
+struct PickerMouseStates {
+    model_link: MouseStateHandle,
+    reset: MouseStateHandle,
+    slider: MouseStateHandle,
+    models: [MouseStateHandle; MODELS.len()],
 }
 
 /// "claude-opus-5-5" → "Opus 5.5", "claude-sonnet-4-5-20250929" → "Sonnet 4.5".
@@ -272,16 +349,19 @@ fn last_string_field(text: &str, key: &str) -> Option<String> {
 }
 
 /// Reads the model and effort of the conversation `session_id` in `cwd` from its transcript,
-/// falling back to the effort in Claude's settings.
-fn read_model_label(cwd: PathBuf, session_id: String) -> Option<ClaudeModelLabel> {
+/// falling back to Claude's settings.
+fn read_model_label(session: Option<(PathBuf, String)>) -> Option<ClaudeModelLabel> {
     use std::io::{Read as _, Seek as _, SeekFrom};
 
     let claude_dir = dirs::home_dir()?.join(".claude");
-    let transcript = claude_dir
-        .join("projects")
-        .join(project_slug(&cwd))
-        .join(format!("{session_id}.jsonl"));
-    let tail = std::fs::File::open(transcript).ok().and_then(|mut file| {
+    let transcript = session.map(|(cwd, session_id)| {
+        claude_dir
+            .join("projects")
+            .join(project_slug(&cwd))
+            .join(format!("{session_id}.jsonl"))
+    });
+    let tail = transcript.and_then(|transcript| {
+        let mut file = std::fs::File::open(transcript).ok()?;
         let len = file.metadata().ok()?.len();
         file.seek(SeekFrom::Start(len.saturating_sub(TRANSCRIPT_TAIL_BYTES)))
             .ok()?;
@@ -291,9 +371,15 @@ fn read_model_label(cwd: PathBuf, session_id: String) -> Option<ClaudeModelLabel
     });
     let settings = std::fs::read_to_string(claude_dir.join("settings.json")).ok();
 
+    // A new session has no transcript yet; it runs with the model and effort from the settings.
     let model = tail
         .as_deref()
         .and_then(|tail| last_string_field(tail, "model"))
+        .or_else(|| {
+            settings
+                .as_deref()
+                .and_then(|settings| last_string_field(settings, "model"))
+        })
         .and_then(|model| model_label(&model))
         .unwrap_or_else(|| "Claude".to_owned());
     let effort = tail
@@ -306,6 +392,26 @@ fn read_model_label(cwd: PathBuf, session_id: String) -> Option<ClaudeModelLabel
         })
         .map(|effort| effort_label(&effort));
     Some(ClaudeModelLabel { model, effort })
+}
+
+/// The keys that erase everything typed in Claude's prompt: Right arrows to the end of the text,
+/// then a Backspace per character. Rows that wrap count a line break each, so the counts can run
+/// a little over, which Claude ignores at the ends of the text.
+fn erase_prompt_keys(rows: &[String], cursor: Option<(usize, usize)>) -> Vec<&'static [u8]> {
+    let row_lengths: Vec<usize> = rows.iter().map(|row| row.chars().count()).collect();
+    let line_breaks = row_lengths.len().saturating_sub(1);
+    let total = row_lengths.iter().sum::<usize>() + line_breaks;
+    let after_cursor = match cursor {
+        Some((row, col)) if row < row_lengths.len() => {
+            row_lengths[row].saturating_sub(col)
+                + row_lengths[row + 1..].iter().sum::<usize>()
+                + (row_lengths.len() - 1 - row)
+        }
+        _ => 0,
+    };
+    std::iter::repeat_n(CURSOR_RIGHT, after_cursor)
+        .chain(std::iter::repeat_n(BACKSPACE, total))
+        .collect()
 }
 
 /// One line, collapsed whitespace, cut to fit a chip.
@@ -381,6 +487,11 @@ fn parse_status_line(line: &str) -> StatusLine {
 /// What the composer reads off Claude's prompt in the grid.
 struct PromptState {
     first_line: String,
+    /// The prompt's rows, from the column the text starts at, without trailing blanks. Empty
+    /// without text.
+    rows: Vec<String>,
+    /// Where the cursor is in `rows`, as (row, column).
+    cursor: Option<(usize, usize)>,
     status_line: String,
     /// Nothing typed yet: a single line holding at most Claude's dimmed placeholder.
     is_empty: bool,
@@ -410,10 +521,28 @@ fn prompt_state(model: &TerminalModel) -> Option<PromptState> {
         matches!(cell.c, ' ' | '\0') || cell.flags().contains(Flags::DIM)
     });
     let cursor_at_start = grid.cursor_point() == Point::new(rules.top + 1, 2);
+    let is_empty = is_single_line && (only_placeholder || cursor_at_start);
+    let rows = if is_empty {
+        Vec::new()
+    } else {
+        (rules.top + 1..rules.bottom)
+            .filter_map(|row| row_text(row, 2))
+            .map(|line| line.replace('\0', " ").trim_end().to_owned())
+            .collect()
+    };
+    let cursor_point = grid.cursor_point();
+    let cursor = (rules.top < cursor_point.row && cursor_point.row < rules.bottom).then(|| {
+        (
+            cursor_point.row - rules.top - 1,
+            cursor_point.col.saturating_sub(2),
+        )
+    });
     Some(PromptState {
         first_line: row_text(rules.top + 1, 2)?,
+        rows,
+        cursor,
         status_line: row_text(status_row, 0)?,
-        is_empty: is_single_line && (only_placeholder || cursor_at_start),
+        is_empty,
     })
 }
 
@@ -446,6 +575,133 @@ impl TerminalView {
         self.focus_terminal(ctx);
     }
 
+    /// Whether the cursor is in the off half of its blink, so it isn't drawn.
+    pub(super) fn is_claude_cursor_blinked_off(&self) -> bool {
+        self.claude_composer.is_cursor_blinked_off
+    }
+
+    /// Shows the cursor and starts its blink over, like a text field does on every key press.
+    /// Warp draws the cursor of Claude's prompt, so it blinks it too, when cursor blinking is on.
+    pub(super) fn restart_claude_cursor_blink(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.claude_composer.is_cursor_blinked_off {
+            self.claude_composer.is_cursor_blinked_off = false;
+            ctx.notify();
+        }
+        if !self.runs_claude(ctx) {
+            return;
+        }
+        self.claude_composer.cursor_blink_epoch += 1;
+        self.schedule_claude_cursor_blink(ctx);
+    }
+
+    fn schedule_claude_cursor_blink(&mut self, ctx: &mut ViewContext<Self>) {
+        let epoch = self.claude_composer.cursor_blink_epoch;
+        ctx.spawn(Timer::after(CURSOR_BLINK_INTERVAL), move |me, _, ctx| {
+            me.blink_claude_cursor(epoch, ctx);
+        });
+    }
+
+    fn blink_claude_cursor(&mut self, epoch: usize, ctx: &mut ViewContext<Self>) {
+        if epoch != self.claude_composer.cursor_blink_epoch {
+            return;
+        }
+        let should_blink = AppEditorSettings::as_ref(ctx).cursor_blink_enabled()
+            && ctx.focused_view_id(ctx.window_id()) == Some(self.view_id)
+            && self.runs_claude(ctx);
+        if !should_blink {
+            // The blink stops with the cursor showing.
+            if std::mem::take(&mut self.claude_composer.is_cursor_blinked_off) {
+                ctx.notify();
+            }
+            return;
+        }
+        self.claude_composer.is_cursor_blinked_off = !self.claude_composer.is_cursor_blinked_off;
+        ctx.notify();
+        self.schedule_claude_cursor_blink(ctx);
+    }
+
+    pub(super) fn is_claude_prompt_selected(&self) -> bool {
+        self.claude_composer.is_prompt_selected
+    }
+
+    /// Selects everything typed in Claude's prompt, as ⌘A does in a text field. Returns whether
+    /// there was a prompt with text to select.
+    pub(super) fn select_claude_prompt(&mut self, ctx: &mut ViewContext<Self>) -> bool {
+        if !self.runs_claude(ctx) {
+            return false;
+        }
+        let has_text = prompt_state(&self.model.lock()).is_some_and(|state| !state.is_empty);
+        if has_text {
+            self.claude_composer.is_prompt_selected = true;
+            self.focus_terminal(ctx);
+        }
+        has_text
+    }
+
+    /// The text of the prompt while it's selected, for ⌘C.
+    pub(super) fn selected_claude_prompt_text(&self) -> Option<String> {
+        if !self.claude_composer.is_prompt_selected {
+            return None;
+        }
+        prompt_state(&self.model.lock())
+            .map(|state| state.rows.join("\n"))
+            .filter(|text| !text.is_empty())
+    }
+
+    /// Ends the prompt selection, if any. While it was on, a Backspace or Delete erases the
+    /// prompt, and typed or pasted text replaces it; returns whether `bytes` was used up that
+    /// way. Any other key just ends the selection.
+    pub(super) fn replace_selected_claude_prompt(
+        &mut self,
+        bytes: &[u8],
+        ctx: &mut ViewContext<Self>,
+    ) -> bool {
+        if !std::mem::take(&mut self.claude_composer.is_prompt_selected) {
+            return false;
+        }
+        ctx.notify();
+        let is_erase = ERASE_KEYS.contains(&bytes);
+        let is_text = bytes.starts_with(BRACKETED_PASTE_START)
+            || bytes
+                .first()
+                .is_some_and(|&byte| byte >= 0x20 && byte != 0x7f);
+        if !is_erase && !is_text {
+            return false;
+        }
+        let Some(state) = prompt_state(&self.model.lock()) else {
+            return false;
+        };
+        let mut keys: VecDeque<Vec<u8>> = erase_prompt_keys(&state.rows, state.cursor)
+            .into_iter()
+            .map(<[u8]>::to_vec)
+            .collect();
+        if !is_erase {
+            keys.push_back(bytes.to_vec());
+        }
+        self.send_keys_one_by_one(keys, ctx);
+        true
+    }
+
+    /// Writes `keys` a moment apart, so Claude reads each as a key press rather than a paste.
+    fn send_keys_one_by_one(&mut self, mut keys: VecDeque<Vec<u8>>, ctx: &mut ViewContext<Self>) {
+        let Some(key) = keys.pop_front() else {
+            return;
+        };
+        self.write_user_bytes_to_pty(key, ctx);
+        if !keys.is_empty() {
+            ctx.spawn(Timer::after(KEY_SPACING), move |me, _, ctx| {
+                me.send_keys_one_by_one(keys, ctx);
+            });
+        }
+    }
+
+    /// Ends the prompt selection without touching the prompt, like a click elsewhere does.
+    pub(super) fn deselect_claude_prompt(&mut self, ctx: &mut ViewContext<Self>) {
+        if std::mem::take(&mut self.claude_composer.is_prompt_selected) {
+            ctx.notify();
+        }
+    }
+
     /// Moves Claude to its next permission mode, like pressing Shift+Tab.
     pub(super) fn cycle_claude_mode(&mut self, ctx: &mut ViewContext<Self>) {
         self.write_user_bytes_to_pty(SHIFT_TAB.to_vec(), ctx);
@@ -453,40 +709,151 @@ impl TerminalView {
     }
 
     pub(super) fn toggle_claude_model_menu(&mut self, ctx: &mut ViewContext<Self>) {
-        let open = !self.claude_composer.is_model_menu_open;
-        self.claude_composer.is_model_menu_open = open;
-        if open {
-            let items = model_menu_items(self.claude_composer.model.as_ref());
-            self.claude_composer.model_menu.update(ctx, |menu, ctx| {
-                menu.update_menu_items(items, ctx);
-                menu.reset_selected_index();
-            });
-            ctx.focus(&self.claude_composer.model_menu);
-        } else {
-            self.focus_terminal(ctx);
+        if self.claude_composer.picker.is_some() {
+            self.handle_claude_picker_action(ClaudePickerAction::Close, ctx);
+            return;
         }
+        self.claude_composer.picker = Some(PickerPage::Effort);
         ctx.notify();
     }
 
-    fn handle_claude_model_menu_event(
+    pub(super) fn handle_claude_picker_action(
         &mut self,
-        event: &PromptDisplayMenuEvent,
+        action: ClaudePickerAction,
         ctx: &mut ViewContext<Self>,
     ) {
-        let choice = match event {
-            PromptDisplayMenuEvent::MenuAction(menu_event) => menu_event
-                .action_item
-                .as_any()
-                .downcast_ref::<ModelMenuItem>()
-                .map(|item| item.choice),
-            PromptDisplayMenuEvent::CloseMenu => None,
+        let choices = match action {
+            ClaudePickerAction::ShowModels => {
+                self.claude_composer.picker = Some(PickerPage::Models);
+                Vec::new()
+            }
+            ClaudePickerAction::ChooseModel(index) => {
+                let mut choices = self.close_claude_picker();
+                choices.extend(
+                    MODELS
+                        .get(index)
+                        .map(|&(label, id)| ModelChoice::Model { label, id }),
+                );
+                choices
+            }
+            ClaudePickerAction::PressSlider(x) | ClaudePickerAction::DragSlider(x) => {
+                self.claude_composer.slider_settle = None;
+                self.claude_composer.slider_drag = self.slider_position_at(x, ctx);
+                ctx.notify();
+                return;
+            }
+            ClaudePickerAction::ReleaseSlider => {
+                let Some(position) = self.claude_composer.slider_drag.take() else {
+                    return;
+                };
+                let index = nearest_effort(position);
+                self.claude_composer.pending_effort = Some(index);
+                self.claude_composer.slider_settle = Some(SliderSettle {
+                    from: position,
+                    to: effort_position(index),
+                    started_at: Instant::now(),
+                });
+                self.animate_slider_settle(ctx);
+                return;
+            }
+            ClaudePickerAction::ResetEffort => {
+                self.close_claude_picker();
+                vec![ModelChoice::Effort(DEFAULT_EFFORT)]
+            }
+            ClaudePickerAction::Close => self.close_claude_picker(),
         };
-        self.claude_composer.is_model_menu_open = false;
-        self.focus_terminal(ctx);
         ctx.notify();
-        if let Some(choice) = choice {
-            self.apply_claude_model_choice(choice, ctx);
+        self.focus_terminal(ctx);
+        self.apply_claude_model_choices(choices, ctx);
+    }
+
+    /// Closes the picker, and returns the effort picked on its slider, which Claude switches to
+    /// now: typed while the picker is open, `/effort` would redraw Claude's prompt under it.
+    fn close_claude_picker(&mut self) -> Vec<ModelChoice> {
+        let composer = &mut self.claude_composer;
+        composer.picker = None;
+        composer.slider_drag = None;
+        composer.slider_settle = None;
+        let pending = composer.pending_effort.take();
+        pending
+            .filter(|&index| Some(index) != self.current_effort_index())
+            .map(|index| ModelChoice::Effort(EFFORTS[index]))
+            .into_iter()
+            .collect()
+    }
+
+    /// Runs the first choice now and the next ones a moment apart, so each command is done
+    /// before the next is typed.
+    fn apply_claude_model_choices(
+        &mut self,
+        choices: Vec<ModelChoice>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let mut choices = choices.into_iter();
+        let Some(first) = choices.next() else {
+            return;
+        };
+        self.apply_claude_model_choice(first, ctx);
+        let rest: Vec<_> = choices.collect();
+        if !rest.is_empty() {
+            ctx.spawn(Timer::after(COMMAND_SPACING), move |me, _, ctx| {
+                me.apply_claude_model_choices(rest, ctx);
+            });
         }
+    }
+
+    /// The level of the effort Claude runs with, when it's one of `EFFORTS`.
+    fn current_effort_index(&self) -> Option<usize> {
+        let effort = self.claude_composer.model.as_ref()?.effort.as_deref()?;
+        EFFORTS
+            .iter()
+            .position(|&level| effort_label(level) == effort)
+    }
+
+    /// The knob position for window x `x` on the effort slider.
+    fn slider_position_at(&self, x: f32, ctx: &ViewContext<Self>) -> Option<f32> {
+        let track = ctx.element_position_by_id(self.claude_effort_track_position_id())?;
+        Some(slider_position(x, track.min_x(), track.max_x()))
+    }
+
+    fn claude_effort_track_position_id(&self) -> String {
+        format!("terminal_view:claude_effort_track_{}", self.view_id)
+    }
+
+    /// Re-renders every frame until the knob has settled.
+    fn animate_slider_settle(&mut self, ctx: &mut ViewContext<Self>) {
+        ctx.notify();
+        if self
+            .claude_composer
+            .slider_settle
+            .is_some_and(|settle| settle.position().is_none())
+        {
+            self.claude_composer.slider_settle = None;
+            return;
+        }
+        ctx.spawn(Timer::after(SLIDER_FRAME), |me, _, ctx| {
+            if me.claude_composer.slider_settle.is_some() {
+                me.animate_slider_settle(ctx);
+            }
+        });
+    }
+
+    /// Where the slider's knob is drawn: under the cursor while held, gliding while it settles,
+    /// and otherwise on the current level.
+    fn slider_knob_position(&self) -> Option<f32> {
+        self.claude_composer
+            .slider_drag
+            .or_else(|| {
+                self.claude_composer
+                    .slider_settle
+                    .and_then(|settle| settle.position())
+            })
+            .or_else(|| {
+                self.claude_composer
+                    .pending_effort
+                    .or_else(|| self.current_effort_index())
+                    .map(effort_position)
+            })
     }
 
     /// Runs Claude's `/model` or `/effort` for `choice`. Typed into a prompt that holds text, or
@@ -527,8 +894,10 @@ impl TerminalView {
             }
             ModelChoice::Effort(effort) => {
                 if let Some(model) = &mut self.claude_composer.model {
-                    model.effort = Some(effort_label(effort));
+                    model.effort = (effort != DEFAULT_EFFORT).then(|| effort_label(effort));
                 }
+                // Re-read the effort Claude settles on for "auto".
+                self.claude_composer.model_refreshed_at = None;
                 format!("/effort {effort}")
             }
         };
@@ -588,7 +957,7 @@ impl TerminalView {
         {
             return;
         }
-        let Some((cwd, session_id)) = CLIAgentSessionsModel::as_ref(ctx)
+        let session = CLIAgentSessionsModel::as_ref(ctx)
             .session(self.view_id)
             .and_then(|session| {
                 let context = &session.session_context;
@@ -596,13 +965,10 @@ impl TerminalView {
                     PathBuf::from(context.cwd.as_deref()?),
                     context.session_id.clone()?,
                 ))
-            })
-        else {
-            return;
-        };
+            });
         self.claude_composer.model_refreshed_at = Some(Instant::now());
         ctx.spawn(
-            async move { read_model_label(cwd, session_id) },
+            async move { read_model_label(session) },
             |me, label, ctx| {
                 if label.is_some() && me.claude_composer.model != label {
                     me.claude_composer.model = label;
@@ -637,7 +1003,9 @@ impl TerminalView {
             ClaudePalette::is_dark,
         );
         let style = ControlStyle {
-            font_family: appearance.ui_font_family(),
+            font_family: crate::appearance::system_ui_font_family_cached(app)
+                .unwrap_or_else(|| appearance.ui_font_family()),
+            strong_text: theme.main_text_color(theme.background()),
             text: theme.sub_text_color(theme.background()),
             hover: warp_core::ui::theme::color::internal_colors::fg_overlay_2(theme),
             divider: warp_core::ui::theme::color::internal_colors::fg_overlay_3(theme),
@@ -698,24 +1066,361 @@ impl TerminalView {
         controls
     }
 
-    /// The model menu, which floats above every other layer like the footer's menus.
-    pub(super) fn render_claude_model_menu(
+    /// The model and effort picker over the model chip, which floats above every other layer
+    /// like the footer's menus. Clicking outside it closes it.
+    pub(super) fn render_claude_picker(
         &self,
         app: &AppContext,
     ) -> Option<(Box<dyn Element>, OffsetPositioning)> {
-        if !self.claude_composer.is_model_menu_open || !self.runs_claude(app) {
+        let page = self.claude_composer.picker?;
+        if !self.runs_claude(app) {
             return None;
         }
+        let appearance = Appearance::as_ref(app);
+        let theme = appearance.theme();
+        let background = theme.surface_2();
+        let colors = PickerColors {
+            font_family: crate::appearance::system_ui_font_family_cached(app)
+                .unwrap_or_else(|| appearance.ui_font_family()),
+            text: theme.main_text_color(background),
+            sub_text: theme.sub_text_color(background),
+            hover: warp_core::ui::theme::color::internal_colors::fg_overlay_2(theme),
+            track: warp_core::ui::theme::color::internal_colors::fg_overlay_2(theme),
+            on_fill: WarpThemeFill::Solid(BUTTON_ICON_COLOR).with_opacity(60),
+        };
+        let content = match page {
+            PickerPage::Effort => self.render_effort_page(colors),
+            PickerPage::Models => self.render_models_page(colors),
+        };
+        let card = ConstrainedBox::new(
+            Container::new(content)
+                .with_uniform_padding(PICKER_PADDING)
+                .with_background(background)
+                .with_border(Border::all(1.).with_border_fill(
+                    warp_core::ui::theme::color::internal_colors::fg_overlay_3(theme),
+                ))
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(PICKER_CORNER_RADIUS)))
+                .with_drop_shadow(DropShadow::default())
+                .finish(),
+        )
+        .with_width(PICKER_WIDTH)
+        .finish();
+        let picker = Dismiss::new(card)
+            .on_dismiss(|ctx, _| {
+                ctx.dispatch_typed_action(TerminalAction::ClaudePicker(ClaudePickerAction::Close));
+            })
+            .finish();
         Some((
-            ChildView::new(&self.claude_composer.model_menu).finish(),
+            picker,
             OffsetPositioning::offset_from_save_position_element(
                 self.claude_model_chip_position_id(),
-                vec2f(0., -6.),
+                vec2f(0., -PICKER_OFFSET),
                 PositionedElementOffsetBounds::WindowByPosition,
                 PositionedElementAnchor::TopLeft,
                 ChildAnchor::BottomLeft,
             ),
         ))
+    }
+
+    /// The effort's name, the model (which opens the list of models) and the slider, with a
+    /// button that goes back to the model's default effort.
+    fn render_effort_page(&self, colors: PickerColors) -> Box<dyn Element> {
+        let states = &self.claude_composer.picker_mouse_states;
+        let knob = self.slider_knob_position();
+        // While the knob is held, the title follows the level it would settle on.
+        let title = self
+            .claude_composer
+            .slider_drag
+            .map(nearest_effort)
+            .or(self.claude_composer.pending_effort)
+            .or_else(|| self.current_effort_index())
+            .map(|index| effort_label(EFFORTS[index]))
+            .unwrap_or_else(|| "Padrão".to_owned());
+        let model_name = self
+            .claude_composer
+            .model
+            .as_ref()
+            .map_or_else(|| "Claude".to_owned(), |model| model.model.clone());
+
+        let model_link = Hoverable::new(states.model_link.clone(), move |state| {
+            let color = if state.is_hovered() {
+                colors.text
+            } else {
+                colors.sub_text
+            };
+            Flex::row()
+                .with_main_axis_size(MainAxisSize::Min)
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_spacing(2.)
+                .with_child(
+                    Text::new_inline(model_name, colors.font_family, PICKER_FONT_SIZE)
+                        .with_color(color.into())
+                        .finish(),
+                )
+                .with_child(render_svg(CHEVRON_RIGHT_ICON, color, 10.))
+                .finish()
+        })
+        .with_cursor(Cursor::PointingHand)
+        .on_click(|ctx, _, _| {
+            ctx.dispatch_typed_action(TerminalAction::ClaudePicker(ClaudePickerAction::ShowModels));
+        })
+        .finish();
+        let heading = Flex::column()
+            .with_main_axis_size(MainAxisSize::Min)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(2.)
+            .with_child(
+                Text::new_inline(title, colors.font_family, PICKER_TITLE_FONT_SIZE)
+                    .with_style(Properties::default().weight(Weight::Medium))
+                    .with_color(SEND_COLOR)
+                    .finish(),
+            )
+            .with_child(model_link)
+            .finish();
+        let reset = Hoverable::new(states.reset.clone(), move |state| {
+            let color = if state.is_hovered() {
+                colors.text
+            } else {
+                colors.sub_text
+            };
+            render_svg(RESET_ICON, color, PICKER_ICON_SIZE)
+        })
+        .with_cursor(Cursor::PointingHand)
+        .on_click(|ctx, _, _| {
+            ctx.dispatch_typed_action(TerminalAction::ClaudePicker(
+                ClaudePickerAction::ResetEffort,
+            ));
+        })
+        .finish();
+        let mut header = Stack::new().with_child(Align::new(heading).finish());
+        header.add_positioned_child(
+            reset,
+            OffsetPositioning::offset_from_parent(
+                vec2f(0., 0.),
+                warpui::elements::ParentOffsetBounds::ParentByPosition,
+                warpui::elements::ParentAnchor::TopRight,
+                ChildAnchor::TopRight,
+            ),
+        );
+
+        Flex::column()
+            .with_main_axis_size(MainAxisSize::Min)
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_spacing(10.)
+            .with_child(header.finish())
+            .with_child(self.render_effort_slider(knob, colors))
+            .finish()
+    }
+
+    /// A track with a dot per effort level, filled up to the knob. The knob follows the cursor
+    /// while it's held, and glides onto the nearest level when let go.
+    fn render_effort_slider(&self, knob: Option<f32>, colors: PickerColors) -> Box<dyn Element> {
+        let fill = WarpThemeFill::Solid(SEND_COLOR);
+        let radius = Radius::Pixels(SLIDER_HEIGHT / 2.);
+        let position = knob.unwrap_or(0.).clamp(0., 1.);
+        // Flex weights can't be zero.
+        let (before, after) = (position.max(0.001), (1. - position).max(0.001));
+        let span = |weight: f32, child: Box<dyn Element>| Expanded::new(weight, child).finish();
+        let blank = || Empty::new().finish();
+        let block = |width: f32, background: Option<WarpThemeFill>, corner: CornerRadius| {
+            let mut container = Container::new(blank()).with_corner_radius(corner);
+            if let Some(background) = background {
+                container = container.with_background(background);
+            }
+            ConstrainedBox::new(container.finish())
+                .with_width(width)
+                .finish()
+        };
+
+        // Empty containers have no size of their own, so each layer is a row that stretches them
+        // over the whole track.
+        let row = || {
+            Flex::row()
+                .with_main_axis_size(MainAxisSize::Max)
+                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+        };
+        let mut layers = Stack::new().with_child(
+            row()
+                .with_child(span(
+                    1.,
+                    Container::new(blank())
+                        .with_background(colors.track)
+                        .with_corner_radius(CornerRadius::with_all(radius))
+                        .finish(),
+                ))
+                .finish(),
+        );
+        if knob.is_some() {
+            // A pill from the left end to past the knob's middle, so both its ends are round.
+            layers.add_child(
+                row()
+                    .with_child(block(
+                        SLIDER_INSET,
+                        Some(fill),
+                        CornerRadius::with_left(radius),
+                    ))
+                    .with_child(span(
+                        before,
+                        Container::new(blank()).with_background(fill).finish(),
+                    ))
+                    .with_child(block(
+                        SLIDER_INSET,
+                        Some(fill),
+                        CornerRadius::with_right(radius),
+                    ))
+                    .with_child(span(after, blank()))
+                    .finish(),
+            );
+        }
+        let mut dots = Flex::row()
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center);
+        for index in 0..EFFORTS.len() {
+            let is_filled = knob.is_some_and(|knob| effort_position(index) < knob);
+            dots.add_child(render_dot(if is_filled {
+                colors.on_fill
+            } else {
+                colors.sub_text
+            }));
+        }
+        layers.add_child(
+            ConstrainedBox::new(
+                Container::new(dots.finish())
+                    .with_horizontal_padding(SLIDER_INSET - SLIDER_DOT_SIZE / 2.)
+                    .finish(),
+            )
+            .with_height(SLIDER_HEIGHT)
+            .finish(),
+        );
+        if knob.is_some() {
+            let gap = SLIDER_INSET - SLIDER_KNOB_SIZE / 2.;
+            layers.add_child(
+                ConstrainedBox::new(
+                    Flex::row()
+                        .with_main_axis_size(MainAxisSize::Max)
+                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                        .with_child(block(gap, None, CornerRadius::default()))
+                        .with_child(span(before, blank()))
+                        .with_child(render_knob())
+                        .with_child(span(after, blank()))
+                        .with_child(block(gap, None, CornerRadius::default()))
+                        .finish(),
+                )
+                .with_height(SLIDER_HEIGHT)
+                .finish(),
+            );
+        }
+        let track = SavePosition::new(
+            ConstrainedBox::new(layers.finish())
+                .with_height(SLIDER_HEIGHT)
+                .finish(),
+            &self.claude_effort_track_position_id(),
+        )
+        .finish();
+
+        // Pressing jumps the knob under the cursor; dragging, even past the ends, moves it along.
+        let drag_state = self.claude_composer.slider_drag_state.clone();
+        let draggable = Draggable::new(self.claude_composer.slider_drag_state.clone(), track)
+            .with_drag_axis(DragAxis::HorizontalOnly)
+            .with_alternate_drag_element(blank())
+            .with_keep_original_visible(true)
+            .on_drag(move |ctx, _, _, _| {
+                if let Some(mouse) = drag_state.dragging_mouse_position() {
+                    ctx.dispatch_typed_action(TerminalAction::ClaudePicker(
+                        ClaudePickerAction::DragSlider(mouse.x()),
+                    ));
+                }
+            })
+            .on_drop(|ctx, _, _, _| {
+                ctx.dispatch_typed_action(TerminalAction::ClaudePicker(
+                    ClaudePickerAction::ReleaseSlider,
+                ));
+            })
+            .finish();
+        let pressable = EventHandler::new(draggable)
+            .with_always_handle()
+            .on_left_mouse_down(|ctx, _, position| {
+                ctx.dispatch_typed_action(TerminalAction::ClaudePicker(
+                    ClaudePickerAction::PressSlider(position.x()),
+                ));
+                DispatchEventResult::StopPropagation
+            })
+            .on_left_mouse_up(|ctx, _, _| {
+                ctx.dispatch_typed_action(TerminalAction::ClaudePicker(
+                    ClaudePickerAction::ReleaseSlider,
+                ));
+                DispatchEventResult::StopPropagation
+            })
+            .finish();
+        Hoverable::new(
+            self.claude_composer.picker_mouse_states.slider.clone(),
+            |_| pressable,
+        )
+        .with_cursor(Cursor::PointingHand)
+        .finish()
+    }
+
+    /// "Selecionar modelo" and the models, the current one checked.
+    fn render_models_page(&self, colors: PickerColors) -> Box<dyn Element> {
+        let current = self
+            .claude_composer
+            .model
+            .as_ref()
+            .map(|model| model.model.as_str());
+        let mut list = Flex::column()
+            .with_main_axis_size(MainAxisSize::Min)
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_spacing(2.)
+            .with_child(
+                Container::new(
+                    Text::new_inline("Selecionar modelo", colors.font_family, PICKER_FONT_SIZE)
+                        .with_color(colors.sub_text.into())
+                        .finish(),
+                )
+                .with_horizontal_padding(8.)
+                .with_padding_bottom(6.)
+                .finish(),
+            );
+        for (index, (label, _)) in MODELS.iter().enumerate() {
+            let is_current = current == Some(*label);
+            let label = *label;
+            let item = Hoverable::new(
+                self.claude_composer.picker_mouse_states.models[index].clone(),
+                move |state| {
+                    let mut row = Flex::row()
+                        .with_main_axis_size(MainAxisSize::Max)
+                        .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                        .with_child(
+                            Text::new_inline(label, colors.font_family, PICKER_FONT_SIZE + 1.)
+                                .with_color(colors.text.into())
+                                .finish(),
+                        );
+                    if is_current {
+                        row.add_child(render_svg(CHECK_ICON, colors.text, PICKER_ICON_SIZE));
+                    }
+                    let mut item =
+                        Container::new(ConstrainedBox::new(row.finish()).with_height(22.).finish())
+                            .with_horizontal_padding(8.)
+                            .with_vertical_padding(5.)
+                            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)));
+                    if state.is_hovered() {
+                        item = item.with_background(colors.hover);
+                    }
+                    item.finish()
+                },
+            )
+            .with_cursor(Cursor::PointingHand)
+            .on_click(move |ctx, _, _| {
+                ctx.dispatch_typed_action(TerminalAction::ClaudePicker(
+                    ClaudePickerAction::ChooseModel(index),
+                ));
+            })
+            .finish();
+            list.add_child(item);
+        }
+        list.finish()
     }
 
     fn render_mention_chips(&self, is_dark: bool, style: ControlStyle) -> Box<dyn Element> {
@@ -759,21 +1464,15 @@ impl TerminalView {
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_spacing(CONTROL_GAP);
 
-        let model_text = match &self.claude_composer.model {
-            Some(label) => match &label.effort {
-                Some(effort) => format!("{} · {effort}", label.model),
-                None => label.model.clone(),
-            },
-            None => "Claude".to_owned(),
+        let (model_name, effort) = match &self.claude_composer.model {
+            Some(label) => (label.model.clone(), label.effort.clone()),
+            None => ("Claude".to_owned(), None),
         };
-        let model_chip = render_control(
+        let model_chip = render_model_chip(
             self.claude_composer.model_chip_mouse_state.clone(),
-            TerminalAction::ToggleClaudeModelMenu,
+            model_name,
+            effort,
             style,
-            Some((WarpIcon::ClaudeLogo, WarpThemeFill::Solid(SEND_COLOR))),
-            model_text,
-            style.text,
-            true,
         );
         left.add_child(
             SavePosition::new(model_chip, &self.claude_model_chip_position_id()).finish(),
@@ -813,6 +1512,8 @@ impl TerminalView {
 #[derive(Clone, Copy)]
 struct ControlStyle {
     font_family: FamilyId,
+    /// The model's name in the model chip.
+    strong_text: WarpThemeFill,
     text: WarpThemeFill,
     hover: WarpThemeFill,
     divider: WarpThemeFill,
@@ -901,6 +1602,101 @@ fn render_control(
     .with_cursor(Cursor::PointingHand)
     .on_click(move |ctx, _, _| ctx.dispatch_typed_action(action.clone()))
     .finish()
+}
+
+/// Colors and font of the model and effort picker, resolved once per render.
+#[derive(Clone, Copy)]
+struct PickerColors {
+    font_family: FamilyId,
+    text: WarpThemeFill,
+    sub_text: WarpThemeFill,
+    hover: WarpThemeFill,
+    track: WarpThemeFill,
+    /// The dots over the slider's fill.
+    on_fill: WarpThemeFill,
+}
+
+/// The Claude logo, the model in the text color and the effort a step dimmer, then a chevron.
+fn render_model_chip(
+    mouse_state: MouseStateHandle,
+    model: String,
+    effort: Option<String>,
+    style: ControlStyle,
+) -> Box<dyn Element> {
+    Hoverable::new(mouse_state, move |state| {
+        let mut content = Flex::row()
+            .with_main_axis_size(MainAxisSize::Min)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(5.)
+            .with_child(render_icon(
+                WarpIcon::ClaudeLogo,
+                WarpThemeFill::Solid(SEND_COLOR),
+                ICON_SIZE,
+            ))
+            .with_child(
+                Text::new_inline(model.clone(), style.font_family, FONT_SIZE)
+                    .with_style(Properties::default().weight(Weight::Medium))
+                    .with_color(style.strong_text.into())
+                    .finish(),
+            );
+        if let Some(effort) = &effort {
+            content.add_child(
+                Text::new_inline(effort.clone(), style.font_family, FONT_SIZE)
+                    .with_color(style.text.into())
+                    .finish(),
+            );
+        }
+        content.add_child(render_icon(WarpIcon::ChevronDown, style.text, CHEVRON_SIZE));
+        let mut control = Container::new(
+            ConstrainedBox::new(content.finish())
+                .with_height(CONTROL_HEIGHT)
+                .finish(),
+        )
+        .with_horizontal_padding(CONTROL_HORIZONTAL_PADDING)
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)));
+        if state.is_hovered() {
+            control = control.with_background(style.hover);
+        }
+        control.finish()
+    })
+    .with_cursor(Cursor::PointingHand)
+    .on_click(|ctx, _, _| ctx.dispatch_typed_action(TerminalAction::ToggleClaudeModelMenu))
+    .finish()
+}
+
+fn render_dot(color: WarpThemeFill) -> Box<dyn Element> {
+    ConstrainedBox::new(
+        Container::new(Empty::new().finish())
+            .with_background(color)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(SLIDER_DOT_SIZE / 2.)))
+            .finish(),
+    )
+    .with_width(SLIDER_DOT_SIZE)
+    .with_height(SLIDER_DOT_SIZE)
+    .finish()
+}
+
+fn render_knob() -> Box<dyn Element> {
+    ConstrainedBox::new(
+        Container::new(Empty::new().finish())
+            .with_background(WarpThemeFill::Solid(BUTTON_ICON_COLOR))
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(
+                SLIDER_KNOB_SIZE / 2.,
+            )))
+            .with_drop_shadow(DropShadow::default())
+            .finish(),
+    )
+    .with_width(SLIDER_KNOB_SIZE)
+    .with_height(SLIDER_KNOB_SIZE)
+    .finish()
+}
+
+/// One of the picker's outline icons, from `bundled/svg`.
+fn render_svg(path: &'static str, color: WarpThemeFill, size: f32) -> Box<dyn Element> {
+    ConstrainedBox::new(SvgIcon::new(path, color.into_solid()).finish())
+        .with_width(size)
+        .with_height(size)
+        .finish()
 }
 
 fn with_alpha(color: ColorU, alpha: u8) -> ColorU {

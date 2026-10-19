@@ -343,6 +343,30 @@ fn load_default_ui_font_family(ctx: &mut AppContext) -> anyhow::Result<FamilyId>
     })
 }
 
+/// The family name CoreText gives the macOS system font.
+const SYSTEM_UI_FONT: &str = ".AppleSystemUIFont";
+
+/// The macOS system font (SF Pro), which the Claude Code panels use for their own text. `None`
+/// on other platforms or when it can't be loaded.
+pub fn system_ui_font_family(ctx: &mut AppContext) -> Option<FamilyId> {
+    #[cfg(target_os = "macos")]
+    {
+        warpui::fonts::Cache::handle(ctx).update(ctx, |font_cache, _| {
+            font_cache.get_or_load_system_font(SYSTEM_UI_FONT).ok()
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = ctx;
+        None
+    }
+}
+
+/// The system font from `system_ui_font_family`, once it's been loaded.
+pub fn system_ui_font_family_cached(app: &AppContext) -> Option<FamilyId> {
+    warpui::fonts::Cache::as_ref(app).family_id_for_name(SYSTEM_UI_FONT)
+}
+
 fn load_password_font_family(ctx: &mut AppContext) -> anyhow::Result<FamilyId> {
     warpui::fonts::Cache::handle(ctx).update(ctx, |font_cache, _| {
         font_cache.load_family_from_bytes(
