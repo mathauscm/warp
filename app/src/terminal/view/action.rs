@@ -14,6 +14,7 @@ use warpui::elements::HyperlinkUrl;
 use warpui::event::ModifiersState;
 use warpui::units::Lines;
 
+use super::claude_composer::ClaudePickerAction;
 use super::inline_banner::{
     AwsBedrockLoginBannerAction, AwsCliNotInstalledBannerAction, OpenInWarpBannerAction,
     VimModeBannerAction,
@@ -473,8 +474,10 @@ pub enum TerminalAction {
     InterruptClaude,
     /// Drop a mention waiting to be sent to Claude Code, by its index.
     RemoveClaudeMention(usize),
-    /// Open or close the menu that switches Claude Code's model and effort.
+    /// Open or close the picker that switches Claude Code's model and effort.
     ToggleClaudeModelMenu,
+    /// Something done in the open model and effort picker.
+    ClaudePicker(ClaudePickerAction),
     /// Move Claude Code to its next permission mode, like Shift+Tab.
     CycleClaudeMode,
 
@@ -767,6 +770,7 @@ impl fmt::Debug for TerminalAction {
             InterruptClaude => write!(f, "InterruptClaude"),
             RemoveClaudeMention(index) => write!(f, "RemoveClaudeMention({index})"),
             ToggleClaudeModelMenu => write!(f, "ToggleClaudeModelMenu"),
+            ClaudePicker(action) => write!(f, "ClaudePicker({action:?})"),
             CycleClaudeMode => write!(f, "CycleClaudeMode"),
             Osc52AllowBlockedClipboardOperation => {
                 write!(f, "Osc52AllowBlockedClipboardOperation")

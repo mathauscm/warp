@@ -238,6 +238,12 @@ impl TerminalView {
                 card_position_id: self.claude_card_position_id(),
                 controls_position_id: self.claude_controls_position_id(),
             }),
+            selection: self.is_claude_prompt_selected().then(|| {
+                Appearance::as_ref(app)
+                    .theme()
+                    .text_selection_color()
+                    .into_solid()
+            }),
         })
     }
 

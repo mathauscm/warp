@@ -50,6 +50,8 @@ pub struct PromptCardStyle {
     /// Set when Warp draws its own controls in the card: Claude's status line is hidden, and the
     /// card's rects are cached for the elements that float over it.
     pub controls: Option<PromptCardControls>,
+    /// Set while the whole prompt is selected (⌘A): its text gets this highlight.
+    pub selection: Option<ColorU>,
 }
 
 /// Save-position ids of the card's rects.
@@ -213,6 +215,29 @@ pub fn paint_prompt_card(
                     vec2f((controls_right - text_left).max(0.), cell_size.y()),
                 ),
             );
+        }
+    }
+
+    if let Some(selection) = style.selection {
+        let text_left = frame.grid_origin.x() + frame.padding_x;
+        for row_index in rules.top + 1..rules.bottom {
+            let Some(row) = grid.row(row_index) else {
+                continue;
+            };
+            let Some(last) = (PROMPT_TEXT_COLUMN..grid.columns())
+                .rev()
+                .find(|&col| !matches!(row[col].c, ' ' | '\0'))
+            else {
+                continue;
+            };
+            let start_x = text_left + PROMPT_TEXT_COLUMN as f32 * cell_size.x();
+            let width = (last + 1 - PROMPT_TEXT_COLUMN) as f32 * cell_size.x();
+            ctx.scene
+                .draw_rect_without_hit_recording(RectF::new(
+                    vec2f(start_x, row_top(row_index)),
+                    vec2f(width, cell_size.y()),
+                ))
+                .with_background(Fill::Solid(selection));
         }
     }
 

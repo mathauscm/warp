@@ -13,20 +13,18 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
-use asset_macro::bundled_or_fetched_asset;
-use pathfinder_color::ColorU;
 use pathfinder_geometry::vector::vec2f;
 use warp_core::ui::Icon as WarpIcon;
 use warp_core::ui::theme::Fill as WarpThemeFill;
 use warp_core::ui::theme::color::internal_colors;
 use warpui::r#async::Timer;
 use warpui::elements::{
-    CacheOption, ChildAnchor, ChildView, Clipped, ClippedScrollStateHandle, ClippedScrollable,
-    ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, DragAxis, Draggable,
-    DraggableState, Element, Empty, Fill as ElementFill, Flex, Hoverable, Image, MainAxisAlignment,
-    MainAxisSize, MouseStateHandle, OffsetPositioning, Padding, ParentAnchor, ParentElement,
-    ParentOffsetBounds, PositionedElementAnchor, PositionedElementOffsetBounds, Radius,
-    SavePosition, ScrollbarWidth, Shrinkable, Stack, Text,
+    ChildAnchor, ChildView, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox, Container,
+    CornerRadius, CrossAxisAlignment, DragAxis, Draggable, DraggableState, Element, Empty,
+    Fill as ElementFill, Flex, Hoverable, Icon as SvgIcon, MainAxisAlignment, MainAxisSize,
+    MouseStateHandle, OffsetPositioning, Padding, ParentAnchor, ParentElement, ParentOffsetBounds,
+    PositionedElementAnchor, PositionedElementOffsetBounds, Radius, SavePosition, ScrollbarWidth,
+    Shrinkable, Stack, Text,
 };
 use warpui::fonts::{FamilyId, Properties, Weight};
 use warpui::geometry::rect::RectF;
@@ -36,8 +34,8 @@ use warpui::text_layout::ClipConfig;
 use warpui::ui_components::components::{UiComponent, UiComponentStyles};
 use warpui::ui_components::text_input::TextInput;
 use warpui::{
-    AppContext, Entity, EntityId, SingletonEntity, TypedActionView, View, ViewContext, ViewHandle,
-    WindowId,
+    AppContext, Entity, EntityId, EventContext, SingletonEntity, TypedActionView, View,
+    ViewContext, ViewHandle, WindowId,
 };
 
 use crate::appearance::Appearance;
@@ -71,50 +69,32 @@ const PROJECT_SPACING: f32 = 6.;
 const SECTION_SPACING: f32 = 14.;
 const ROW_SPACING: f32 = 1.;
 const ROW_HORIZONTAL_PADDING: f32 = 8.;
-const PROJECT_ROW_VERTICAL_PADDING: f32 = 5.;
-const THREAD_ROW_VERTICAL_PADDING: f32 = 7.;
+const PROJECT_ROW_VERTICAL_PADDING: f32 = 6.;
+const THREAD_ROW_VERTICAL_PADDING: f32 = 6.;
 const ROW_CORNER_RADIUS: f32 = 8.;
 const BUTTON_CORNER_RADIUS: f32 = 6.;
-/// Lines a thread's title up with its project's name, past the chevron.
-const THREAD_INDENT: f32 = CHEVRON_SIZE + ICON_TEXT_GAP;
+/// Lines a thread's title up with its project's name, past the folder icon.
+const THREAD_INDENT: f32 = FOLDER_ICON_SIZE + ICON_TEXT_GAP;
 const CHEVRON_SIZE: f32 = 12.;
 const SECTION_CHEVRON_SIZE: f32 = 10.;
-const DETAIL_ICON_SIZE: f32 = 11.;
-const LOGO_SIZE: f32 = 12.;
-const DETAIL_ICON_GAP: f32 = 5.;
 const ACTION_ICON_SIZE: f32 = 14.;
 const ACTION_BUTTON_PADDING: f32 = 3.;
-const ICON_TEXT_GAP: f32 = 6.;
-/// Space between a thread's title and its branch line.
-const LINE_SPACING: f32 = 3.;
-const SECTION_FONT_SIZE: f32 = 12.;
-const BRAND_FONT_SIZE: f32 = 16.;
-const BRAND_HEIGHT: f32 = 56.;
-const BRAND_ICON_SIZE: f32 = 16.;
-const BRAND_BUTTON_SIZE: f32 = 26.;
-const BRAND_TEXT: ColorU = ColorU {
-    r: 0xf4,
-    g: 0xf7,
-    b: 0xff,
-    a: 0xff,
-};
-/// The blue of "Code", light enough to read on the banner's blues.
-const BRAND_BLUE: ColorU = ColorU {
-    r: 0x7a,
-    g: 0xb0,
-    b: 0xff,
-    a: 0xff,
-};
-const BRAND_BACKGROUND: ColorU = ColorU {
-    r: 0x02,
-    g: 0x07,
-    b: 0x17,
-    a: 0xff,
-};
+const ICON_TEXT_GAP: f32 = 9.;
+const SECTION_FONT_SIZE: f32 = 13.;
+const HEADER_FONT_SIZE: f32 = 17.;
+const HEADER_ICON_SIZE: f32 = 16.;
+const FOLDER_ICON_SIZE: f32 = 16.;
+const NEW_CHAT_ICON_SIZE: f32 = 16.;
+const FOLDER_ICON: &str = "bundled/svg/picolas-folder.svg";
+const FOLDER_OPEN_ICON: &str = "bundled/svg/picolas-folder-open.svg";
+const NEW_CHAT_ICON: &str = "bundled/svg/picolas-new-chat.svg";
+const SEARCH_ICON: &str = "bundled/svg/picolas-search.svg";
+const SIDEBAR_ICON: &str = "bundled/svg/picolas-sidebar.svg";
+const PIN_ICON: &str = "bundled/svg/picolas-pin.svg";
 
-const PROJECT_FONT_SIZE: f32 = 13.;
-const TITLE_FONT_SIZE: f32 = 13.;
-const META_FONT_SIZE: f32 = 11.;
+const PROJECT_FONT_SIZE: f32 = 13.5;
+const TITLE_FONT_SIZE: f32 = 13.5;
+const META_FONT_SIZE: f32 = 11.5;
 /// Height of a row's right side, which swaps between the age, status, and
 /// buttons on hover; fixed so the swap doesn't move the row.
 const META_HEIGHT: f32 = ACTION_ICON_SIZE + 2. * ACTION_BUTTON_PADDING;
@@ -152,6 +132,10 @@ pub enum ClaudeThreadsAction {
     /// Shows every thread of a project, or of "Recentes" when `None`.
     ToggleShowAllThreads(Option<PathBuf>),
     NewThread(PathBuf),
+    /// Starts a thread in the folder of the focused pane.
+    NewChat,
+    /// Shows or hides the search field.
+    ToggleSearch,
     OpenThread {
         session_id: String,
         cwd: PathBuf,
@@ -223,6 +207,9 @@ pub struct ClaudeThreadsView {
     /// Lowercased; while set, only the threads whose title or branch contain it are listed, with
     /// every section and project expanded.
     search_query: String,
+    is_search_open: bool,
+    /// The system font, which the panel's text uses when it loads.
+    font_family: Option<FamilyId>,
 }
 
 impl ClaudeThreadsView {
@@ -300,6 +287,8 @@ impl ClaudeThreadsView {
             rename_editor,
             renaming: None,
             search_query: String::new(),
+            is_search_open: false,
+            font_family: crate::appearance::system_ui_font_family(ctx),
         }
     }
 
@@ -566,6 +555,41 @@ impl ClaudeThreadsView {
         ctx.notify();
     }
 
+    fn new_chat(&mut self, ctx: &mut ViewContext<Self>) {
+        let directory = get_context_target_terminal_view(self.window_id, ctx)
+            .and_then(|view| view.as_ref(ctx).pwd_if_local(ctx))
+            .map(PathBuf::from)
+            .or_else(dirs::home_dir);
+        let Some(directory) = directory else {
+            return;
+        };
+        let group = self
+            .config
+            .projects
+            .iter()
+            .filter(|project| directory.starts_with(&project.path))
+            .max_by_key(|project| project.path.as_os_str().len())
+            .map(|project| project_group_name(&project.path));
+        ctx.dispatch_typed_action_deferred(WorkspaceAction::RunCommandInNewTab {
+            directory,
+            command: NEW_THREAD_COMMAND.to_owned(),
+            group,
+        });
+    }
+
+    /// Opens the search field focused, or closes it and clears the search.
+    fn toggle_search(&mut self, ctx: &mut ViewContext<Self>) {
+        self.is_search_open = !self.is_search_open;
+        if self.is_search_open {
+            ctx.focus(&self.search_editor);
+        } else {
+            self.search_editor
+                .update(ctx, |editor, ctx| editor.clear_buffer(ctx));
+            self.search_query.clear();
+        }
+        ctx.notify();
+    }
+
     fn cancel_rename(&mut self, ctx: &mut ViewContext<Self>) {
         if self.renaming.take().is_some() {
             ctx.notify();
@@ -783,6 +807,8 @@ impl TypedActionView for ClaudeThreadsView {
                     group: Some(project_group_name(path)),
                 });
             }
+            ClaudeThreadsAction::NewChat => self.new_chat(ctx),
+            ClaudeThreadsAction::ToggleSearch => self.toggle_search(ctx),
             ClaudeThreadsAction::OpenThread { session_id, cwd } => {
                 self.pending_delete = None;
                 self.open_thread(session_id, cwd, ctx);
@@ -840,7 +866,7 @@ struct Palette {
     /// Titles of threads that aren't open, a step behind the open ones.
     idle_text: WarpThemeFill,
     sub_text: WarpThemeFill,
-    /// Branch and folder line under a thread's title.
+    /// Notes, counts and ages, a step behind `sub_text`.
     detail_text: WarpThemeFill,
     row_hover: WarpThemeFill,
     /// The thread open in the focused pane.
@@ -880,9 +906,9 @@ struct Fonts {
 }
 
 impl Fonts {
-    fn new(appearance: &Appearance) -> Self {
+    fn new(family: Option<FamilyId>, appearance: &Appearance) -> Self {
         Self {
-            family: appearance.ui_font_family(),
+            family: family.unwrap_or_else(|| appearance.ui_font_family()),
             medium: Properties::default().weight(Weight::Medium),
         }
     }
@@ -912,7 +938,7 @@ impl View for ClaudeThreadsView {
             active_terminal_id: get_context_target_terminal_view(self.window_id, app)
                 .map(|view| view.id()),
             palette: Palette::new(appearance),
-            fonts: Fonts::new(appearance),
+            fonts: Fonts::new(self.font_family, appearance),
             appearance,
             app,
         };
@@ -934,8 +960,7 @@ impl View for ClaudeThreadsView {
             add_section_header(&mut list, ThreadSection::Pinned);
             if !self.is_section_collapsed(ThreadSection::Pinned) {
                 for thread in &groups.pinned {
-                    let project = self.config.project_of(thread);
-                    list.add_child(self.render_thread_row(thread, project, 0., rows));
+                    list.add_child(self.render_thread_row(thread, 0., rows));
                 }
             }
         }
@@ -981,8 +1006,11 @@ impl View for ClaudeThreadsView {
         let panel = Flex::column()
             .with_main_axis_size(MainAxisSize::Max)
             .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
-            .with_child(self.render_brand(rows.fonts))
-            .with_child(self.render_search_bar(rows.palette))
+            .with_child(self.render_header(rows))
+            .with_child(self.render_new_chat_row(rows))
+            .with_children(
+                (self.is_search_open || is_searching).then(|| self.render_search_bar(rows.palette)),
+            )
             .with_child(Shrinkable::new(1., scrollable).finish())
             .finish();
         let mut stack = Stack::new().with_child(panel);
@@ -1055,11 +1083,7 @@ impl ClaudeThreadsView {
             .with_main_axis_size(MainAxisSize::Max)
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_spacing(ICON_TEXT_GAP)
-            .with_child(render_icon(
-                WarpIcon::Search,
-                palette.sub_text,
-                ACTION_ICON_SIZE,
-            ))
+            .with_child(render_svg(SEARCH_ICON, palette.sub_text, ACTION_ICON_SIZE))
             .with_child(
                 Shrinkable::new(
                     1.,
@@ -1089,8 +1113,8 @@ impl ClaudeThreadsView {
         .finish()
     }
 
-    /// The name of a section with a chevron after it; clicking it collapses or expands the
-    /// section. "Projetos" also gets the button that adds a project folder, shown on hover.
+    /// The name of a section; clicking it collapses or expands the section, which a chevron
+    /// shows on hover. "Projetos" also gets the button that adds a project folder, on hover.
     fn render_section_header(
         &self,
         section: ThreadSection,
@@ -1126,7 +1150,7 @@ impl ClaudeThreadsView {
                 } else {
                     palette.sub_text
                 };
-                let label = Flex::row()
+                let mut label = Flex::row()
                     .with_main_axis_size(MainAxisSize::Min)
                     .with_cross_axis_alignment(CrossAxisAlignment::Center)
                     .with_spacing(4.)
@@ -1135,9 +1159,11 @@ impl ClaudeThreadsView {
                             .with_style(fonts.medium)
                             .with_color(color.into())
                             .finish(),
-                    )
-                    .with_child(render_icon(chevron, color, SECTION_CHEVRON_SIZE))
-                    .finish();
+                    );
+                if hover_state.is_hovered() {
+                    label.add_child(render_icon(chevron, color, SECTION_CHEVRON_SIZE));
+                }
+                let label = label.finish();
                 let mut row = Flex::row()
                     .with_main_axis_size(MainAxisSize::Max)
                     .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
@@ -1190,11 +1216,11 @@ impl ClaudeThreadsView {
                 .with_main_axis_size(MainAxisSize::Min)
                 .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
                 .with_spacing(ROW_SPACING)
-                .with_child(self.render_project_row(project, threads.len(), rows));
+                .with_child(self.render_project_row(project, rows));
             if is_searching || !project.collapsed {
                 if threads.is_empty() {
                     if self.has_scanned {
-                        block.add_child(render_note("Nenhuma conversa ainda", THREAD_INDENT, rows));
+                        block.add_child(render_note("Nenhum chat", THREAD_INDENT, rows));
                     }
                 } else {
                     self.add_thread_rows(
@@ -1214,100 +1240,94 @@ impl ClaudeThreadsView {
         list.finish()
     }
 
-    /// The button that hides the sidebar and the app's name, on the banner image across the top
-    /// of the panel.
-    fn render_brand(&self, fonts: Fonts) -> Box<dyn Element> {
-        let toggle_button = Hoverable::new(self.mouse_state("brand:toggle".to_owned()), |state| {
-            let (icon_opacity, background_opacity) = if state.is_hovered() {
-                (100, 16)
-            } else {
-                (72, 0)
-            };
-            let icon = ConstrainedBox::new(
-                WarpIcon::LeftSidebarClose
-                    .to_warpui_icon(brand_color(BRAND_TEXT, icon_opacity))
-                    .finish(),
-            )
-            .with_width(BRAND_ICON_SIZE)
-            .with_height(BRAND_ICON_SIZE)
-            .finish();
-            ConstrainedBox::new(
-                Container::new(Align::new(icon).finish())
-                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(
-                        BUTTON_CORNER_RADIUS,
-                    )))
-                    .with_background(brand_color(BRAND_TEXT, background_opacity))
-                    .finish(),
-            )
-            .with_width(BRAND_BUTTON_SIZE)
-            .with_height(BRAND_BUTTON_SIZE)
-            .finish()
-        })
-        .with_cursor(Cursor::PointingHand)
-        .on_click(|ctx, _, _| ctx.dispatch_typed_action(WorkspaceAction::ToggleClaudeThreadsPanel))
-        .finish();
-
-        let name = Flex::row()
+    /// The app's name, with the buttons that show the search field and hide the sidebar.
+    fn render_header(&self, rows: RowContext<'_>) -> Box<dyn Element> {
+        let RowContext {
+            palette,
+            fonts,
+            appearance,
+            ..
+        } = rows;
+        let buttons = Flex::row()
             .with_main_axis_size(MainAxisSize::Min)
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
-            .with_spacing(5.)
-            .with_child(
-                Text::new_inline("Picolas", fonts.family, BRAND_FONT_SIZE)
-                    .with_style(Properties::default().weight(Weight::Semibold))
-                    .with_color(BRAND_TEXT)
-                    .finish(),
-            )
-            .with_child(
-                Text::new_inline("Code", fonts.family, BRAND_FONT_SIZE)
-                    .with_style(Properties::default().weight(Weight::Semibold))
-                    .with_color(BRAND_BLUE)
-                    .finish(),
-            )
+            .with_spacing(4.)
+            .with_child(render_svg_button(
+                SEARCH_ICON,
+                "Buscar threads",
+                self.mouse_state("header:search".to_owned()),
+                HEADER_ICON_SIZE,
+                palette,
+                appearance,
+                |ctx| ctx.dispatch_typed_action(ClaudeThreadsAction::ToggleSearch),
+            ))
+            .with_child(render_svg_button(
+                SIDEBAR_ICON,
+                "Recolher painel",
+                self.mouse_state("header:sidebar".to_owned()),
+                HEADER_ICON_SIZE,
+                palette,
+                appearance,
+                |ctx| ctx.dispatch_typed_action(WorkspaceAction::ToggleClaudeThreadsPanel),
+            ))
             .finish();
-        let content = ConstrainedBox::new(
-            Container::new(
-                Flex::row()
-                    .with_main_axis_size(MainAxisSize::Max)
-                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                    .with_spacing(10.)
-                    .with_child(toggle_button)
-                    .with_child(name)
-                    .finish(),
-            )
-            .with_padding_left(PANEL_PADDING + 4.)
-            .with_padding_right(PANEL_PADDING)
-            .finish(),
-        )
-        .with_height(BRAND_HEIGHT)
-        .finish();
-
-        let background = Image::new(
-            bundled_or_fetched_asset!("png/picolas_banner.png"),
-            CacheOption::Original,
-        )
-        .cover()
-        .finish();
-        let banner = Stack::new()
+        let row = Flex::row()
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_child(
-                ConstrainedBox::new(background)
-                    .with_height(BRAND_HEIGHT)
+                Text::new_inline("Picolas Code", fonts.family, HEADER_FONT_SIZE)
+                    .with_style(Properties::default().weight(Weight::Semibold))
+                    .with_color(palette.main_text.into())
                     .finish(),
             )
-            .with_child(content);
-
-        Container::new(Clipped::new(banner.finish()).finish())
-            .with_background(WarpThemeFill::Solid(BRAND_BACKGROUND))
-            .with_margin_bottom(PANEL_PADDING)
+            .with_child(buttons)
+            .finish();
+        Container::new(row)
+            .with_padding_left(PANEL_PADDING + ROW_HORIZONTAL_PADDING)
+            .with_padding_right(PANEL_PADDING + 2.)
+            .with_padding_top(12.)
+            .with_padding_bottom(10.)
             .finish()
     }
 
-    /// Chevron, folder name and thread count. On hover the count gives way to
-    /// buttons for a new thread and removing the project. Clicking the row
-    /// collapses or expands it.
+    /// "Novo chat": a Claude Code thread in the folder of the focused pane.
+    fn render_new_chat_row(&self, rows: RowContext<'_>) -> Box<dyn Element> {
+        let RowContext { palette, fonts, .. } = rows;
+        let row = Hoverable::new(self.mouse_state("new-chat".to_owned()), move |state| {
+            let content = Flex::row()
+                .with_main_axis_size(MainAxisSize::Max)
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_spacing(ICON_TEXT_GAP)
+                .with_child(render_svg(
+                    NEW_CHAT_ICON,
+                    palette.main_text,
+                    NEW_CHAT_ICON_SIZE,
+                ))
+                .with_child(
+                    Text::new_inline("Novo chat", fonts.family, TITLE_FONT_SIZE)
+                        .with_color(palette.main_text.into())
+                        .finish(),
+                )
+                .finish();
+            let background = state.is_hovered().then_some(palette.row_hover);
+            render_row_container(content, PROJECT_ROW_VERTICAL_PADDING, background)
+        })
+        .with_cursor(Cursor::PointingHand)
+        .on_click(|ctx, _, _| ctx.dispatch_typed_action(ClaudeThreadsAction::NewChat))
+        .finish();
+        Container::new(row)
+            .with_horizontal_padding(PANEL_PADDING)
+            .with_padding_bottom(PANEL_PADDING)
+            .finish()
+    }
+
+    /// A folder icon, open while the project is expanded, and the folder's name. On hover come
+    /// the buttons for a new thread and removing the project. Clicking the row collapses or
+    /// expands it.
     fn render_project_row(
         &self,
         project: &ThreadProject,
-        thread_count: usize,
         rows: RowContext<'_>,
     ) -> Box<dyn Element> {
         let RowContext {
@@ -1319,10 +1339,10 @@ impl ClaudeThreadsView {
         let path = project.path.clone();
         let key = path.display().to_string();
         let name = project.name();
-        let chevron = if project.collapsed && self.search_query.is_empty() {
-            WarpIcon::ChevronRight
+        let folder_icon = if project.collapsed && self.search_query.is_empty() {
+            FOLDER_ICON
         } else {
-            WarpIcon::ChevronDown
+            FOLDER_OPEN_ICON
         };
         let new_thread_button = render_icon_button(
             WarpIcon::Plus,
@@ -1352,12 +1372,6 @@ impl ClaudeThreadsView {
                 if hover_state.is_hovered() {
                     meta.add_child(remove_button);
                     meta.add_child(new_thread_button);
-                } else if thread_count > 0 {
-                    meta.add_child(
-                        Text::new_inline(thread_count.to_string(), fonts.family, META_FONT_SIZE)
-                            .with_color(palette.detail_text.into())
-                            .finish(),
-                    );
                 }
                 let meta = ConstrainedBox::new(Align::new(meta.finish()).right().finish())
                     .with_height(META_HEIGHT)
@@ -1367,12 +1381,11 @@ impl ClaudeThreadsView {
                     .with_main_axis_size(MainAxisSize::Max)
                     .with_cross_axis_alignment(CrossAxisAlignment::Center)
                     .with_spacing(ICON_TEXT_GAP)
-                    .with_child(render_icon(chevron, palette.sub_text, CHEVRON_SIZE))
+                    .with_child(render_svg(folder_icon, palette.main_text, FOLDER_ICON_SIZE))
                     .with_child(
                         Shrinkable::new(
                             1.,
                             Text::new_inline(name, fonts.family, PROJECT_FONT_SIZE)
-                                .with_style(fonts.medium)
                                 .with_clip(ClipConfig::ellipsis())
                                 .with_color(palette.main_text.into())
                                 .finish(),
@@ -1435,7 +1448,7 @@ impl ClaudeThreadsView {
             threads.len().min(RECENT_THREAD_LIMIT)
         };
         for thread in &threads[..shown] {
-            list.add_child(self.render_thread_row(thread, project, indent, rows));
+            list.add_child(self.render_thread_row(thread, indent, rows));
         }
 
         if !self.search_query.is_empty() || threads.len() <= RECENT_THREAD_LIMIT {
@@ -1481,13 +1494,12 @@ impl ClaudeThreadsView {
         );
     }
 
-    /// Two lines: the title with its age (or what the session is doing), and the branch it runs
-    /// on. The thread open in the focused pane gets a raised card. On hover the age gives way to
-    /// the "⋯" menu and the pin button; deleting asks for confirmation in the row.
+    /// The title with its age, or what the session is doing. The thread open in the focused pane
+    /// gets a raised card. On hover the age gives way to the pin button and the "⋯" menu;
+    /// deleting asks for confirmation in the row.
     fn render_thread_row(
         &self,
         thread: &ClaudeThread,
-        project: Option<&Path>,
         indent: f32,
         rows: RowContext<'_>,
     ) -> Box<dyn Element> {
@@ -1514,14 +1526,6 @@ impl ClaudeThreadsView {
         });
         let title = thread.title.clone();
         let age = claude_threads::format_age(thread.updated_at, now);
-        // Threads outside their project's folder, in a subfolder, or in a worktree say where they
-        // run.
-        let detail = match &thread.git_branch {
-            Some(branch) => Some((WarpIcon::GitBranch, branch.clone())),
-            None => (Some(thread.cwd.as_path()) != project)
-                .then(|| ThreadProject::new(thread.cwd.clone()).name())
-                .map(|folder| (WarpIcon::Folder, folder)),
-        };
         let action = ClaudeThreadsAction::OpenThread {
             session_id: thread.session_id.clone(),
             cwd: thread.cwd.clone(),
@@ -1553,17 +1557,15 @@ impl ClaudeThreadsView {
             &thread_menu_button_position_id(session_id),
         )
         .finish();
-        let pin_button = render_icon_button(
-            if is_pinned {
-                WarpIcon::PinFilled
-            } else {
-                WarpIcon::Pin
-            },
+        let pin_action = ClaudeThreadsAction::TogglePinThread(session_id.clone());
+        let pin_button = render_svg_button(
+            PIN_ICON,
             if is_pinned { "Desafixar" } else { "Fixar" },
             self.mouse_state(format!("thread-pin:{session_id}")),
-            ClaudeThreadsAction::TogglePinThread(session_id.clone()),
+            ACTION_ICON_SIZE,
             palette,
             appearance,
+            move |ctx| ctx.dispatch_typed_action(pin_action.clone()),
         );
         let confirm_buttons = is_confirming.then(|| {
             [
@@ -1615,8 +1617,8 @@ impl ClaudeThreadsView {
                 } else if rename_input.is_some() {
                     // The editor takes the whole line.
                 } else if hover_state.is_hovered() || is_menu_open {
-                    meta.add_child(menu_button);
                     meta.add_child(pin_button);
+                    meta.add_child(menu_button);
                 } else {
                     match status {
                         Some(status @ (ThreadStatus::Working | ThreadStatus::Blocked)) => {
@@ -1643,7 +1645,7 @@ impl ClaudeThreadsView {
                             }
                             meta.add_child(
                                 Text::new_inline(age, fonts.family, META_FONT_SIZE)
-                                    .with_color(palette.sub_text.into())
+                                    .with_color(palette.detail_text.into())
                                     .finish(),
                             );
                         }
@@ -1668,7 +1670,6 @@ impl ClaudeThreadsView {
                             1.,
                             rename_input.unwrap_or_else(|| {
                                 Text::new_inline(title, fonts.family, TITLE_FONT_SIZE)
-                                    .with_style(fonts.medium)
                                     .with_clip(ClipConfig::ellipsis())
                                     .with_color(title_color.into())
                                     .finish()
@@ -1679,39 +1680,7 @@ impl ClaudeThreadsView {
                     .with_child(meta)
                     .finish();
 
-                let mut details = Flex::row()
-                    .with_main_axis_size(MainAxisSize::Min)
-                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                    .with_spacing(DETAIL_ICON_GAP);
-                if let Some((icon, text)) = detail {
-                    details.add_child(render_icon(icon, palette.detail_text, DETAIL_ICON_SIZE));
-                    details.add_child(
-                        Shrinkable::new(
-                            1.,
-                            Text::new_inline(text, fonts.family, META_FONT_SIZE)
-                                .with_clip(ClipConfig::ellipsis())
-                                .with_color(palette.detail_text.into())
-                                .finish(),
-                        )
-                        .finish(),
-                    );
-                }
-                // The agent's logo closes the branch line, under the age or status.
-                let detail_line = Flex::row()
-                    .with_main_axis_size(MainAxisSize::Max)
-                    .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
-                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                    .with_spacing(ICON_TEXT_GAP)
-                    .with_child(Shrinkable::new(1., details.finish()).finish())
-                    .with_child(render_icon(WarpIcon::ClaudeLogo, palette.claude, LOGO_SIZE))
-                    .finish();
-                let content = Flex::column()
-                    .with_main_axis_size(MainAxisSize::Min)
-                    .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
-                    .with_spacing(LINE_SPACING)
-                    .with_child(title_line)
-                    .with_child(detail_line)
-                    .finish();
+                let content = title_line;
                 let content = Container::new(content).with_padding_left(indent).finish();
                 let background = if is_active {
                     Some(palette.row_active)
@@ -1776,11 +1745,6 @@ impl ThreadStatus {
     }
 }
 
-/// `color` at `opacity` percent.
-fn brand_color(color: ColorU, opacity: u8) -> WarpThemeFill {
-    WarpThemeFill::Solid(color).with_opacity(opacity)
-}
-
 fn render_empty_state(rows: RowContext<'_>) -> Box<dyn Element> {
     let hint = Text::new(
         "Adicione uma pasta com o + de Projetos para ver as conversas do Claude Code feitas nela.",
@@ -1803,6 +1767,56 @@ fn render_note(text: &'static str, indent: f32, rows: RowContext<'_>) -> Box<dyn
     )
     .with_padding_left(indent + ROW_HORIZONTAL_PADDING)
     .with_vertical_padding(PROJECT_ROW_VERTICAL_PADDING)
+    .finish()
+}
+
+/// One of the panel's own outline icons, from `bundled/svg`.
+fn render_svg(path: &'static str, color: WarpThemeFill, size: f32) -> Box<dyn Element> {
+    ConstrainedBox::new(SvgIcon::new(path, color.into_solid()).finish())
+        .with_width(size)
+        .with_height(size)
+        .finish()
+}
+
+/// `render_icon_button` for the panel's own outline icons, with any click handler.
+fn render_svg_button(
+    path: &'static str,
+    tooltip: &'static str,
+    mouse_state: MouseStateHandle,
+    size: f32,
+    palette: Palette,
+    appearance: &Appearance,
+    on_click: impl Fn(&mut EventContext) + 'static,
+) -> Box<dyn Element> {
+    let ui_builder = appearance.ui_builder().clone();
+    Hoverable::new(mouse_state, move |hover_state| {
+        let color = if hover_state.is_hovered() {
+            palette.main_text
+        } else {
+            palette.sub_text
+        };
+        let button = Container::new(render_svg(path, color, size))
+            .with_padding(Padding::uniform(ACTION_BUTTON_PADDING))
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(BUTTON_CORNER_RADIUS)));
+        if !hover_state.is_hovered() {
+            return button.finish();
+        }
+        let button = button.with_background(palette.button_hover).finish();
+        let tooltip = ui_builder.tool_tip(tooltip.to_owned()).build().finish();
+        let mut stack = Stack::new().with_child(button);
+        stack.add_positioned_overlay_child(
+            tooltip,
+            OffsetPositioning::offset_from_parent(
+                vec2f(0., 4.),
+                ParentOffsetBounds::WindowByPosition,
+                ParentAnchor::BottomMiddle,
+                ChildAnchor::TopMiddle,
+            ),
+        );
+        stack.finish()
+    })
+    .with_cursor(Cursor::PointingHand)
+    .on_click(move |ctx, _, _| on_click(ctx))
     .finish()
 }
 

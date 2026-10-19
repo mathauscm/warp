@@ -126,6 +126,7 @@ impl TerminalView {
         let point = mouse_state.maybe_point();
         match (mouse_state.button(), mouse_state.action()) {
             (MouseButton::Left, MouseAction::Pressed) => {
+                self.deselect_claude_prompt(ctx);
                 self.set_claude_mention(None, ctx);
                 self.claude_drag = Some(ClaudeDrag {
                     start: point,

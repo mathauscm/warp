@@ -4405,7 +4405,7 @@ impl TerminalView {
             }
         });
 
-        let claude_composer = claude_composer::ClaudeComposer::new(ctx);
+        let claude_composer = claude_composer::ClaudeComposer::new();
         let window_id = ctx.window_id();
         let mut terminal_view = Self {
             model,
@@ -10040,6 +10040,10 @@ impl TerminalView {
         ctx: &mut ViewContext<Self>,
     ) -> bool {
         let bytes = data.into();
+        self.restart_claude_cursor_blink(ctx);
+        if self.replace_selected_claude_prompt(&bytes, ctx) {
+            return true;
+        }
         if self.submit_with_claude_mentions(&bytes, ctx) {
             return true;
         }
@@ -17278,6 +17282,10 @@ impl TerminalView {
     }
 
     fn copy(&mut self, ctx: &mut ViewContext<Self>) {
+        if let Some(prompt) = self.selected_claude_prompt_text() {
+            ctx.clipboard().write(ClipboardContent::plain_text(prompt));
+            return;
+        }
         // First check if there's selected text in the CLI subagent views
         for subagent_view in self.cli_subagent_views.values() {
             if let Some(selected_text) = subagent_view.as_ref(ctx).selected_text(ctx) {
@@ -20785,6 +20793,10 @@ impl TerminalView {
     }
 
     fn select_all_blocks(&mut self, ctx: &mut ViewContext<Self>) {
+        // In Claude Code, ⌘A selects what's typed in its prompt, like in a chat app's composer.
+        if self.select_claude_prompt(ctx) {
+            return;
+        }
         let first_block_index = self
             .model
             .lock()
@@ -25133,6 +25145,9 @@ impl TerminalView {
         }
         if self.runs_claude(app) {
             alt_screen_element = alt_screen_element.with_beam_cursor();
+            if self.is_claude_cursor_blinked_off() {
+                alt_screen_element = alt_screen_element.with_hide_cursor_cell();
+            }
         }
         if let Some(style) = self.claude_prompt_card(app) {
             alt_screen_element = alt_screen_element.with_prompt_card(style);
@@ -25414,6 +25429,9 @@ impl TerminalView {
         }
         if self.runs_claude(app) {
             element = element.with_beam_cursor();
+            if self.is_claude_cursor_blinked_off() {
+                element = element.with_hide_cursor_cell();
+            }
         }
         if let Some(style) = self.claude_prompt_card(app) {
             element = element.with_prompt_card(style);
@@ -27663,6 +27681,7 @@ impl TypedActionView for TerminalView {
             | InterruptClaude
             | RemoveClaudeMention(_)
             | ToggleClaudeModelMenu
+            | ClaudePicker(_)
             | CycleClaudeMode
             | ToggleSessionRecording
             | Osc52AllowBlockedClipboardOperation => Empty,
@@ -28818,6 +28837,7 @@ impl TypedActionView for TerminalView {
             InterruptClaude => self.interrupt_claude(ctx),
             RemoveClaudeMention(index) => self.remove_claude_mention(*index, ctx),
             ToggleClaudeModelMenu => self.toggle_claude_model_menu(ctx),
+            ClaudePicker(action) => self.handle_claude_picker_action(*action, ctx),
             CycleClaudeMode => self.cycle_claude_mode(ctx),
             ToggleCLIAgentRichInput => {
                 if self.has_active_cli_agent_input_session(ctx) {
@@ -29043,8 +29063,8 @@ impl View for TerminalView {
         for (control, positioning) in self.render_claude_composer(&model, app) {
             stack.add_positioned_child(control, positioning);
         }
-        if let Some((menu, positioning)) = self.render_claude_model_menu(app) {
-            stack.add_positioned_overlay_child(menu, positioning);
+        if let Some((picker, positioning)) = self.render_claude_picker(app) {
+            stack.add_positioned_overlay_child(picker, positioning);
         }
 
         self.maybe_render_onboarding_callout(
@@ -29405,6 +29425,7 @@ impl View for TerminalView {
 
     fn on_focus(&mut self, focus_ctx: &FocusContext, ctx: &mut ViewContext<Self>) {
         if focus_ctx.is_self_focused() {
+            self.restart_claude_cursor_blink(ctx);
             self.maybe_report_focus_in(ctx);
             ctx.dispatch_typed_action(&PaneGroupAction::HandleFocusChange);
 
