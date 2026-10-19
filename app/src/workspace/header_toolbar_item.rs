@@ -97,10 +97,10 @@ impl HeaderToolbarItemKind {
         matches!(self, Self::TabsPanel | Self::ToolsPanel | Self::CodeReview)
     }
 
-    /// The tools and agent management panels stay available in the toolbar editor, but aren't
-    /// shown by default.
+    /// The agent management panel stays available in the toolbar editor, but isn't shown by
+    /// default.
     pub fn default_left() -> Vec<Self> {
-        vec![Self::TabsPanel]
+        vec![Self::TabsPanel, Self::ToolsPanel]
     }
 
     pub fn default_right() -> Vec<Self> {

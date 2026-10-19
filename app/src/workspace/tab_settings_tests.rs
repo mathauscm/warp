@@ -92,6 +92,14 @@ fn header_toolbar_chip_selection_default_contains_code_review() {
     assert!(config.contains_item(&HeaderToolbarItemKind::CodeReview));
 }
 
+/// The tools panel (file explorer, global search) is laid out only where its item is, so the
+/// default layout has to keep it even though its button is hidden next to vertical tabs.
+#[test]
+fn header_toolbar_chip_selection_default_keeps_the_tools_panel() {
+    let config = HeaderToolbarChipSelection::Default;
+    assert!(config.contains_item(&HeaderToolbarItemKind::ToolsPanel));
+}
+
 #[test]
 fn header_toolbar_chip_selection_custom_without_code_review_reports_absent() {
     let config = HeaderToolbarChipSelection::Custom {
