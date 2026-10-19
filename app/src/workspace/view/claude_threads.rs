@@ -132,7 +132,7 @@ pub enum ClaudeThreadsAction {
     /// Shows every thread of a project, or of "Recentes" when `None`.
     ToggleShowAllThreads(Option<PathBuf>),
     NewThread(PathBuf),
-    /// Starts a thread in the folder of the focused pane.
+    /// Starts a thread in the home folder.
     NewChat,
     /// Shows or hides the search field.
     ToggleSearch,
@@ -555,25 +555,16 @@ impl ClaudeThreadsView {
         ctx.notify();
     }
 
+    /// A Claude Code thread in the home folder, outside every project, like a new chat in a chat
+    /// app.
     fn new_chat(&mut self, ctx: &mut ViewContext<Self>) {
-        let directory = get_context_target_terminal_view(self.window_id, ctx)
-            .and_then(|view| view.as_ref(ctx).pwd_if_local(ctx))
-            .map(PathBuf::from)
-            .or_else(dirs::home_dir);
-        let Some(directory) = directory else {
+        let Some(directory) = dirs::home_dir() else {
             return;
         };
-        let group = self
-            .config
-            .projects
-            .iter()
-            .filter(|project| directory.starts_with(&project.path))
-            .max_by_key(|project| project.path.as_os_str().len())
-            .map(|project| project_group_name(&project.path));
         ctx.dispatch_typed_action_deferred(WorkspaceAction::RunCommandInNewTab {
             directory,
             command: NEW_THREAD_COMMAND.to_owned(),
-            group,
+            group: None,
         });
     }
 
@@ -1291,7 +1282,7 @@ impl ClaudeThreadsView {
             .finish()
     }
 
-    /// "Novo chat": a Claude Code thread in the folder of the focused pane.
+    /// "Novo chat": a Claude Code thread in the home folder.
     fn render_new_chat_row(&self, rows: RowContext<'_>) -> Box<dyn Element> {
         let RowContext { palette, fonts, .. } = rows;
         let row = Hoverable::new(self.mouse_state("new-chat".to_owned()), move |state| {

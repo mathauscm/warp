@@ -20,7 +20,7 @@ use warpui::r#async::Timer;
 use warpui::elements::{
     Align, Border, ChildAnchor, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment,
     Dismiss, DispatchEventResult, DragAxis, Draggable, DraggableState, DropShadow, Element, Empty,
-    EventHandler, Expanded, Flex, Hoverable, Icon as SvgIcon, MainAxisAlignment, MainAxisSize,
+    EventHandler, Flex, Hoverable, Icon as SvgIcon, MainAxisAlignment, MainAxisSize,
     MouseStateHandle, OffsetPositioning, Padding, ParentElement, PositionedElementAnchor,
     PositionedElementOffsetBounds, Radius, SavePosition, Stack, Text,
 };
@@ -105,11 +105,14 @@ const DEFAULT_EFFORT: &str = "auto";
 const PICKER_WIDTH: f32 = 236.;
 const PICKER_PADDING: f32 = 12.;
 const PICKER_CORNER_RADIUS: f32 = 12.;
+const PICKER_BORDER: f32 = 1.;
 /// Space between the model chip and the picker above it.
 const PICKER_OFFSET: f32 = 8.;
 const PICKER_TITLE_FONT_SIZE: f32 = 13.;
 const PICKER_FONT_SIZE: f32 = 12.;
 const SLIDER_HEIGHT: f32 = 18.;
+/// The picker's width inside its padding and border, which the slider spans.
+const SLIDER_WIDTH: f32 = PICKER_WIDTH - 2. * (PICKER_PADDING + PICKER_BORDER);
 const SLIDER_KNOB_SIZE: f32 = 14.;
 const SLIDER_DOT_SIZE: f32 = 3.;
 /// How far from each end of the track the knob's middle stops.
@@ -285,6 +288,12 @@ fn effort_position(index: usize) -> f32 {
     index as f32 / (EFFORTS.len() - 1) as f32
 }
 
+/// The width of the slider's fill for a knob at `position`: a pill from the track's left end to
+/// past the knob's middle, never narrower than it is tall.
+fn slider_fill_width(position: f32) -> f32 {
+    2. * SLIDER_INSET + position.clamp(0., 1.) * (SLIDER_WIDTH - 2. * SLIDER_INSET)
+}
+
 /// The effort level nearest to a knob position.
 fn nearest_effort(position: f32) -> usize {
     (position.clamp(0., 1.) * (EFFORTS.len() - 1) as f32).round() as usize
@@ -348,8 +357,17 @@ fn last_string_field(text: &str, key: &str) -> Option<String> {
     Some(text[start..end].to_owned())
 }
 
-/// Reads the model and effort of the conversation `session_id` in `cwd` from its transcript,
-/// falling back to Claude's settings.
+/// The string at `key` at the top level of Claude's `settings.json`.
+fn settings_string(settings: &str, key: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(settings)
+        .ok()?
+        .get(key)?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// Reads the model and effort of the conversation `session` (its folder and id) from its
+/// transcript, falling back to Claude's settings.
 fn read_model_label(session: Option<(PathBuf, String)>) -> Option<ClaudeModelLabel> {
     use std::io::{Read as _, Seek as _, SeekFrom};
 
@@ -378,7 +396,7 @@ fn read_model_label(session: Option<(PathBuf, String)>) -> Option<ClaudeModelLab
         .or_else(|| {
             settings
                 .as_deref()
-                .and_then(|settings| last_string_field(settings, "model"))
+                .and_then(|settings| settings_string(settings, "model"))
         })
         .and_then(|model| model_label(&model))
         .unwrap_or_else(|| "Claude".to_owned());
@@ -388,7 +406,7 @@ fn read_model_label(session: Option<(PathBuf, String)>) -> Option<ClaudeModelLab
         .or_else(|| {
             settings
                 .as_deref()
-                .and_then(|settings| last_string_field(settings, "effortLevel"))
+                .and_then(|settings| settings_string(settings, "effortLevel"))
         })
         .map(|effort| effort_label(&effort));
     Some(ClaudeModelLabel { model, effort })
@@ -1096,7 +1114,7 @@ impl TerminalView {
             Container::new(content)
                 .with_uniform_padding(PICKER_PADDING)
                 .with_background(background)
-                .with_border(Border::all(1.).with_border_fill(
+                .with_border(Border::all(PICKER_BORDER).with_border_fill(
                     warp_core::ui::theme::color::internal_colors::fg_overlay_3(theme),
                 ))
                 .with_corner_radius(CornerRadius::with_all(Radius::Pixels(PICKER_CORNER_RADIUS)))
@@ -1208,116 +1226,73 @@ impl TerminalView {
             .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
             .with_spacing(10.)
             .with_child(header.finish())
-            .with_child(self.render_effort_slider(knob, colors))
+            .with_child(Align::new(self.render_effort_slider(knob, colors)).finish())
             .finish()
     }
 
     /// A track with a dot per effort level, filled up to the knob. The knob follows the cursor
     /// while it's held, and glides onto the nearest level when let go.
     fn render_effort_slider(&self, knob: Option<f32>, colors: PickerColors) -> Box<dyn Element> {
-        let fill = WarpThemeFill::Solid(SEND_COLOR);
-        let radius = Radius::Pixels(SLIDER_HEIGHT / 2.);
-        let position = knob.unwrap_or(0.).clamp(0., 1.);
-        // Flex weights can't be zero.
-        let (before, after) = (position.max(0.001), (1. - position).max(0.001));
-        let span = |weight: f32, child: Box<dyn Element>| Expanded::new(weight, child).finish();
-        let blank = || Empty::new().finish();
-        let block = |width: f32, background: Option<WarpThemeFill>, corner: CornerRadius| {
-            let mut container = Container::new(blank()).with_corner_radius(corner);
-            if let Some(background) = background {
-                container = container.with_background(background);
-            }
-            ConstrainedBox::new(container.finish())
-                .with_width(width)
-                .finish()
+        // The picker has a fixed width, so the track's geometry is known up front and the fill
+        // can be one fully rounded shape, a pill at every position.
+        let span = SLIDER_WIDTH - 2. * SLIDER_INSET;
+        let knob_middle = knob.map(|knob| SLIDER_INSET + knob.clamp(0., 1.) * span);
+        let pill = |width: f32, height: f32, color: WarpThemeFill| {
+            ConstrainedBox::new(
+                Container::new(Empty::new().finish())
+                    .with_background(color)
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(height / 2.)))
+                    .finish(),
+            )
+            .with_width(width)
+            .with_height(height)
+            .finish()
         };
 
-        // Empty containers have no size of their own, so each layer is a row that stretches them
-        // over the whole track.
-        let row = || {
-            Flex::row()
-                .with_main_axis_size(MainAxisSize::Max)
-                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
-        };
-        let mut layers = Stack::new().with_child(
-            row()
-                .with_child(span(
-                    1.,
-                    Container::new(blank())
-                        .with_background(colors.track)
-                        .with_corner_radius(CornerRadius::with_all(radius))
-                        .finish(),
-                ))
-                .finish(),
-        );
-        if knob.is_some() {
-            // A pill from the left end to past the knob's middle, so both its ends are round.
-            layers.add_child(
-                row()
-                    .with_child(block(
-                        SLIDER_INSET,
-                        Some(fill),
-                        CornerRadius::with_left(radius),
-                    ))
-                    .with_child(span(
-                        before,
-                        Container::new(blank()).with_background(fill).finish(),
-                    ))
-                    .with_child(block(
-                        SLIDER_INSET,
-                        Some(fill),
-                        CornerRadius::with_right(radius),
-                    ))
-                    .with_child(span(after, blank()))
-                    .finish(),
-            );
+        let mut layers = Stack::new().with_child(pill(SLIDER_WIDTH, SLIDER_HEIGHT, colors.track));
+        if let Some(knob) = knob {
+            layers.add_child(pill(
+                slider_fill_width(knob),
+                SLIDER_HEIGHT,
+                WarpThemeFill::Solid(SEND_COLOR),
+            ));
         }
-        let mut dots = Flex::row()
-            .with_main_axis_size(MainAxisSize::Max)
-            .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
-            .with_cross_axis_alignment(CrossAxisAlignment::Center);
         for index in 0..EFFORTS.len() {
-            let is_filled = knob.is_some_and(|knob| effort_position(index) < knob);
-            dots.add_child(render_dot(if is_filled {
+            let x = SLIDER_INSET + effort_position(index) * span;
+            let is_filled = knob_middle.is_some_and(|knob_middle| x < knob_middle);
+            let color = if is_filled {
                 colors.on_fill
             } else {
                 colors.sub_text
-            }));
-        }
-        layers.add_child(
-            ConstrainedBox::new(
-                Container::new(dots.finish())
-                    .with_horizontal_padding(SLIDER_INSET - SLIDER_DOT_SIZE / 2.)
-                    .finish(),
-            )
-            .with_height(SLIDER_HEIGHT)
-            .finish(),
-        );
-        if knob.is_some() {
-            let gap = SLIDER_INSET - SLIDER_KNOB_SIZE / 2.;
+            };
             layers.add_child(
-                ConstrainedBox::new(
-                    Flex::row()
-                        .with_main_axis_size(MainAxisSize::Max)
-                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                        .with_child(block(gap, None, CornerRadius::default()))
-                        .with_child(span(before, blank()))
-                        .with_child(render_knob())
-                        .with_child(span(after, blank()))
-                        .with_child(block(gap, None, CornerRadius::default()))
-                        .finish(),
-                )
-                .with_height(SLIDER_HEIGHT)
+                Container::new(pill(SLIDER_DOT_SIZE, SLIDER_DOT_SIZE, color))
+                    .with_padding_left(x - SLIDER_DOT_SIZE / 2.)
+                    .with_padding_top((SLIDER_HEIGHT - SLIDER_DOT_SIZE) / 2.)
+                    .finish(),
+            );
+        }
+        if let Some(knob_middle) = knob_middle {
+            layers.add_child(
+                Container::new(pill(
+                    SLIDER_KNOB_SIZE,
+                    SLIDER_KNOB_SIZE,
+                    WarpThemeFill::Solid(BUTTON_ICON_COLOR),
+                ))
+                .with_padding_left(knob_middle - SLIDER_KNOB_SIZE / 2.)
+                .with_padding_top((SLIDER_HEIGHT - SLIDER_KNOB_SIZE) / 2.)
                 .finish(),
             );
         }
         let track = SavePosition::new(
             ConstrainedBox::new(layers.finish())
+                .with_width(SLIDER_WIDTH)
                 .with_height(SLIDER_HEIGHT)
                 .finish(),
             &self.claude_effort_track_position_id(),
         )
         .finish();
+        let blank = || Empty::new().finish();
 
         // Pressing jumps the knob under the cursor; dragging, even past the ends, moves it along.
         let drag_state = self.claude_composer.slider_drag_state.clone();
@@ -1661,33 +1636,6 @@ fn render_model_chip(
     })
     .with_cursor(Cursor::PointingHand)
     .on_click(|ctx, _, _| ctx.dispatch_typed_action(TerminalAction::ToggleClaudeModelMenu))
-    .finish()
-}
-
-fn render_dot(color: WarpThemeFill) -> Box<dyn Element> {
-    ConstrainedBox::new(
-        Container::new(Empty::new().finish())
-            .with_background(color)
-            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(SLIDER_DOT_SIZE / 2.)))
-            .finish(),
-    )
-    .with_width(SLIDER_DOT_SIZE)
-    .with_height(SLIDER_DOT_SIZE)
-    .finish()
-}
-
-fn render_knob() -> Box<dyn Element> {
-    ConstrainedBox::new(
-        Container::new(Empty::new().finish())
-            .with_background(WarpThemeFill::Solid(BUTTON_ICON_COLOR))
-            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(
-                SLIDER_KNOB_SIZE / 2.,
-            )))
-            .with_drop_shadow(DropShadow::default())
-            .finish(),
-    )
-    .with_width(SLIDER_KNOB_SIZE)
-    .with_height(SLIDER_KNOB_SIZE)
     .finish()
 }
 

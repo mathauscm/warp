@@ -139,3 +139,35 @@ fn a_settling_knob_ends_on_its_level() {
     let position = settle.position().expect("still settling");
     assert!((0.4..=0.5).contains(&position));
 }
+
+#[test]
+fn settings_are_read_as_json_whatever_their_formatting() {
+    let settings = r#"{
+  "env": { "model": "nested" },
+  "model": "claude-opus-5-5",
+  "effortLevel": "high"
+}"#;
+    assert_eq!(
+        settings_string(settings, "model").as_deref(),
+        Some("claude-opus-5-5")
+    );
+    assert_eq!(
+        settings_string(settings, "effortLevel").as_deref(),
+        Some("high")
+    );
+    assert_eq!(settings_string(settings, "missing"), None);
+    assert_eq!(settings_string("not json", "model"), None);
+}
+
+#[test]
+fn the_slider_fill_is_a_pill_at_every_position() {
+    // At the left end the fill is a circle as tall as the track; at the right end, the track.
+    assert_eq!(slider_fill_width(0.), SLIDER_HEIGHT);
+    assert_eq!(slider_fill_width(-1.), SLIDER_HEIGHT);
+    assert_eq!(slider_fill_width(1.), SLIDER_WIDTH);
+    for index in 0..EFFORTS.len() {
+        let width = slider_fill_width(effort_position(index));
+        assert!((SLIDER_HEIGHT..=SLIDER_WIDTH).contains(&width));
+    }
+    assert!(SLIDER_WIDTH > 2. * SLIDER_HEIGHT);
+}
