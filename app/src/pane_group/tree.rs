@@ -71,6 +71,10 @@ pub enum HiddenPaneReason {
     // Pane is a child agent spawned by an orchestrator. It stays hidden
     // until the user explicitly reveals it from the status card.
     ChildAgent,
+
+    // Pane was put away like VS Code's terminal panel: still alive, out of
+    // view until it's toggled back in the same place.
+    Stowed,
 }
 
 impl HiddenPane {
@@ -102,6 +106,12 @@ impl HiddenPane {
         Self {
             pane_id,
             reason: HiddenPaneReason::ChildAgent,
+        }
+    }
+    pub fn from_stow(pane_id: PaneId) -> Self {
+        Self {
+            pane_id,
+            reason: HiddenPaneReason::Stowed,
         }
     }
 }
@@ -337,6 +347,54 @@ impl PaneData {
 
     pub fn hide_closed_pane(&mut self, id: PaneId) {
         self.hidden_panes.push(HiddenPane::from_close(id));
+    }
+
+    pub fn stow_pane(&mut self, id: PaneId) {
+        if !self.is_pane_hidden(&id) {
+            self.hidden_panes.push(HiddenPane::from_stow(id));
+        }
+    }
+
+    /// Brings back every stowed pane and returns their ids.
+    pub fn unstow_panes(&mut self) -> Vec<PaneId> {
+        let stowed = self.stowed_pane_ids();
+        self.hidden_panes
+            .retain(|pane| pane.reason != HiddenPaneReason::Stowed);
+        stowed
+    }
+
+    pub fn stowed_pane_ids(&self) -> Vec<PaneId> {
+        self.hidden_panes
+            .iter()
+            .filter(|hidden| hidden.reason == HiddenPaneReason::Stowed)
+            .map(|hidden| hidden.pane_id)
+            .collect()
+    }
+
+    /// Resizes the pane within its parent split so it takes `share` (0..1) of it, scaling its
+    /// siblings to fill the rest. Returns false when the pane isn't in a split.
+    pub fn set_pane_share(&mut self, pane_id: PaneId, share: f32) -> bool {
+        match &mut self.root {
+            PaneNode::Branch(branch) => branch.set_pane_share(pane_id, share),
+            PaneNode::Leaf(_) => false,
+        }
+    }
+
+    /// The pane's share (0..1) of its parent split, if it's in one.
+    #[cfg(test)]
+    pub fn pane_share(&self, pane_id: PaneId) -> Option<f32> {
+        fn find(branch: &PaneBranch, pane_id: PaneId) -> Option<f32> {
+            let total: f32 = branch.nodes.iter().map(|(flex, _)| flex.0).sum();
+            branch.nodes.iter().find_map(|(flex, node)| match node {
+                PaneNode::Leaf(id) if *id == pane_id => Some(flex.0 / total),
+                PaneNode::Leaf(_) => None,
+                PaneNode::Branch(branch) => find(branch, pane_id),
+            })
+        }
+        match &self.root {
+            PaneNode::Branch(branch) => find(branch, pane_id),
+            PaneNode::Leaf(_) => None,
+        }
     }
 
     pub fn unhide_closed_pane(&mut self, id: PaneId) -> bool {
@@ -618,6 +676,7 @@ impl PaneNode {
                     && !pane_hidden_for_undo(hidden_panes, pane_id)
                     && !pane_hidden_for_move(hidden_panes, pane_id)
                     && !pane_hidden_for_child_agent(hidden_panes, pane_id)
+                    && !pane_stowed(hidden_panes, pane_id)
             }
             PaneNode::Branch(branch) => branch.has_visible_children(hidden_panes),
         }
@@ -1071,12 +1130,14 @@ impl PaneBranch {
         // Collect divider positions to render them as positioned elements later.
         let mut divider_positions = Vec::new();
 
-        for (flex, node) in self.nodes.iter() {
+        let is_shown = |node: &PaneNode| {
+            node.has_visible_children(hidden_panes)
+                || node.has_children_hidden_for_move(hidden_panes)
+        };
+        for (index, (flex, node)) in self.nodes.iter().enumerate() {
             // Skip nodes that have no visible children, but preserve nodes with children
             // hidden for move operations as they serve as drop targets
-            if !node.has_visible_children(hidden_panes)
-                && !node.has_children_hidden_for_move(hidden_panes)
-            {
+            if !is_shown(node) {
                 continue;
             }
             let mut flex_value = flex.0;
@@ -1093,6 +1154,13 @@ impl PaneBranch {
             );
             if let Some(divider) = dividers.next() {
                 if matches!(node, PaneNode::Leaf(id) if pane_hidden_for_move(hidden_panes, id)) {
+                    continue;
+                }
+                // A divider below the last shown pane would hang off the edge.
+                if !self.nodes[index + 1..]
+                    .iter()
+                    .any(|(_, node)| is_shown(node))
+                {
                     continue;
                 }
                 // Store a position index to render the actual divider at after we've rendered all pane content.
@@ -1317,6 +1385,33 @@ impl PaneBranch {
             .iter()
             .any(|(_, node)| node.has_children_hidden_for_move(hidden_panes))
     }
+
+    fn set_pane_share(&mut self, pane_id: PaneId, share: f32) -> bool {
+        let Some(index) = self
+            .nodes
+            .iter()
+            .position(|(_, node)| matches!(node, PaneNode::Leaf(id) if *id == pane_id))
+        else {
+            return self.nodes.iter_mut().any(|(_, node)| match node {
+                PaneNode::Branch(branch) => branch.set_pane_share(pane_id, share),
+                PaneNode::Leaf(_) => false,
+            });
+        };
+        let total: f32 = self.nodes.iter().map(|(flex, _)| flex.0).sum();
+        let others = total - self.nodes[index].0.0;
+        let sibling_count = (self.nodes.len() - 1).max(1) as f32;
+        let target = share.clamp(0.05, 0.95) * total;
+        for (i, (flex, _)) in self.nodes.iter_mut().enumerate() {
+            flex.0 = if i == index {
+                target
+            } else if others > f32::EPSILON {
+                flex.0 / others * (total - target)
+            } else {
+                (total - target) / sibling_count
+            };
+        }
+        true
+    }
 }
 
 fn pane_hidden_for_job(hidden_panes: &[HiddenPane], id: &PaneId) -> bool {
@@ -1341,6 +1436,12 @@ fn pane_hidden_for_child_agent(hidden_panes: &[HiddenPane], id: &PaneId) -> bool
     hidden_panes
         .iter()
         .any(|pane| pane.reason == HiddenPaneReason::ChildAgent && pane.pane_id == *id)
+}
+
+fn pane_stowed(hidden_panes: &[HiddenPane], id: &PaneId) -> bool {
+    hidden_panes
+        .iter()
+        .any(|pane| pane.reason == HiddenPaneReason::Stowed && pane.pane_id == *id)
 }
 
 impl FindPaneByDirection for PaneBranch {

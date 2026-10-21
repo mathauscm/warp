@@ -865,6 +865,8 @@ pub enum WorkspaceAction {
     /// Show the Threads panel (Claude Code conversations by project) in the
     /// vertical tabs sidebar, or hide it when it's already showing.
     ToggleClaudeThreadsPanel,
+    /// Show or hide the terminals below the open editors, like VS Code's terminal panel.
+    ToggleTerminalPanel,
     /// Show the Projects panel (saved projects by tag) in the vertical tabs
     /// sidebar, or hide it when it's already showing.
     ToggleProjectManagerPanel,
@@ -1167,6 +1169,7 @@ impl WorkspaceAction {
             | OpenClaudeSession
             | RunCommandInNewTab { .. }
             | ToggleClaudeThreadsPanel
+            | ToggleTerminalPanel
             | ToggleProjectManagerPanel
             | SaveActiveDirectoryAsProject
             | OpenProjectFolder { .. }

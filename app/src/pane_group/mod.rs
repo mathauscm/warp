@@ -228,6 +228,8 @@ lazy_static! {
 const MINIMUM_PANE_SIZE: f32 = 50.;
 const MINIMUM_PANE_SIZE_UDI: f32 = 190.;
 const KEYBOARD_RESIZE_DELTA: f32 = 10.;
+/// Share of the height a terminal keeps below an editor, like VS Code's panel.
+const BOTTOM_TERMINAL_SHARE: f32 = 0.32;
 
 fn get_minimum_pane_size(app: &AppContext) -> f32 {
     use crate::settings::InputSettings;
@@ -4488,6 +4490,11 @@ impl PaneGroup {
             return;
         }
 
+        if self.should_stow_instead_of_closing(pane_id) {
+            self.stow_terminal_panes(ctx);
+            return;
+        }
+
         if let Some(terminal_manager) = self
             .terminal_session_by_id(pane_id)
             .map(|session| session.terminal_manager(ctx))
@@ -4821,6 +4828,12 @@ impl PaneGroup {
             ctx.emit(Event::TerminalViewStateChanged);
             ctx.emit(Event::AppStateChanged);
             return;
+        }
+
+        // Closing the last pane in view brings the stowed terminals back rather than leaving the
+        // tab with nothing on screen.
+        if self.panes.visible_pane_ids() == [pane_id] {
+            self.unstow_terminal_panes(ctx);
         }
 
         // Best-effort: re-bind any child conversations on this view back
@@ -5387,6 +5400,155 @@ impl PaneGroup {
         ctx.emit(Event::AppStateChanged);
     }
 
+    fn visible_editor_pane(&self) -> Option<PaneId> {
+        self.panes
+            .visible_pane_ids()
+            .into_iter()
+            .find(|pane_id| is_editor_pane(*pane_id))
+    }
+
+    /// Adds an editor the way VS Code lays one out: beside the open editors when there are some,
+    /// otherwise above everything else, leaving the terminals a short strip at the bottom.
+    pub fn add_editor_pane<C: PaneContent>(
+        &mut self,
+        pane: C,
+        focus_new_pane: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if let Some(editor) = self.visible_editor_pane() {
+            let _ = self.add_pane(
+                Direction::Right,
+                Some(editor),
+                Box::new(pane),
+                focus_new_pane,
+                ctx,
+            );
+            return;
+        }
+        let Some(pane_id) = self.add_pane(Direction::Up, None, Box::new(pane), focus_new_pane, ctx)
+        else {
+            return;
+        };
+        self.panes
+            .set_pane_share(pane_id, 1. - BOTTOM_TERMINAL_SHARE);
+        ctx.notify();
+    }
+
+    /// After a pane is dropped above or below another (`target`, or the whole tree when `None`),
+    /// a terminal that ends up under an editor gets a short strip instead of half the height.
+    fn fit_terminal_below_editor(
+        &mut self,
+        moved: PaneId,
+        target: Option<PaneId>,
+        direction: Direction,
+    ) {
+        let others = |is_kind: fn(PaneId) -> bool| match target {
+            Some(target) => is_kind(target),
+            None => self
+                .panes
+                .visible_pane_ids()
+                .into_iter()
+                .any(|pane_id| pane_id != moved && is_kind(pane_id)),
+        };
+        match direction {
+            Direction::Down if moved.is_terminal_pane() && others(is_editor_pane) => {
+                self.panes.set_pane_share(moved, BOTTOM_TERMINAL_SHARE);
+            }
+            Direction::Up
+                if is_editor_pane(moved) && others(|pane_id| pane_id.is_terminal_pane()) =>
+            {
+                self.panes.set_pane_share(moved, 1. - BOTTOM_TERMINAL_SHARE);
+            }
+            Direction::Up | Direction::Down | Direction::Left | Direction::Right => {}
+        }
+    }
+
+    /// Whether closing this pane should put it away instead: the last terminal under an editor
+    /// stays alive out of view, as VS Code's terminal panel does.
+    fn should_stow_instead_of_closing(&self, pane_id: PaneId) -> bool {
+        if !pane_id.is_terminal_pane() || self.visible_editor_pane().is_none() {
+            return false;
+        }
+        let visible = self.panes.visible_pane_ids();
+        visible.contains(&pane_id)
+            && visible
+                .iter()
+                .filter(|visible_id| visible_id.is_terminal_pane())
+                .count()
+                == 1
+    }
+
+    /// Puts the visible terminals away while an editor stays in view. Returns false when there
+    /// was nothing to put away or no editor to leave on screen.
+    fn stow_terminal_panes(&mut self, ctx: &mut ViewContext<Self>) -> bool {
+        let Some(editor) = self.visible_editor_pane() else {
+            return false;
+        };
+        let terminals: Vec<PaneId> = self
+            .panes
+            .visible_pane_ids()
+            .into_iter()
+            .filter(PaneId::is_terminal_pane)
+            .collect();
+        if terminals.is_empty() {
+            return false;
+        }
+        let focused = self.focused_pane_id(ctx);
+        for terminal in &terminals {
+            self.panes.stow_pane(*terminal);
+        }
+        if terminals.contains(&focused) {
+            self.focus_pane(editor, true, ctx);
+        }
+        ctx.notify();
+        ctx.emit(Event::TerminalViewStateChanged);
+        ctx.emit(Event::AppStateChanged);
+        true
+    }
+
+    /// Brings the stowed terminals back where they were. Returns false when none were stowed.
+    fn unstow_terminal_panes(&mut self, ctx: &mut ViewContext<Self>) -> bool {
+        let stowed = self.panes.unstow_panes();
+        if stowed.is_empty() {
+            return false;
+        }
+        ctx.notify();
+        ctx.emit(Event::TerminalViewStateChanged);
+        ctx.emit(Event::AppStateChanged);
+        true
+    }
+
+    /// Shows or hides the terminals below the editors, like VS Code's ⌘J. With an editor and no
+    /// terminal at all, opens one at the bottom.
+    pub fn toggle_terminal_panel(&mut self, ctx: &mut ViewContext<Self>) {
+        let stowed = self.panes.stowed_pane_ids();
+        if self.unstow_terminal_panes(ctx) {
+            let active = self.active_session_id(ctx).map(PaneId::from);
+            let target = active
+                .filter(|active| stowed.contains(active))
+                .or_else(|| stowed.last().copied());
+            if let Some(target) = target {
+                self.focus_pane(target, true, ctx);
+            }
+            return;
+        }
+        if self.stow_terminal_panes(ctx) {
+            return;
+        }
+        let has_terminal = self
+            .panes
+            .visible_pane_ids()
+            .iter()
+            .any(PaneId::is_terminal_pane);
+        if self.visible_editor_pane().is_some() && !has_terminal {
+            let terminal: PaneId = self
+                .add_session(Direction::Down, None, None, None, None, ctx)
+                .into();
+            self.panes.set_pane_share(terminal, BOTTOM_TERMINAL_SHARE);
+            ctx.notify();
+        }
+    }
+
     /// Show a pane that was hidden for close. Used for undo functionality.
     /// Returns true if the pane was successfully shown, false if it wasn't found.
     fn unhide_closed_pane(&mut self, id: PaneId, ctx: &mut ViewContext<Self>) -> bool {
@@ -5667,6 +5829,7 @@ impl PaneGroup {
         }
 
         self.panes.split_root(id, direction);
+        self.fit_terminal_below_editor(id, None, direction);
         self.handle_pane_count_change(ctx);
         ctx.notify();
         ctx.emit(Event::TerminalViewStateChanged);
@@ -5685,7 +5848,9 @@ impl PaneGroup {
         // Also clear hidden closed panes since rearranging invalidates undo functionality
         self.clear_hidden_closed_panes(ctx);
 
-        self.panes.move_pane(id, target_pane_id, direction);
+        if self.panes.move_pane(id, target_pane_id, direction) {
+            self.fit_terminal_below_editor(id, Some(target_pane_id), direction);
+        }
 
         self.handle_pane_count_change(ctx);
         ctx.notify();
@@ -7703,6 +7868,9 @@ impl PaneGroup {
         focus_pane_contents: bool,
         ctx: &mut ViewContext<Self>,
     ) -> bool {
+        if self.panes.stowed_pane_ids().contains(&id) {
+            self.unstow_terminal_panes(ctx);
+        }
         // No-op if the pane is hidden-for-close (undo stack) or no longer present.
         if FeatureFlag::UndoClosedPanes.is_enabled() && self.is_pane_hidden_for_close(id) {
             return false;
@@ -8433,4 +8601,8 @@ impl View for PaneGroup {
         _ctx: &mut ViewContext<Self>,
     ) {
     }
+}
+
+fn is_editor_pane(pane_id: PaneId) -> bool {
+    pane_id.is_code_pane() || pane_id.is_file_pane()
 }
