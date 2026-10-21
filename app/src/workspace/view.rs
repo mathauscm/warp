@@ -703,6 +703,7 @@ pub(crate) const NEW_AGENT_TAB_BINDING_NAME: &str = "workspace:new_agent_tab";
 pub(crate) const NEW_AMBIENT_AGENT_TAB_BINDING_NAME: &str = "workspace:new_ambient_agent_tab";
 pub(crate) const TOGGLE_TAB_CONFIGS_MENU_BINDING_NAME: &str = "workspace:toggle_tab_configs_menu";
 pub(crate) const TOGGLE_CLAUDE_THREADS_BINDING_NAME: &str = "workspace:toggle_claude_threads";
+pub(crate) const TOGGLE_TERMINAL_PANEL_BINDING_NAME: &str = "workspace:toggle_terminal_panel";
 pub(crate) const TOGGLE_PROJECT_MANAGER_BINDING_NAME: &str = "workspace:toggle_project_manager";
 pub(crate) const OPEN_CLAUDE_SESSION_BINDING_NAME: &str = "workspace:open_claude_session";
 
@@ -8994,12 +8995,7 @@ impl Workspace {
             }
             EditorLayout::SplitPane => {
                 self.active_tab_pane_group().update(ctx, |pane_group, ctx| {
-                    pane_group.add_pane_with_direction(
-                        Direction::Right,
-                        pane,
-                        true, /* focus_new_pane */
-                        ctx,
-                    );
+                    pane_group.add_editor_pane(pane, true /* focus_new_pane */, ctx);
                 });
             }
         }
@@ -9242,12 +9238,7 @@ impl Workspace {
             }
             EditorLayout::SplitPane => {
                 self.active_tab_pane_group().update(ctx, |pane_group, ctx| {
-                    pane_group.add_pane_with_direction(
-                        Direction::Right,
-                        pane,
-                        !preview, /* focus_new_pane */
-                        ctx,
-                    );
+                    pane_group.add_editor_pane(pane, !preview /* focus_new_pane */, ctx);
                 });
             }
         }
@@ -9846,8 +9837,8 @@ impl Workspace {
     }
 
     /// Opens a project in a new window, like the Project Manager extension's
-    /// "Open in New Window": a terminal in its folder and the file explorer
-    /// showing it. The current window stays as it is.
+    /// "Open in New Window": a terminal in its folder and only the file
+    /// explorer beside it. The current window stays as it is.
     fn open_project_in_new_window(path: PathBuf, ctx: &mut ViewContext<Self>) {
         let options = NewTerminalOptions::default()
             .with_initial_directory(path)
@@ -9860,14 +9851,25 @@ impl Workspace {
             ctx,
         );
         ctx.windows().show_window_and_focus_app(window_id);
-        if *CodeSettings::as_ref(ctx).show_project_explorer
-            && let Some(workspace) = ctx
-                .views_of_type::<Workspace>(window_id)
-                .and_then(|workspaces| workspaces.into_iter().next())
-        {
-            workspace.update(ctx, |workspace, ctx| {
+        let Some(workspace) = ctx
+            .views_of_type::<Workspace>(window_id)
+            .and_then(|workspaces| workspaces.into_iter().next())
+        else {
+            return;
+        };
+        let show_project_explorer = *CodeSettings::as_ref(ctx).show_project_explorer;
+        workspace.update(ctx, |workspace, ctx| {
+            workspace.close_vertical_tabs_panel(ctx);
+            if show_project_explorer {
                 workspace.open_left_panel_view(&LeftPanelAction::ProjectExplorer, ctx);
-            });
+            }
+        });
+    }
+
+    fn close_vertical_tabs_panel(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.vertical_tabs_panel_open {
+            self.set_vertical_tabs_content(VerticalTabsContent::Tabs, ctx);
+            self.toggle_vertical_tabs_panel(ctx);
         }
     }
 
@@ -13611,12 +13613,7 @@ impl Workspace {
                 }
                 EditorLayout::SplitPane => {
                     self.active_tab_pane_group().update(ctx, |pane_group, ctx| {
-                        pane_group.add_pane_with_direction(
-                            Direction::Right,
-                            pane,
-                            true, /* focus_new_pane */
-                            ctx,
-                        );
+                        pane_group.add_editor_pane(pane, true /* focus_new_pane */, ctx);
                     });
                 }
             }
@@ -24951,6 +24948,11 @@ impl TypedActionView for Workspace {
             }
             ToggleClaudeThreadsPanel => {
                 self.toggle_vertical_tabs_content(VerticalTabsContent::Threads, ctx);
+            }
+            ToggleTerminalPanel => {
+                self.active_tab_pane_group().update(ctx, |pane_group, ctx| {
+                    pane_group.toggle_terminal_panel(ctx);
+                });
             }
             ToggleProjectManagerPanel => {
                 self.toggle_vertical_tabs_content(VerticalTabsContent::Projects, ctx);

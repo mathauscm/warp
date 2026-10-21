@@ -782,3 +782,46 @@ fn test_hide_multiple_child_agent_panes() {
     assert_eq!(tree.visible_pane_ids(), vec![panes[0], panes[1]]);
     assert!(tree.is_pane_hidden(&panes[2]));
 }
+
+#[test]
+fn setting_a_pane_share_resizes_it_and_scales_its_siblings() {
+    let panes = [
+        PaneId::dummy_pane_id(),
+        PaneId::dummy_pane_id(),
+        PaneId::dummy_pane_id(),
+    ];
+    let mut tree = PaneData::new(panes[0]);
+    tree.split(panes[0], panes[1], Direction::Down);
+    tree.split(panes[1], panes[2], Direction::Down);
+
+    assert!(tree.set_pane_share(panes[2], 0.4));
+
+    let share = |id| tree.pane_share(id).expect("pane is in a split");
+    assert!((share(panes[2]) - 0.4).abs() < 1e-4);
+    assert!((share(panes[0]) - 0.3).abs() < 1e-4);
+    assert!((share(panes[1]) - 0.3).abs() < 1e-4);
+}
+
+#[test]
+fn a_pane_alone_has_no_share_to_set() {
+    let pane = PaneId::dummy_pane_id();
+    let mut tree = PaneData::new(pane);
+
+    assert!(!tree.set_pane_share(pane, 0.4));
+}
+
+#[test]
+fn stowed_panes_keep_their_place_but_are_not_visible() {
+    let panes = [PaneId::dummy_pane_id(), PaneId::dummy_pane_id()];
+    let mut tree = PaneData::new(panes[0]);
+    tree.split(panes[0], panes[1], Direction::Down);
+
+    tree.stow_pane(panes[1]);
+    assert_eq!(tree.visible_pane_ids(), vec![panes[0]]);
+    assert_eq!(tree.pane_ids(), vec![panes[0], panes[1]]);
+    assert_eq!(tree.stowed_pane_ids(), vec![panes[1]]);
+
+    assert_eq!(tree.unstow_panes(), vec![panes[1]]);
+    assert_eq!(tree.visible_pane_ids(), vec![panes[0], panes[1]]);
+    assert!(tree.stowed_pane_ids().is_empty());
+}

@@ -169,5 +169,5 @@ fn the_slider_fill_is_a_pill_at_every_position() {
         let width = slider_fill_width(effort_position(index));
         assert!((SLIDER_HEIGHT..=SLIDER_WIDTH).contains(&width));
     }
-    assert!(SLIDER_WIDTH > 2. * SLIDER_HEIGHT);
+    const { assert!(SLIDER_WIDTH > 2. * SLIDER_HEIGHT) };
 }

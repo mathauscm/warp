@@ -87,3 +87,14 @@ fn test_interaction_state_prevents_editing() {
         assert_eq!(text.as_str(), "abc");
     });
 }
+
+#[test]
+fn the_minimap_of_an_empty_file_does_not_panic() {
+    App::test((), |mut app| async move {
+        let (_window, editor_view) = initialize_editor(&mut app);
+
+        let lines = editor_view.read(&app, |view, ctx| view.minimap_lines(ctx));
+
+        assert!(lines.iter().all(Vec::is_empty));
+    });
+}

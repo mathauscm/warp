@@ -4124,3 +4124,146 @@ fn test_undo_close_keeps_a_file_pane_watching_its_file() {
         });
     });
 }
+
+#[cfg(feature = "local_fs")]
+fn add_markdown_editor(
+    pane_group: &ViewHandle<PaneGroup>,
+    directory: &std::path::Path,
+    app: &mut App,
+) -> PaneId {
+    let path = directory.join("notes.md");
+    std::fs::write(&path, "# notes").expect("write file");
+    pane_group.update(app, |panes, ctx| {
+        let existing: Vec<PaneId> = panes.pane_ids().collect();
+        let pane = FilePane::new(Some(LocalOrRemotePath::Local(path)), None, None, ctx);
+        panes.add_editor_pane(pane, true, ctx);
+        get_newly_created_pane_id(panes, &existing)
+    })
+}
+
+#[cfg(feature = "local_fs")]
+#[test]
+fn an_editor_opens_above_the_terminal_which_keeps_a_short_strip() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        app.add_singleton_model(warp_files::FileModel::new);
+        let pane_group = mock_pane_group(&mut app, Default::default());
+        let terminal = pane_group.read(&app, |panes, _| get_newly_created_pane_id(panes, &[]));
+        let directory = tempfile::tempdir().expect("temp dir");
+
+        let editor = add_markdown_editor(&pane_group, directory.path(), &mut app);
+
+        pane_group.read(&app, |panes, ctx| {
+            assert_eq!(panes.panes.pane_ids(), vec![editor, terminal]);
+            let share = panes
+                .panes
+                .pane_share(terminal)
+                .expect("terminal is in a split");
+            assert!((share - BOTTOM_TERMINAL_SHARE).abs() < 1e-4);
+            assert_eq!(panes.focused_pane_id(ctx), editor);
+        });
+    });
+}
+
+#[cfg(feature = "local_fs")]
+#[test]
+fn closing_the_last_terminal_under_an_editor_stows_it_and_the_toggle_brings_it_back() {
+    let _undo_closed_panes = FeatureFlag::UndoClosedPanes.override_enabled(true);
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        app.add_singleton_model(warp_files::FileModel::new);
+        let pane_group = mock_pane_group(&mut app, Default::default());
+        let terminal = pane_group.read(&app, |panes, _| get_newly_created_pane_id(panes, &[]));
+        let directory = tempfile::tempdir().expect("temp dir");
+        let editor = add_markdown_editor(&pane_group, directory.path(), &mut app);
+
+        pane_group.update(&mut app, |panes, ctx| {
+            panes.focus_pane(terminal, true, ctx);
+            panes.close_pane_with_confirmation(terminal, ctx);
+
+            assert!(panes.has_pane_id(terminal), "the session should stay alive");
+            assert_eq!(panes.visible_pane_ids(), vec![editor]);
+            assert_eq!(panes.focused_pane_id(ctx), editor);
+
+            panes.toggle_terminal_panel(ctx);
+            assert_eq!(panes.visible_pane_ids(), vec![editor, terminal]);
+            assert_eq!(panes.focused_pane_id(ctx), terminal);
+
+            panes.toggle_terminal_panel(ctx);
+            assert_eq!(panes.visible_pane_ids(), vec![editor]);
+        });
+    });
+}
+
+#[cfg(feature = "local_fs")]
+#[test]
+fn closing_the_editor_while_the_terminal_is_stowed_brings_the_terminal_back() {
+    let _undo_closed_panes = FeatureFlag::UndoClosedPanes.override_enabled(true);
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        app.add_singleton_model(warp_files::FileModel::new);
+        let pane_group = mock_pane_group(&mut app, Default::default());
+        let terminal = pane_group.read(&app, |panes, _| get_newly_created_pane_id(panes, &[]));
+        let directory = tempfile::tempdir().expect("temp dir");
+        let editor = add_markdown_editor(&pane_group, directory.path(), &mut app);
+
+        pane_group.update(&mut app, |panes, ctx| {
+            panes.toggle_terminal_panel(ctx);
+            assert_eq!(panes.visible_pane_ids(), vec![editor]);
+
+            panes.close_pane(editor, ctx);
+            assert_eq!(panes.visible_pane_ids(), vec![terminal]);
+            assert_eq!(panes.focused_pane_id(ctx), terminal);
+        });
+    });
+}
+
+#[cfg(feature = "local_fs")]
+#[test]
+fn a_terminal_beside_another_terminal_still_closes_under_an_editor() {
+    let _undo_closed_panes = FeatureFlag::UndoClosedPanes.override_enabled(true);
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        app.add_singleton_model(warp_files::FileModel::new);
+        let pane_group = mock_pane_group(&mut app, Default::default());
+        let first = pane_group.read(&app, |panes, _| get_newly_created_pane_id(panes, &[]));
+        let directory = tempfile::tempdir().expect("temp dir");
+        let editor = add_markdown_editor(&pane_group, directory.path(), &mut app);
+
+        pane_group.update(&mut app, |panes, ctx| {
+            panes.focus_pane(first, true, ctx);
+            panes.add_terminal_pane(Direction::Right, None, ctx);
+            let second = get_newly_created_pane_id(panes, &[first, editor]);
+
+            panes.close_pane_with_confirmation(second, ctx);
+
+            assert!(panes.is_pane_hidden_for_close(second));
+            assert!(panes.panes.stowed_pane_ids().is_empty());
+            assert_eq!(panes.visible_pane_ids(), vec![editor, first]);
+        });
+    });
+}
+
+#[cfg(feature = "local_fs")]
+#[test]
+fn a_terminal_dropped_below_an_editor_takes_a_short_strip() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        app.add_singleton_model(warp_files::FileModel::new);
+        let pane_group = mock_pane_group(&mut app, Default::default());
+        let terminal = pane_group.read(&app, |panes, _| get_newly_created_pane_id(panes, &[]));
+        let directory = tempfile::tempdir().expect("temp dir");
+        let editor = add_markdown_editor(&pane_group, directory.path(), &mut app);
+
+        pane_group.update(&mut app, |panes, ctx| {
+            panes.move_pane(terminal, editor, Direction::Right, ctx);
+            let side_share = panes.panes.pane_share(terminal).expect("in a split");
+            assert!((side_share - 0.5).abs() < 1e-4, "side by side stays even");
+
+            panes.move_pane(terminal, editor, Direction::Down, ctx);
+            assert_eq!(panes.panes.pane_ids(), vec![editor, terminal]);
+            let share = panes.panes.pane_share(terminal).expect("in a split");
+            assert!((share - BOTTOM_TERMINAL_SHARE).abs() < 1e-4);
+        });
+    });
+}
