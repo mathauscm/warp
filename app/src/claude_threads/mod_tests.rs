@@ -287,3 +287,26 @@ fn rename_appends_a_custom_title_that_wins() {
     );
     assert!(rename_thread(&thread, "   ").is_err());
 }
+
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn move_to_trash_dir_follows_the_freedesktop_trash_layout() {
+    let dir = tempfile::tempdir().unwrap();
+    let trash = dir.path().join("Trash");
+    for _ in 0..2 {
+        let transcript = dir.path().join("my thread.jsonl");
+        std::fs::write(&transcript, "{}").unwrap();
+        move_to_trash_dir(&transcript, &trash).unwrap();
+        assert!(!transcript.exists());
+    }
+
+    assert!(trash.join("files/my thread.jsonl").is_file());
+    assert!(trash.join("files/my thread.jsonl.2").is_file());
+    let info = std::fs::read_to_string(trash.join("info/my thread.jsonl.trashinfo")).unwrap();
+    let expected_path = dir.path().join("my%20thread.jsonl");
+    assert!(info.starts_with(&format!(
+        "[Trash Info]\nPath={}\nDeletionDate=",
+        expected_path.display()
+    )));
+    assert!(trash.join("info/my thread.jsonl.2.trashinfo").is_file());
+}

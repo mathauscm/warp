@@ -1,0 +1,191 @@
+# Builds WarpOss for Apple Silicon (.dmg) and Linux x86_64 (.AppImage, .deb and
+# Arch .pkg.tar.zst) and publishes them as a GitHub Release whenever a version
+# tag is pushed:
+#
+#   git tag v0.4 && git push origin v0.4
+#
+# It can also be started by hand from the Actions tab for an existing tag.
+# The Mac app is ad-hoc signed (no Apple Developer ID), so macOS asks each user
+# to allow it once; the release notes explain how.
+name: Build Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build and publish (e.g. v0.1)"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-release-${{ inputs.tag || github.ref_name }}
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  macos:
+    name: Build WarpOss.dmg (Apple Silicon)
+    runs-on: macos-26
+    timeout-minutes: 360
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Fetch Git LFS objects
+        run: |
+          git lfs install --local
+          git lfs pull
+
+      # The release build needs ~15 GB; drop simulators and extra Xcodes the
+      # runner image ships with.
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf ~/Library/Developer/CoreSimulator /Library/Developer/CoreSimulator/Profiles/Runtimes || true
+          df -h /
+
+      - uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
+        with:
+          xcode-version: "26"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: build-dmg-arm64
+
+      - name: Install build dependencies
+        run: |
+          ./script/install_cargo_release_deps
+          ./script/install_cargo_bundle
+          brew install protobuf create-dmg
+          rustup target add aarch64-apple-darwin
+
+      - name: Build WarpOss.app and WarpOss.dmg
+        run: ./script/bundle --channel oss --arch aarch64 --selfsign
+
+      - name: Collect package
+        run: |
+          mkdir dist
+          cp target/release-lto/bundle/osx/WarpOss.dmg "dist/WarpOss-${TAG}-arm64.dmg"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: macos
+          path: dist/*
+          retention-days: 1
+
+  linux:
+    name: Build WarpOss for Linux (x86_64)
+    # The oldest supported runner, so the binary links against an older glibc
+    # and runs on more distributions.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    env:
+      APPIMAGE_EXTRACT_AND_RUN: "1"
+      WARP_SKIP_SUDO_PROMPT: "1"
+    steps:
+      # The release build needs ~15 GB; drop SDKs the runner image ships with.
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Fetch Git LFS objects
+        run: |
+          git lfs install --local
+          git lfs pull
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          ./script/linux/install_build_deps
+          ./script/install_cargo_release_deps --no-build-deps
+          ./script/linux/install_linuxdeploy
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: build-linux-x86_64
+
+      - name: Build AppImage and .deb
+        id: bundle_app
+        run: ./script/bundle --channel oss --packages appimage,deb --release-tag "$TAG"
+
+      - name: Build Arch Linux package
+        uses: ./.github/actions/bundle_arch_package
+        env:
+          GIT_RELEASE_TAG: ${{ env.TAG }}
+        with:
+          channel: oss
+          release-tag: ${{ env.TAG }}
+          arch: x86_64
+          settings-schema-source: ${{ steps.bundle_app.outputs.settings_schema_path }}
+
+      - name: Collect packages
+        run: |
+          mkdir dist
+          cd target/release-lto/bundle/linux
+          cp WarpOss-x86_64.AppImage "$GITHUB_WORKSPACE/dist/WarpOss-${TAG}-x86_64.AppImage"
+          cp *.deb *.pkg.tar.zst "$GITHUB_WORKSPACE/dist/"
+          ls -la "$GITHUB_WORKSPACE/dist"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: linux
+          path: dist/*
+          retention-days: 1
+
+  publish:
+    name: Publish release
+    needs: [macos, linux]
+    # Publish whatever built, so one platform failing doesn't hold back the other.
+    if: ${{ !cancelled() && (needs.macos.result == 'success' || needs.linux.result == 'success') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          ls -la dist
+          cat > notes.md <<'NOTES'
+          ## macOS (Apple Silicon — M1 ou mais novo)
+
+          1. Baixe o `.dmg`, abra e arraste o **Picolas Code** para **Aplicativos**.
+          2. O app não é assinado pela Apple, então o macOS bloqueia a primeira abertura.
+             Libere uma vez com **um** destes jeitos:
+             - Tente abrir o app, vá em **Ajustes do Sistema → Privacidade e Segurança** e clique em **Abrir Mesmo Assim**; ou
+             - No Terminal: `xattr -dr com.apple.quarantine "/Applications/Picolas Code.app"`
+          3. Pronto: dali em diante ele abre normalmente.
+
+          ## Linux (x86_64)
+
+          - **Arch / CachyOS / Manjaro:** `sudo pacman -U warp-terminal-oss-*.pkg.tar.zst`
+          - **Debian / Ubuntu / Mint:** `sudo apt install ./warp-terminal-oss_*.deb`
+          - **Qualquer distro (AppImage):** `chmod +x WarpOss-*-x86_64.AppImage` e execute o arquivo.
+
+          Depois de instalar pelo pacote, o **Picolas Code** aparece no menu de aplicativos
+          (ou rode `warp-terminal-oss` no terminal).
+          NOTES
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --title "Picolas Code $TAG" --notes-file notes.md
+          fi

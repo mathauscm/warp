@@ -41,8 +41,18 @@ const LIGHT_BACKGROUND: ColorU = rgb(0xfaf9f5);
 /// The Claude app's main text color in light mode.
 const LIGHT_FOREGROUND: ColorU = rgb(0x141413);
 
-/// Font candidates, in order: SF Mono's names across macOS versions, then Menlo.
-const FONT_FAMILIES: &[&str] = &["SF Mono", ".SF NS Mono", "SFMono-Regular", "Menlo"];
+/// Font candidates, in order: SF Mono's names across macOS versions, Menlo, then
+/// close monospace fonts for systems without them.
+const FONT_FAMILIES: &[&str] = &[
+    "SF Mono",
+    ".SF NS Mono",
+    "SFMono-Regular",
+    "Menlo",
+    "JetBrains Mono",
+    "Adwaita Mono",
+    "Noto Sans Mono",
+    "DejaVu Sans Mono",
+];
 const FONT_SIZE: f32 = 14.;
 const LINE_HEIGHT_RATIO: f32 = 1.4;
 

@@ -344,27 +344,33 @@ fn load_default_ui_font_family(ctx: &mut AppContext) -> anyhow::Result<FamilyId>
 }
 
 /// The family name CoreText gives the macOS system font.
-const SYSTEM_UI_FONT: &str = ".AppleSystemUIFont";
+#[cfg(target_os = "macos")]
+const SYSTEM_UI_FONTS: &[&str] = &[".AppleSystemUIFont"];
 
-/// The macOS system font (SF Pro), which the Claude Code panels use for their own text. `None`
-/// on other platforms or when it can't be loaded.
+/// The closest Linux matches to SF Pro, in order: GNOME's own UI font (built on Inter), Inter
+/// itself, then the older GNOME and generic sans fonts.
+#[cfg(all(unix, not(target_os = "macos")))]
+const SYSTEM_UI_FONTS: &[&str] = &["Adwaita Sans", "Inter", "Cantarell", "Noto Sans"];
+
+#[cfg(not(unix))]
+const SYSTEM_UI_FONTS: &[&str] = &[];
+
+/// The system UI font (SF Pro on macOS, its closest match on Linux), which the Claude Code
+/// panels use for their own text. `None` on other platforms or when it can't be loaded.
 pub fn system_ui_font_family(ctx: &mut AppContext) -> Option<FamilyId> {
-    #[cfg(target_os = "macos")]
-    {
-        warpui::fonts::Cache::handle(ctx).update(ctx, |font_cache, _| {
-            font_cache.get_or_load_system_font(SYSTEM_UI_FONT).ok()
-        })
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = ctx;
-        None
-    }
+    warpui::fonts::Cache::handle(ctx).update(ctx, |font_cache, _| {
+        SYSTEM_UI_FONTS
+            .iter()
+            .find_map(|name| font_cache.get_or_load_system_font(name).ok())
+    })
 }
 
 /// The system font from `system_ui_font_family`, once it's been loaded.
 pub fn system_ui_font_family_cached(app: &AppContext) -> Option<FamilyId> {
-    warpui::fonts::Cache::as_ref(app).family_id_for_name(SYSTEM_UI_FONT)
+    let font_cache = warpui::fonts::Cache::as_ref(app);
+    SYSTEM_UI_FONTS
+        .iter()
+        .find_map(|name| font_cache.family_id_for_name(name))
 }
 
 fn load_password_font_family(ctx: &mut AppContext) -> anyhow::Result<FamilyId> {
