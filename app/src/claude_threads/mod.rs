@@ -20,7 +20,7 @@
 //! the conversation started in with every non-alphanumeric character replaced
 //! by `-`. A project lists the conversations started in its folder or in any
 //! folder below it, plus the ones moved into it. The only changes made under `~/.claude` are
-//! renaming a thread and deleting one, which moves its transcript to the macOS Trash.
+//! renaming a thread and deleting one, which moves its transcript to the system Trash.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -355,7 +355,71 @@ fn move_to_trash(path: &Path) -> Result<(), String> {
     })
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Moves `path` to the home trash of the freedesktop.org Trash spec, which GNOME,
+/// KDE and other desktops show and can restore from.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn move_to_trash(path: &Path) -> Result<(), String> {
+    let trash = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+        .or_else(|| dirs::home_dir().map(|home| home.join(".local/share")))
+        .ok_or("pasta pessoal não encontrada")?
+        .join("Trash");
+    move_to_trash_dir(path, &trash)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn move_to_trash_dir(path: &Path, trash: &Path) -> Result<(), String> {
+    use std::io::Write;
+
+    let path = std::path::absolute(path).map_err(|err| err.to_string())?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| format!("caminho inválido: {}", path.display()))?
+        .to_string_lossy()
+        .into_owned();
+    let (files, info) = (trash.join("files"), trash.join("info"));
+    std::fs::create_dir_all(&files).map_err(|err| err.to_string())?;
+    std::fs::create_dir_all(&info).map_err(|err| err.to_string())?;
+
+    let encoded_path = path
+        .to_string_lossy()
+        .split('/')
+        .map(|segment| urlencoding::encode(segment).into_owned())
+        .collect::<Vec<_>>()
+        .join("/");
+    let deletion_date = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S");
+    // Creating the .trashinfo with create_new reserves the name, so two deletions of
+    // files with the same name never overwrite each other.
+    for attempt in 1.. {
+        let trashed_name = match attempt {
+            1 => name.clone(),
+            n => format!("{name}.{n}"),
+        };
+        let info_path = info.join(format!("{trashed_name}.trashinfo"));
+        let mut info_file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&info_path)
+        {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err.to_string()),
+        };
+        let moved = write!(
+            info_file,
+            "[Trash Info]\nPath={encoded_path}\nDeletionDate={deletion_date}\n"
+        )
+        .and_then(|()| std::fs::rename(&path, files.join(&trashed_name)));
+        return moved.map_err(|err| {
+            let _ = std::fs::remove_file(&info_path);
+            err.to_string()
+        });
+    }
+    unreachable!()
+}
+
+#[cfg(not(unix))]
 fn move_to_trash(path: &Path) -> Result<(), String> {
     Err(format!(
         "mover para a lixeira não é suportado aqui: {}",

@@ -13,11 +13,25 @@ use serde_json::Value;
 use warpui::fonts::FamilyId;
 use warpui::{AppContext, SingletonEntity};
 
-/// VS Code's defaults on macOS when `editor.fontFamily`/`fontSize`/`lineHeight`
-/// are not set.
+/// VS Code's defaults when `editor.fontFamily`/`fontSize`/`lineHeight` are not set.
+#[cfg(target_os = "macos")]
 const DEFAULT_FONT_FAMILY: &str = "Menlo";
+#[cfg(target_os = "macos")]
 const DEFAULT_FONT_SIZE: f32 = 12.;
+#[cfg(not(target_os = "macos"))]
+const DEFAULT_FONT_FAMILY: &str = "Droid Sans Mono";
+#[cfg(not(target_os = "macos"))]
+const DEFAULT_FONT_SIZE: f32 = 14.;
 const DEFAULT_LINE_HEIGHT_RATIO: f32 = 1.5;
+/// Tried after the configured fonts, for the system's `monospace` that VS Code
+/// would fall back to.
+const FALLBACK_FONT_FAMILIES: &[&str] = &[
+    DEFAULT_FONT_FAMILY,
+    "Adwaita Mono",
+    "Noto Sans Mono",
+    "DejaVu Sans Mono",
+    "Liberation Mono",
+];
 
 /// Tree-sitter capture names emitted by the highlight queries, mapped to the
 /// TextMate scope VS Code themes use for the same kind of token.
@@ -157,7 +171,7 @@ fn load(ctx: &mut AppContext) -> EditorAppearance {
         .split(',')
         .map(|name| name.trim().trim_matches(|c| c == '\'' || c == '"'))
         .filter(|name| !name.is_empty() && *name != "monospace")
-        .chain(std::iter::once(DEFAULT_FONT_FAMILY))
+        .chain(FALLBACK_FONT_FAMILIES.iter().copied())
         .find_map(|name| load_font(name, ctx));
 
     EditorAppearance {
