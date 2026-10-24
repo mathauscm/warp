@@ -148,15 +148,42 @@ fn settings_are_read_as_json_whatever_their_formatting() {
   "effortLevel": "high"
 }"#;
     assert_eq!(
-        settings_string(settings, "model").as_deref(),
-        Some("claude-opus-5-5")
+        model_and_effort(None, Some(settings)),
+        (Some("claude-opus-5-5".to_owned()), Some("high".to_owned()))
     );
+    assert_eq!(model_and_effort(None, Some("not json")), (None, None));
+    assert_eq!(model_and_effort(None, None), (None, None));
+}
+
+#[test]
+fn effort_kept_per_model_is_read_for_the_default_model() {
+    // Newer Claude Code leaves `model` out for the default model and keeps the effort per model.
+    let settings = r#"{
+  "modelSettings": { "claude-opus-5-5": { "effortLevel": "high" } }
+}"#;
     assert_eq!(
-        settings_string(settings, "effortLevel").as_deref(),
-        Some("high")
+        model_and_effort(None, Some(settings)),
+        (Some("claude-opus-5-5".to_owned()), Some("high".to_owned()))
     );
-    assert_eq!(settings_string(settings, "missing"), None);
-    assert_eq!(settings_string("not json", "model"), None);
+
+    let settings = r#"{
+  "model": "claude-sonnet-5-5",
+  "modelSettings": {
+    "claude-opus-5-5": { "effortLevel": "high" },
+    "claude-sonnet-5-5": { "effortLevel": "low" }
+  }
+}"#;
+    assert_eq!(
+        model_and_effort(None, Some(settings)),
+        (Some("claude-sonnet-5-5".to_owned()), Some("low".to_owned()))
+    );
+
+    // The transcript wins over the settings.
+    let tail = r#"{"message":{"model":"claude-fable-5-1"}}"#;
+    assert_eq!(
+        model_and_effort(Some(tail), Some(settings)),
+        (Some("claude-fable-5-1".to_owned()), None)
+    );
 }
 
 #[test]
