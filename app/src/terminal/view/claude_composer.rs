@@ -357,15 +357,6 @@ fn last_string_field(text: &str, key: &str) -> Option<String> {
     Some(text[start..end].to_owned())
 }
 
-/// The string at `key` at the top level of Claude's `settings.json`.
-fn settings_string(settings: &str, key: &str) -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(settings)
-        .ok()?
-        .get(key)?
-        .as_str()
-        .map(str::to_owned)
-}
-
 /// Reads the model and effort of the conversation `session` (its folder and id) from its
 /// transcript, falling back to Claude's settings.
 fn read_model_label(session: Option<(PathBuf, String)>) -> Option<ClaudeModelLabel> {
@@ -388,28 +379,59 @@ fn read_model_label(session: Option<(PathBuf, String)>) -> Option<ClaudeModelLab
         Some(String::from_utf8_lossy(&bytes).into_owned())
     });
     let settings = std::fs::read_to_string(claude_dir.join("settings.json")).ok();
+    let (model, effort) = model_and_effort(tail.as_deref(), settings.as_deref());
+    Some(ClaudeModelLabel {
+        model: model
+            .and_then(|model| model_label(&model))
+            .unwrap_or_else(|| "Claude".to_owned()),
+        effort: effort.map(|effort| effort_label(&effort)),
+    })
+}
 
-    // A new session has no transcript yet; it runs with the model and effort from the settings.
+/// The model id and effort of a conversation, from the end of its transcript and Claude's
+/// `settings.json`. A new session has no transcript yet; it runs with the model and effort from
+/// the settings.
+///
+/// Newer Claude Code versions keep the effort per model, under `modelSettings.<model id>`, and
+/// leave `model` out while the default model is picked. Then the model is the one entry of
+/// `modelSettings`, when there's only one.
+fn model_and_effort(
+    tail: Option<&str>,
+    settings: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let settings =
+        settings.and_then(|settings| serde_json::from_str::<serde_json::Value>(settings).ok());
+    let model_settings = settings
+        .as_ref()
+        .and_then(|settings| settings.get("modelSettings"))
+        .and_then(|model_settings| model_settings.as_object());
     let model = tail
-        .as_deref()
         .and_then(|tail| last_string_field(tail, "model"))
         .or_else(|| {
             settings
-                .as_deref()
-                .and_then(|settings| settings_string(settings, "model"))
+                .as_ref()
+                .and_then(|settings| settings.get("model")?.as_str().map(str::to_owned))
         })
-        .and_then(|model| model_label(&model))
-        .unwrap_or_else(|| "Claude".to_owned());
+        .or_else(|| {
+            model_settings
+                .filter(|model_settings| model_settings.len() == 1)
+                .and_then(|model_settings| model_settings.keys().next().cloned())
+        });
     let effort = tail
-        .as_deref()
         .and_then(|tail| last_string_field(tail, "effort"))
         .or_else(|| {
             settings
-                .as_deref()
-                .and_then(|settings| settings_string(settings, "effortLevel"))
+                .as_ref()
+                .and_then(|settings| settings.get("effortLevel")?.as_str().map(str::to_owned))
         })
-        .map(|effort| effort_label(&effort));
-    Some(ClaudeModelLabel { model, effort })
+        .or_else(|| {
+            let model_settings = model_settings?.get(model.as_deref()?)?;
+            model_settings
+                .get("effortLevel")?
+                .as_str()
+                .map(str::to_owned)
+        });
+    (model, effort)
 }
 
 /// The keys that erase everything typed in Claude's prompt: Right arrows to the end of the text,
