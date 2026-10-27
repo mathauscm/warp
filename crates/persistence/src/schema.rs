@@ -70,6 +70,15 @@ diesel::table! {
 }
 
 diesel::table! {
+    claude_chat_panes (id) {
+        id -> Integer,
+        kind -> Text,
+        session_id -> Nullable<Text>,
+        cwd -> Text,
+    }
+}
+
+diesel::table! {
     app (id) {
         id -> Nullable<Integer>,
         active_window_id -> Nullable<Integer>,
@@ -513,6 +522,7 @@ diesel::table! {
 
 diesel::joinable!(ambient_agent_panes -> pane_nodes (id));
 diesel::joinable!(app -> windows (active_window_id));
+diesel::joinable!(claude_chat_panes -> pane_nodes (id));
 diesel::joinable!(code_pane_tabs -> code_panes (code_pane_id));
 diesel::joinable!(object_permissions -> object_metadata (object_metadata_id));
 diesel::joinable!(pane_branches -> pane_nodes (pane_node_id));
@@ -529,6 +539,7 @@ diesel::joinable!(workspace_language_server -> workspace_metadata (workspace_id)
 diesel::allow_tables_to_appear_in_same_query!(
     ambient_agent_panes,
     app,
+    claude_chat_panes,
     pane_branches,
     pane_leaves,
     pane_nodes,

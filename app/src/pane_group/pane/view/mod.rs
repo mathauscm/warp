@@ -164,7 +164,8 @@ impl<P: BackingView> PaneView<P> {
         match event {
             PaneGroupFocusEvent::FocusChanged { .. }
             | PaneGroupFocusEvent::InSplitPaneChanged
-            | PaneGroupFocusEvent::FocusedPaneMaximizedChanged => {
+            | PaneGroupFocusEvent::FocusedPaneMaximizedChanged
+            | PaneGroupFocusEvent::DockedPanesChanged => {
                 // Re-render to update dimming and header visibility.
                 ctx.notify();
             }

@@ -13,6 +13,7 @@ use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::ai::blocklist::{InputConfig, SerializedBlockListItem};
 use crate::code::editor_management::CodeSource;
 use crate::drive::OpenWarpDriveObjectSettings;
+pub use crate::native_chat::ClaudeChatPaneSnapshot;
 use crate::root_view::quake_mode_window_id;
 use crate::server::ids::{ServerId, SyncId};
 use crate::settings_view::SettingsSection;
@@ -153,6 +154,10 @@ pub enum LeafContents {
     NetworkLog,
     /// A new first-time user experience which prioritizes choosing a coding repository.
     GetStarted,
+    /// A native Claude chat.
+    ClaudeChat(ClaudeChatPaneSnapshot),
+    /// The gallery of local artifacts. Not persisted: it has no state worth restoring.
+    Artifacts,
 }
 
 #[cfg(feature = "local_fs")]
@@ -172,6 +177,7 @@ impl LeafContents {
             // starts empty on launch; persisting would also regress back to
             // an on-disk log via the app-state database.
             LeafContents::NetworkLog
+            | LeafContents::Artifacts
             // Environment management panes are opened on-demand via workspace
             // actions and have no persistable state.
             | LeafContents::EnvironmentManagement(_) => false,
@@ -187,7 +193,8 @@ impl LeafContents {
             | LeafContents::ExecutionProfileEditor
             | LeafContents::CodeReview(_)
             | LeafContents::AmbientAgent(_)
-            | LeafContents::GetStarted => true,
+            | LeafContents::GetStarted
+            | LeafContents::ClaudeChat(_) => true,
         }
     }
 }

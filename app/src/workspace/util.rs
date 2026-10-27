@@ -387,6 +387,17 @@ pub fn get_context_target_terminal_view(
         })
 }
 
+/// The conversation of the native Claude chat focused in the window's active tab.
+pub fn get_focused_claude_chat_session_id(window_id: WindowId, ctx: &AppContext) -> Option<String> {
+    let workspace = ctx.views_of_type::<Workspace>(window_id)?.first()?.clone();
+    let pane_group = workspace.as_ref(ctx).active_tab_pane_group().as_ref(ctx);
+    let pane = pane_group.downcast_pane_by_id::<crate::pane_group::ClaudeChatPane>(
+        pane_group.focused_pane_id(ctx),
+    )?;
+    let session = pane.backing_view(ctx).as_ref(ctx).session().clone();
+    Some(session.as_ref(ctx).session_id().to_owned())
+}
+
 pub fn get_terminal_background_fill(
     window_id: WindowId,
     app: &AppContext,

@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+#
+# Screenshot of the dev app's window, for checking UI changes without a person at the screen:
+# builds the debug app, launches it with the given environment, waits, captures only its window
+# (even behind other windows) and quits it. Runs are serialized with a lock, since only one dev
+# app can run at a time.
+#
+# Usage:
+#   PICOLAS_OPEN_CHAT=<folder>[#<session id>] ./script/picolas-shot <out.png> [seconds to wait]
+#
+# Other variables: PICOLAS_CHAT_DRAFT, PICOLAS_CHAT_SEND, PICOLAS_CHAT_MODEL (see
+# app/src/native_chat/mod.rs).
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")"/.. && pwd)"
+cd "$REPO_ROOT"
+
+OUT="${1:?usage: picolas-shot <out.png> [seconds]}"
+WAIT="${2:-20}"
+LOCK_DIR="${TMPDIR:-/tmp}/picolas-shot.lock"
+
+until mkdir "$LOCK_DIR" 2>/dev/null; do
+  # A lock older than 15 minutes belongs to a run that died.
+  if [[ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin +15 2>/dev/null)" ]]; then
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+  fi
+  sleep 2
+done
+trap './script/picolas-dev --stop; rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
+
+./script/picolas-dev
+PID="$(cat target/picolas-dev.pid)"
+# The app restores its last window size over PICOLAS_WINDOW_WIDTH, so size the main window from
+# outside once it exists (needs Accessibility access for the calling terminal).
+if [[ -n "${PICOLAS_WINDOW_WIDTH:-}" ]]; then
+  for _ in $(seq 1 30); do
+    [[ -n "$(swift script/picolas/window-id.swift "$PID")" ]] && break
+    sleep 1
+  done
+  osascript -e "tell application \"System Events\" to tell (first process whose unix id is $PID) \
+to set size of window 1 to {$PICOLAS_WINDOW_WIDTH, ${PICOLAS_WINDOW_HEIGHT:-860}}" >/dev/null \
+    || echo "Couldn't resize the window" >&2
+fi
+sleep "$WAIT"
+# The app opens a small transient window before its main one, and a window that's still drawing
+# captures blank, so retry until the main window gives a non-blank image.
+for attempt in $(seq 1 10); do
+  WINDOW_ID="$(swift script/picolas/window-id.swift "$PID")"
+  if [[ -n "$WINDOW_ID" ]] && screencapture -x -o -l"$WINDOW_ID" "$OUT" 2>/dev/null; then
+    blank_status=0
+    swift script/picolas/is-blank.swift "$OUT" || blank_status=$?
+    if [[ "$blank_status" -eq 1 ]]; then
+      echo "Saved $OUT"
+      exit 0
+    fi
+  fi
+  echo "Attempt $attempt: no usable window yet (id '${WINDOW_ID}'), retrying" >&2
+  sleep 3
+done
+echo "The dev app has no non-blank window" >&2
+exit 1

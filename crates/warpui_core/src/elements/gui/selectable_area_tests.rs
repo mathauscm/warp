@@ -6,7 +6,7 @@ use pathfinder_geometry::rect::RectF;
 use super::*;
 use crate::elements::new_scrollable::SingleAxisConfig;
 use crate::elements::{
-    ClippedScrollStateHandle, EventHandler, Fill, NewScrollable, SelectableElement,
+    ClippedScrollStateHandle, EventHandler, Fill, List, ListState, NewScrollable, SelectableElement,
 };
 use crate::platform::WindowStyle;
 use crate::{App, Entity, EntityIdSet, Presenter, TypedActionView, WindowInvalidation};
@@ -217,5 +217,98 @@ fn selection_starts_on_content_painted_in_child_layers() {
             "the drag should have produced a selection from the layered child",
         );
         assert!(!selection_handle.is_selecting());
+    });
+}
+
+/// Like [`ScrollableSelectionView`], with the content in a viewported [`List`].
+struct ListSelectionView {
+    selection_handle: SelectionHandle,
+    captured_selection: Rc<RefCell<Option<Option<String>>>>,
+    list_state: ListState<()>,
+}
+
+impl Default for ListSelectionView {
+    fn default() -> Self {
+        let list_state = ListState::new(|_, _, _| Box::new(LayeredSelectableProbe::default()));
+        list_state.add_item();
+        Self {
+            selection_handle: Default::default(),
+            captured_selection: Default::default(),
+            list_state,
+        }
+    }
+}
+
+impl Entity for ListSelectionView {
+    type Event = ();
+}
+
+impl crate::core::View for ListSelectionView {
+    fn ui_name() -> &'static str {
+        "selectable_list_test_view"
+    }
+
+    fn render(&self, _: &AppContext) -> Box<dyn Element> {
+        let captured_selection = self.captured_selection.clone();
+        SelectableArea::new(
+            self.selection_handle.clone(),
+            move |args, _, _| {
+                *captured_selection.borrow_mut() = Some(args.selection);
+            },
+            List::new(self.list_state.clone()).finish(),
+        )
+        .finish()
+    }
+}
+
+impl TypedActionView for ListSelectionView {
+    type Action = ();
+}
+
+#[test]
+fn selection_reaches_the_items_of_a_viewported_list() {
+    App::test((), |mut app| async move {
+        let (window_id, view) =
+            app.add_window(WindowStyle::NotStealFocus, |_| ListSelectionView::default());
+        let captured_selection = view.read(&app, |view, _| view.captured_selection.clone());
+
+        let root_view_id = view.id();
+        app.update(move |ctx| {
+            let mut presenter = Presenter::new(window_id);
+            let mut updated = EntityIdSet::default();
+            updated.insert(root_view_id);
+            presenter.invalidate(
+                WindowInvalidation {
+                    updated,
+                    ..Default::default()
+                },
+                ctx,
+            );
+            presenter.build_scene(vec2f(200., 200.), 1., None, ctx);
+            let presenter = Rc::new(RefCell::new(presenter));
+            for event in [
+                Event::LeftMouseDown {
+                    position: vec2f(10., 10.),
+                    modifiers: Default::default(),
+                    click_count: 1,
+                    is_first_mouse: false,
+                },
+                Event::LeftMouseDragged {
+                    position: vec2f(60., 10.),
+                    modifiers: Default::default(),
+                },
+                Event::LeftMouseUp {
+                    position: vec2f(60., 10.),
+                    modifiers: Default::default(),
+                },
+            ] {
+                ctx.simulate_window_event(event, window_id, presenter.clone());
+            }
+        });
+
+        assert_eq!(
+            *captured_selection.borrow(),
+            Some(Some("probe".to_string()))
+        );
     });
 }

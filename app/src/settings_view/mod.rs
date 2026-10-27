@@ -407,6 +407,36 @@ impl SettingsSection {
         }
     }
 
+    /// Whether Picolas Code leaves this page out of the sidebar and the settings search: Warp's own
+    /// agents, which it doesn't use (Claude Code configures its own MCP servers and agents). The
+    /// page still shows when something opens it directly.
+    pub fn is_hidden(self) -> bool {
+        match self {
+            Self::WarpAgent
+            | Self::AgentProfiles
+            | Self::AgentMCPServers
+            | Self::Knowledge
+            | Self::ThirdPartyCLIAgents
+            | Self::CloudEnvironments
+            | Self::WarpCloudAgentAPIKeys => true,
+            Self::About
+            | Self::Account
+            | Self::BillingAndUsage
+            | Self::Appearance
+            | Self::Features
+            | Self::Keybindings
+            | Self::Privacy
+            | Self::Referrals
+            | Self::Scripting
+            | Self::SharedBlocks
+            | Self::Teams
+            | Self::WarpDrive
+            | Self::Warpify
+            | Self::CodeIndexing
+            | Self::EditorAndCodeReview => false,
+        }
+    }
+
     /// Parses a [`Self::slug`], also accepting the legacy spellings that
     /// persisted sessions and existing warpctrl callers may still be using.
     ///
@@ -672,6 +702,7 @@ pub mod flags {
     pub const SHOW_PROJECT_EXPLORER: &str = "ShowProjectExplorer";
     pub const SHOW_GLOBAL_SEARCH: &str = "ShowGlobalSearch";
     pub const SHOW_HIDDEN_FILES: &str = "ShowHiddenFiles";
+    pub const SHOW_LSP_SUGGESTIONS: &str = "ShowLspSuggestions";
 }
 
 pub fn init_actions_from_parent_view<T: Action + Clone>(
@@ -1404,31 +1435,16 @@ impl SettingsView {
 
         // Build sidebar nav items. Umbrellas group their subpages here and
         // nowhere else, so this list is the only place membership is declared.
+        // Picolas Code leaves Warp's own agents (the "Agents" and "Cloud platform" umbrellas) out
+        // of the sidebar; see `SettingsSection::is_hidden`.
         let mut nav_items = vec![
             SettingsNavItem::Page(SettingsSection::Account),
-            SettingsNavItem::Umbrella(SettingsUmbrella::new(
-                "Agents",
-                vec![
-                    SettingsSection::WarpAgent,
-                    SettingsSection::AgentProfiles,
-                    SettingsSection::AgentMCPServers,
-                    SettingsSection::Knowledge,
-                    SettingsSection::ThirdPartyCLIAgents,
-                ],
-            )),
             SettingsNavItem::Page(SettingsSection::BillingAndUsage),
             SettingsNavItem::Umbrella(SettingsUmbrella::new(
                 "Code",
                 vec![
                     SettingsSection::CodeIndexing,
                     SettingsSection::EditorAndCodeReview,
-                ],
-            )),
-            SettingsNavItem::Umbrella(SettingsUmbrella::new(
-                "Cloud platform",
-                vec![
-                    SettingsSection::CloudEnvironments,
-                    SettingsSection::WarpCloudAgentAPIKeys,
                 ],
             )),
             SettingsNavItem::Page(SettingsSection::Teams),
@@ -1530,7 +1546,9 @@ impl SettingsView {
             .iter()
             .zip(self.pages_filter.iter())
             .filter_map(move |(page, match_data)| {
-                (self.should_render_page(page, app) && match_data.is_truthy())
+                let reachable =
+                    !page.section.is_hidden() || page.section == self.current_settings_page;
+                (reachable && self.should_render_page(page, app) && match_data.is_truthy())
                     .then_some((page, *match_data))
             })
     }

@@ -65,6 +65,17 @@ define_settings_group!(CodeSettings, settings: [
         toml_path: "code.editor.show_global_search",
         description: "Whether global file search is shown in the tools panel.",
     },
+    // Controls whether the editor footer suggests enabling language support for a codebase.
+    show_lsp_suggestions: ShowLspSuggestions {
+        type: bool,
+        default: true,
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        surface: settings::SettingSurfaces::GUI,
+        private: false,
+        toml_path: "code.editor.show_lsp_suggestions",
+        description: "Whether the editor footer suggests enabling language support.",
+    },
     // Controls whether hidden files (dotfiles) are shown in the project explorer.
     show_hidden_files: ShowHiddenFiles {
         type: bool,

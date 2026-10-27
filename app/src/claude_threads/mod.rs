@@ -37,9 +37,6 @@ const CONFIG_FILE_NAME: &str = "claude_threads.toml";
 const TRANSCRIPT_CHUNK_BYTES: u64 = 256 * 1024;
 const TITLE_MAX_CHARS: usize = 80;
 
-/// Command that starts a new thread in the project folder.
-pub const NEW_THREAD_COMMAND: &str = "claude";
-
 /// A folder whose Claude Code conversations are listed in the Threads panel.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThreadProject {
@@ -300,6 +297,11 @@ fn read_transcript(path: &Path, modified: SystemTime) -> Option<ClaudeThread> {
 /// Renames a thread the way Claude Code's `/rename` does: a `custom-title` record appended to its
 /// transcript, which wins over every earlier title, also in `claude --resume`.
 pub fn rename_thread(thread: &ClaudeThread, title: &str) -> Result<String, String> {
+    rename_transcript(&thread.transcript, &thread.session_id, title)
+}
+
+/// Appends the `custom-title` record of [`rename_thread`] to the transcript at `path`.
+pub fn rename_transcript(path: &Path, session_id: &str, title: &str) -> Result<String, String> {
     let title = clean_title(title);
     if title.is_empty() {
         return Err("O nome não pode ficar vazio".to_owned());
@@ -307,12 +309,12 @@ pub fn rename_thread(thread: &ClaudeThread, title: &str) -> Result<String, Strin
     let record = serde_json::json!({
         "type": "custom-title",
         "customTitle": title,
-        "sessionId": thread.session_id,
+        "sessionId": session_id,
     });
     let mut file = OpenOptions::new()
         .read(true)
         .append(true)
-        .open(&thread.transcript)
+        .open(path)
         .map_err(|err| err.to_string())?;
     // Keep the record on its own line, even if the last one wasn't finished.
     let len = file.metadata().map_err(|err| err.to_string())?.len();

@@ -1,0 +1,63 @@
+[package]
+name = "picolas_webview"
+version = "0.1.0"
+edition = "2024"
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+objc2.workspace = true
+objc2-app-kit = { workspace = true, features = [
+    "std",
+    "NSAppearance",
+    "NSColor",
+    "NSGraphics",
+    "NSImageRep",
+    "NSBitmapImageRep",
+    "NSImage",
+    "NSResponder",
+    "NSView",
+    "NSWindow",
+    "NSWorkspace",
+] }
+objc2-foundation = { workspace = true, features = [
+    "NSData",
+    "NSDictionary",
+    "NSError",
+    "NSGeometry",
+    "NSKeyValueCoding",
+    "NSObject",
+    "NSString",
+    "NSURL",
+    "NSURLRequest",
+    "NSValue",
+] }
+objc2-web-kit = { workspace = true, features = [
+    "std",
+    "block2",
+    "objc2-app-kit",
+    "objc2-core-foundation",
+    "WKFrameInfo",
+    "WKNavigation",
+    "WKNavigationAction",
+    "WKNavigationDelegate",
+    "WKPreferences",
+    "WKSnapshotConfiguration",
+    "WKUIDelegate",
+    "WKWebView",
+    "WKWebViewConfiguration",
+    "WKWindowFeatures",
+] }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2-app-kit = { workspace = true, features = [
+    "NSApplication",
+    "NSRunningApplication",
+    "NSWindow",
+] }
+objc2-foundation = { workspace = true, features = ["block2", "NSDate", "NSTimer"] }

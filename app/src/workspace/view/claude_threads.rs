@@ -40,15 +40,17 @@ use warpui::{
 
 use crate::appearance::Appearance;
 use crate::claude_threads::{
-    self, ClaudeThread, NEW_THREAD_COMMAND, ThreadGroups, ThreadProject, ThreadsConfig,
-    TranscriptCache,
+    self, ClaudeThread, ThreadGroups, ThreadProject, ThreadsConfig, TranscriptCache,
 };
 use crate::editor::{EditorView, Event as EditorEvent, SingleLineEditorOptions, TextOptions};
 use crate::menu::{Event as MenuEvent, Menu, MenuItem, MenuItemFields};
+use crate::native_chat::registry::{NativeChatRegistry, NativeChatStatus};
 use crate::terminal::CLIAgent;
 use crate::terminal::cli_agent_sessions::{CLIAgentSessionStatus, CLIAgentSessionsModel};
 use crate::workspace::WorkspaceAction;
-use crate::workspace::util::get_context_target_terminal_view;
+use crate::workspace::util::{
+    get_context_target_terminal_view, get_focused_claude_chat_session_id,
+};
 
 /// How often the transcripts are re-read while the panel is visible, so new
 /// conversations and title changes show up.
@@ -88,6 +90,7 @@ const NEW_CHAT_ICON_SIZE: f32 = 16.;
 const FOLDER_ICON: &str = "bundled/svg/picolas-folder.svg";
 const FOLDER_OPEN_ICON: &str = "bundled/svg/picolas-folder-open.svg";
 const NEW_CHAT_ICON: &str = "bundled/svg/picolas-new-chat.svg";
+const ARTIFACTS_ICON: &str = "bundled/svg/picolas-artifact-other.svg";
 const SEARCH_ICON: &str = "bundled/svg/picolas-search.svg";
 const SIDEBAR_ICON: &str = "bundled/svg/picolas-sidebar.svg";
 const PIN_ICON: &str = "bundled/svg/picolas-pin.svg";
@@ -134,12 +137,16 @@ pub enum ClaudeThreadsAction {
     NewThread(PathBuf),
     /// Starts a thread in the home folder.
     NewChat,
+    /// Opens the gallery of artifacts.
+    OpenArtifacts,
     /// Shows or hides the search field.
     ToggleSearch,
     OpenThread {
         session_id: String,
         cwd: PathBuf,
     },
+    /// Resumes the thread in a terminal running Claude Code, instead of the native chat.
+    OpenThreadInTerminal(String),
     ToggleThreadMenu(String),
     /// Swaps the open "⋯" menu between its actions and the projects the thread can move to.
     ShowThreadMenuPage {
@@ -260,6 +267,9 @@ impl ClaudeThreadsView {
             MenuEvent::ItemSelected | MenuEvent::ItemHovered => {}
         });
         // Status dots follow the Claude sessions running in the tabs.
+        ctx.subscribe_to_model(&NativeChatRegistry::handle(ctx), |_, _, _, ctx| {
+            ctx.notify()
+        });
         ctx.subscribe_to_model(&CLIAgentSessionsModel::handle(ctx), |me, _, _, ctx| {
             if me.is_visible {
                 ctx.notify();
@@ -439,14 +449,27 @@ impl ClaudeThreadsView {
 
     /// Focuses the tab already running the thread, otherwise resumes it in a
     /// new tab opened in the thread's folder.
+    /// Focuses the terminal already running the thread, or opens it in the native chat.
     fn open_thread(&mut self, session_id: &str, cwd: &Path, ctx: &mut ViewContext<Self>) {
-        let running_in = CLIAgentSessionsModel::as_ref(ctx)
-            .session_by_agent_session_id(session_id)
-            .map(|(terminal_view_id, _)| terminal_view_id);
-        if let Some(terminal_view_id) = running_in {
-            ctx.dispatch_typed_action_deferred(WorkspaceAction::FocusTerminalViewInWorkspace {
-                terminal_view_id,
-            });
+        if self.focus_running_thread(session_id, ctx) {
+            return;
+        }
+        let group = self
+            .find_thread(session_id)
+            .and_then(|thread| self.config.project_of(thread))
+            .map(project_group_name);
+        ctx.dispatch_typed_action_deferred(WorkspaceAction::OpenClaudeChat {
+            cwd: cwd.to_path_buf(),
+            session_id: Some(session_id.to_owned()),
+            draft: None,
+            artifact_kind: None,
+            group,
+        });
+    }
+
+    /// Resumes the thread with Claude Code's own interface, in a terminal tab.
+    fn open_thread_in_terminal(&mut self, session_id: &str, ctx: &mut ViewContext<Self>) {
+        if self.focus_running_thread(session_id, ctx) {
             return;
         }
         let Some(thread) = self.find_thread(session_id) else {
@@ -457,10 +480,24 @@ impl ClaudeThreadsView {
         };
         let group = self.config.project_of(thread).map(project_group_name);
         ctx.dispatch_typed_action_deferred(WorkspaceAction::RunCommandInNewTab {
-            directory: cwd.to_path_buf(),
+            directory: thread.cwd.clone(),
             command,
             group,
         });
+    }
+
+    /// Focuses the terminal tab where Claude Code is already running the thread, if any.
+    fn focus_running_thread(&self, session_id: &str, ctx: &mut ViewContext<Self>) -> bool {
+        let running_in = CLIAgentSessionsModel::as_ref(ctx)
+            .session_by_agent_session_id(session_id)
+            .map(|(terminal_view_id, _)| terminal_view_id);
+        let Some(terminal_view_id) = running_in else {
+            return false;
+        };
+        ctx.dispatch_typed_action_deferred(WorkspaceAction::FocusTerminalViewInWorkspace {
+            terminal_view_id,
+        });
+        true
     }
 
     /// Closes the tab running the thread, if any, then moves its transcript to the Trash.
@@ -558,12 +595,15 @@ impl ClaudeThreadsView {
     /// A Claude Code thread in the home folder, outside every project, like a new chat in a chat
     /// app.
     fn new_chat(&mut self, ctx: &mut ViewContext<Self>) {
-        let Some(directory) = dirs::home_dir() else {
+        let Some(cwd) = dirs::home_dir() else {
             return;
         };
-        ctx.dispatch_typed_action_deferred(WorkspaceAction::RunCommandInNewTab {
-            directory,
-            command: NEW_THREAD_COMMAND.to_owned(),
+        let unused = NativeChatRegistry::as_ref(ctx).unused_chat_in(&cwd, ctx);
+        ctx.dispatch_typed_action_deferred(WorkspaceAction::OpenClaudeChat {
+            cwd,
+            session_id: unused,
+            draft: None,
+            artifact_kind: None,
             group: None,
         });
     }
@@ -610,7 +650,12 @@ impl ClaudeThreadsView {
     ) -> Vec<MenuItem<ClaudeThreadsAction>> {
         let id = session_id.to_owned();
         let thread = self.find_thread(session_id);
-        let mut items = Vec::new();
+        let mut items = vec![
+            MenuItemFields::new("Abrir no terminal")
+                .with_icon(WarpIcon::Terminal)
+                .with_on_select_action(ClaudeThreadsAction::OpenThreadInTerminal(id.clone()))
+                .into_item(),
+        ];
         // Threads that haven't written a transcript yet have nothing to store a name in.
         if thread.is_some_and(|thread| !thread.transcript.as_os_str().is_empty()) {
             items.push(
@@ -755,11 +800,6 @@ fn thread_menu_button_position_id(session_id: &str) -> String {
     format!("claude_threads_menu_button:{session_id}")
 }
 
-/// Quotes `path` for a POSIX shell.
-fn shell_quote(path: &Path) -> String {
-    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
-}
-
 /// Claude sessions opened from a project share a tab group named after its
 /// folder.
 fn project_group_name(project: &Path) -> String {
@@ -792,11 +832,22 @@ impl TypedActionView for ClaudeThreadsView {
                 ctx.notify();
             }
             ClaudeThreadsAction::NewThread(path) => {
-                ctx.dispatch_typed_action_deferred(WorkspaceAction::RunCommandInNewTab {
-                    directory: path.clone(),
-                    command: NEW_THREAD_COMMAND.to_owned(),
+                let unused = NativeChatRegistry::as_ref(ctx).unused_chat_in(path, ctx);
+                ctx.dispatch_typed_action_deferred(WorkspaceAction::OpenClaudeChat {
+                    cwd: path.clone(),
+                    session_id: unused,
+                    draft: None,
+                    artifact_kind: None,
                     group: Some(project_group_name(path)),
                 });
+            }
+            ClaudeThreadsAction::OpenArtifacts => {
+                ctx.dispatch_typed_action_deferred(WorkspaceAction::OpenArtifacts {
+                    artifact_id: None,
+                });
+            }
+            ClaudeThreadsAction::OpenThreadInTerminal(session_id) => {
+                self.open_thread_in_terminal(session_id, ctx);
             }
             ClaudeThreadsAction::NewChat => self.new_chat(ctx),
             ClaudeThreadsAction::ToggleSearch => self.toggle_search(ctx),
@@ -836,9 +887,12 @@ impl TypedActionView for ClaudeThreadsView {
                 self.delete_thread(session_id, ctx);
             }
             ClaudeThreadsAction::DragProject { path, position } => {
+                // A grabbing hand while the project moves, like dragging anything on macOS.
+                ctx.set_cursor_shape(Cursor::ClosedHand);
                 self.drag_project(path, *position, ctx);
             }
             ClaudeThreadsAction::DropProject => {
+                ctx.reset_cursor();
                 self.save_config();
                 ctx.notify();
             }
@@ -910,6 +964,8 @@ impl Fonts {
 struct RowContext<'a> {
     now: SystemTime,
     active_terminal_id: Option<EntityId>,
+    /// The conversation of the focused native chat, if one is focused.
+    active_chat_session_id: Option<&'a str>,
     palette: Palette,
     fonts: Fonts,
     appearance: &'a Appearance,
@@ -924,10 +980,12 @@ impl View for ClaudeThreadsView {
     fn render(&self, app: &AppContext) -> Box<dyn Element> {
         let appearance = Appearance::as_ref(app);
         let theme = appearance.theme();
+        let active_chat_session_id = get_focused_claude_chat_session_id(self.window_id, app);
         let rows = RowContext {
             now: SystemTime::now(),
             active_terminal_id: get_context_target_terminal_view(self.window_id, app)
                 .map(|view| view.id()),
+            active_chat_session_id: active_chat_session_id.as_deref(),
             palette: Palette::new(appearance),
             fonts: Fonts::new(self.font_family, appearance),
             appearance,
@@ -1041,9 +1099,22 @@ impl ClaudeThreadsView {
         threads
     }
 
-    /// Claude sessions running in a tab that no scanned thread covers yet.
+    /// Claude sessions open in a tab (native chats, or Claude Code in a terminal) that no scanned
+    /// thread covers yet.
     fn pending_threads(&self, now: SystemTime, app: &AppContext) -> Vec<ClaudeThread> {
-        CLIAgentSessionsModel::as_ref(app)
+        let native = NativeChatRegistry::as_ref(app)
+            .open_chats(app)
+            .into_iter()
+            .filter(|chat| self.find_thread(&chat.session_id).is_none())
+            .map(|chat| ClaudeThread {
+                title: chat.title.unwrap_or_else(|| NEW_THREAD_TITLE.to_owned()),
+                session_id: chat.session_id,
+                cwd: chat.cwd,
+                updated_at: now,
+                transcript: PathBuf::new(),
+                git_branch: None,
+            });
+        let terminal = CLIAgentSessionsModel::as_ref(app)
             .sessions()
             .filter(|(_, session)| session.agent == CLIAgent::Claude)
             .filter_map(|(_, session)| {
@@ -1066,7 +1137,8 @@ impl ClaudeThreadsView {
                     git_branch: None,
                 })
             })
-            .collect()
+            .collect::<Vec<_>>();
+        native.chain(terminal).collect()
     }
 
     fn render_search_bar(&self, palette: Palette) -> Box<dyn Element> {
@@ -1282,21 +1354,48 @@ impl ClaudeThreadsView {
             .finish()
     }
 
-    /// "Novo chat": a Claude Code thread in the home folder.
+    /// "Novo chat" (a chat in the home folder) and "Artefatos" (the gallery of what Claude made).
     fn render_new_chat_row(&self, rows: RowContext<'_>) -> Box<dyn Element> {
+        Container::new(
+            Flex::column()
+                .with_child(self.render_nav_row(
+                    "new-chat",
+                    NEW_CHAT_ICON,
+                    "Novo chat",
+                    ClaudeThreadsAction::NewChat,
+                    rows,
+                ))
+                .with_child(self.render_nav_row(
+                    "artifacts",
+                    ARTIFACTS_ICON,
+                    "Artefatos",
+                    ClaudeThreadsAction::OpenArtifacts,
+                    rows,
+                ))
+                .finish(),
+        )
+        .with_horizontal_padding(PANEL_PADDING)
+        .with_padding_bottom(PANEL_PADDING)
+        .finish()
+    }
+
+    fn render_nav_row(
+        &self,
+        key: &str,
+        icon: &'static str,
+        label: &'static str,
+        action: ClaudeThreadsAction,
+        rows: RowContext<'_>,
+    ) -> Box<dyn Element> {
         let RowContext { palette, fonts, .. } = rows;
-        let row = Hoverable::new(self.mouse_state("new-chat".to_owned()), move |state| {
+        Hoverable::new(self.mouse_state(key.to_owned()), move |state| {
             let content = Flex::row()
                 .with_main_axis_size(MainAxisSize::Max)
                 .with_cross_axis_alignment(CrossAxisAlignment::Center)
                 .with_spacing(ICON_TEXT_GAP)
-                .with_child(render_svg(
-                    NEW_CHAT_ICON,
-                    palette.main_text,
-                    NEW_CHAT_ICON_SIZE,
-                ))
+                .with_child(render_svg(icon, palette.main_text, NEW_CHAT_ICON_SIZE))
                 .with_child(
-                    Text::new_inline("Novo chat", fonts.family, TITLE_FONT_SIZE)
+                    Text::new_inline(label, fonts.family, TITLE_FONT_SIZE)
                         .with_color(palette.main_text.into())
                         .finish(),
                 )
@@ -1305,12 +1404,8 @@ impl ClaudeThreadsView {
             render_row_container(content, PROJECT_ROW_VERTICAL_PADDING, background)
         })
         .with_cursor(Cursor::PointingHand)
-        .on_click(|ctx, _, _| ctx.dispatch_typed_action(ClaudeThreadsAction::NewChat))
-        .finish();
-        Container::new(row)
-            .with_horizontal_padding(PANEL_PADDING)
-            .with_padding_bottom(PANEL_PADDING)
-            .finish()
+        .on_click(move |ctx, _, _| ctx.dispatch_typed_action(action.clone()))
+        .finish()
     }
 
     /// A folder icon, open while the project is expanded, and the folder's name. On hover come
@@ -1497,6 +1592,7 @@ impl ClaudeThreadsView {
         let RowContext {
             now,
             active_terminal_id,
+            active_chat_session_id,
             palette,
             fonts,
             appearance,
@@ -1505,16 +1601,27 @@ impl ClaudeThreadsView {
         let running_session =
             CLIAgentSessionsModel::as_ref(app).session_by_agent_session_id(&thread.session_id);
         let is_active = running_session
-            .is_some_and(|(terminal_view_id, _)| Some(terminal_view_id) == active_terminal_id);
-        let status = running_session.map(|(_, session)| {
-            if matches!(session.status, CLIAgentSessionStatus::Blocked { .. }) {
-                ThreadStatus::Blocked
-            } else if session.is_working_on_prompt() {
-                ThreadStatus::Working
-            } else {
-                ThreadStatus::Open
-            }
-        });
+            .is_some_and(|(terminal_view_id, _)| Some(terminal_view_id) == active_terminal_id)
+            || active_chat_session_id == Some(thread.session_id.as_str());
+        let status = running_session
+            .map(|(_, session)| {
+                if matches!(session.status, CLIAgentSessionStatus::Blocked { .. }) {
+                    ThreadStatus::Blocked
+                } else if session.is_working_on_prompt() {
+                    ThreadStatus::Working
+                } else {
+                    ThreadStatus::Open
+                }
+            })
+            .or_else(|| {
+                NativeChatRegistry::as_ref(app)
+                    .status(&thread.session_id, app)
+                    .map(|status| match status {
+                        NativeChatStatus::Working => ThreadStatus::Working,
+                        NativeChatStatus::AwaitingUser => ThreadStatus::Blocked,
+                        NativeChatStatus::Idle => ThreadStatus::Open,
+                    })
+            });
         let title = thread.title.clone();
         let age = claude_threads::format_age(thread.updated_at, now);
         let action = ClaudeThreadsAction::OpenThread {
@@ -1579,10 +1686,9 @@ impl ClaudeThreadsView {
             ]
         });
         // Dropped on a pane, a thread already open moves its pane there; any
-        // other resumes in a new split from its folder.
-        let drop_command = thread
-            .resume_command()
-            .map(|resume| format!("cd {} && {resume}", shell_quote(&thread.cwd)));
+        // other opens in a native chat split.
+        let can_drop = thread.resume_command().is_some();
+        let drop_cwd = thread.cwd.clone();
         let is_running = running_session.is_some();
 
         let row = Hoverable::new(
@@ -1691,7 +1797,7 @@ impl ClaudeThreadsView {
         // Dragging a thread onto a pane of the active tab splits it there (see
         // `tab_merge`): an open thread moves its pane, so the same conversation
         // never runs twice.
-        if drop_command.is_none() && !is_running {
+        if !can_drop && !is_running {
             return row;
         }
         let drop_session_id = session_id.clone();
@@ -1702,7 +1808,7 @@ impl ClaudeThreadsView {
             .on_drop(move |ctx, _, _, _| {
                 ctx.dispatch_typed_action(WorkspaceAction::DropClaudeThread {
                     session_id: drop_session_id.clone(),
-                    command: drop_command.clone(),
+                    cwd: drop_cwd.clone(),
                 });
             })
             .finish()

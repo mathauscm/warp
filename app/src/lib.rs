@@ -49,6 +49,7 @@ mod local_control;
 mod login_item;
 mod menu;
 mod modal;
+mod native_chat;
 mod network;
 mod notebooks;
 mod notification;
@@ -1873,6 +1874,8 @@ pub(crate) fn initialize_app(
     ctx.add_singleton_model(|_| RecordingController::new());
     ctx.add_singleton_model(|_| ExecutionProfileEditorManager::default());
     ctx.add_singleton_model(|_| NetworkLogPaneManager::default());
+    ctx.add_singleton_model(native_chat::design::ChatDesign::new);
+    ctx.add_singleton_model(|_| native_chat::registry::NativeChatRegistry::default());
     ctx.add_singleton_model(|_| pricing::PricingInfoModel::new());
     ctx.add_singleton_model(ai::pricing_promotion::PricingPromotionState::new);
     ctx.add_singleton_model(|ctx| {

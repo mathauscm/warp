@@ -39,7 +39,7 @@ use lsp::supported_servers::LSPServerType;
 use num_traits::FromPrimitive;
 use pathfinder_geometry::rect::RectF;
 use pathfinder_geometry::vector::Vector2F;
-use persistence::model::AMBIENT_AGENT_PANE_KIND;
+use persistence::model::{AMBIENT_AGENT_PANE_KIND, CLAUDE_CHAT_PANE_KIND};
 use uuid::Uuid;
 use warp_core::features::FeatureFlag;
 use warp_errors::{report_error, report_if_error};
@@ -930,6 +930,7 @@ fn save_app_state(conn: &mut SqliteConnection, app_state: &AppState) -> Result<(
         diesel::delete(schema::mcp_server_panes::dsl::mcp_server_panes).execute(conn)?;
         diesel::delete(schema::code_review_panes::dsl::code_review_panes).execute(conn)?;
         diesel::delete(schema::ambient_agent_panes::dsl::ambient_agent_panes).execute(conn)?;
+        diesel::delete(schema::claude_chat_panes::dsl::claude_chat_panes).execute(conn)?;
         diesel::delete(schema::pane_leaves::dsl::pane_leaves).execute(conn)?;
         diesel::delete(schema::pane_branches::dsl::pane_branches).execute(conn)?;
         diesel::delete(schema::pane_nodes::dsl::pane_nodes).execute(conn)?;
@@ -1209,8 +1210,11 @@ fn save_pane_state(
             EXECUTION_PROFILE_EDITOR_PANE_KIND
         }
         LeafContents::GetStarted => GET_STARTED_PANE_KIND,
+        LeafContents::ClaudeChat(_) => CLAUDE_CHAT_PANE_KIND,
         LeafContents::AIDocument(_) => AI_DOCUMENT_PANE_KIND,
-        LeafContents::EnvironmentManagement(_) | LeafContents::NetworkLog => {
+        LeafContents::EnvironmentManagement(_)
+        | LeafContents::NetworkLog
+        | LeafContents::Artifacts => {
             // These pane types are filtered out before this function is
             // called; see `LeafContents::is_persisted` and the skip in
             // `save_app_state`. Reaching this arm would mean a `pane_nodes`
@@ -1407,6 +1411,16 @@ fn save_pane_state(
         LeafContents::GetStarted => {
             // Stateless
         }
+        LeafContents::ClaudeChat(snapshot) => {
+            let claude_chat_pane = model::NewClaudeChatPane {
+                id,
+                session_id: snapshot.session_id.clone(),
+                cwd: snapshot.cwd.to_string_lossy().into_owned(),
+            };
+            diesel::insert_into(schema::claude_chat_panes::dsl::claude_chat_panes)
+                .values(claude_chat_pane)
+                .execute(conn)?;
+        }
         LeafContents::AIDocument(ai_document_snapshot) => match ai_document_snapshot {
             crate::app_state::AIDocumentPaneSnapshot::Local {
                 document_id,
@@ -1438,7 +1452,7 @@ fn save_pane_state(
                 .values(ambient_agent_pane)
                 .execute(conn)?;
         }
-        LeafContents::NetworkLog => {
+        LeafContents::NetworkLog | LeafContents::Artifacts => {
             // Unreachable: filtered by `is_persisted` in `save_app_state`.
         }
     }
@@ -2392,6 +2406,18 @@ fn read_node(conn: &mut SqliteConnection, node: model::PaneNode) -> Result<PaneN
                     }
                 }
                 GET_STARTED_PANE_KIND => LeafContents::GetStarted,
+                CLAUDE_CHAT_PANE_KIND => {
+                    let pane = schema::claude_chat_panes::dsl::claude_chat_panes
+                        .find(node.id)
+                        .select(model::ClaudeChatPane::as_select())
+                        .first(conn)?;
+                    LeafContents::ClaudeChat(crate::app_state::ClaudeChatPaneSnapshot {
+                        session_id: pane.session_id,
+                        cwd: PathBuf::from(pane.cwd),
+                        draft: None,
+                        artifact_kind: None,
+                    })
+                }
                 AI_DOCUMENT_PANE_KIND => {
                     let ai_document_pane = schema::ai_document_panes::dsl::ai_document_panes
                         .find(node.id)

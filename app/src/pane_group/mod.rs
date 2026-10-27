@@ -192,6 +192,8 @@ mod tests;
 
 pub use pane::ai_document_pane::AIDocumentPane;
 pub use pane::ai_fact_pane::AIFactPane;
+pub use pane::artifacts_pane::ArtifactsPane;
+pub use pane::claude_chat_pane::ClaudeChatPane;
 pub use pane::code_diff_pane::CodeDiffPane;
 pub use pane::code_pane::CodePane;
 pub use pane::custom_router_editor_pane::CustomRouterEditorPane;
@@ -2023,6 +2025,28 @@ impl PaneGroup {
                     Ok((PaneData::new(pane_id), focus))
                 }
             }
+            LeafContents::ClaudeChat(snapshot) => {
+                let pane: Box<dyn AnyPaneContent + 'static> =
+                    Box::new(ClaudeChatPane::new(snapshot.clone(), ctx));
+                let pane_id = pane.as_pane().id();
+                pane_contents.insert(pane_id, pane);
+                let focus = InitialFocus {
+                    focused_pane: leaf.is_focused.then_some(pane_id),
+                    active_session: None,
+                };
+                Ok((PaneData::new(pane_id), focus))
+            }
+            LeafContents::Artifacts => {
+                let pane: Box<dyn AnyPaneContent + 'static> =
+                    Box::new(ArtifactsPane::new(None, ctx));
+                let pane_id = pane.as_pane().id();
+                pane_contents.insert(pane_id, pane);
+                let focus = InitialFocus {
+                    focused_pane: leaf.is_focused.then_some(pane_id),
+                    active_session: None,
+                };
+                Ok((PaneData::new(pane_id), focus))
+            }
             LeafContents::EnvironmentManagement(_) => {
                 // Environment management panes are not restored from persistence.
                 // They are opened on-demand via workspace actions.
@@ -3081,8 +3105,15 @@ impl PaneGroup {
         });
 
         let in_split_pane = pane_data.visible_pane_count() > 1;
-        let focus_state = ctx.add_model(|_| {
-            focus_state::PaneGroupFocusState::new(focused_pane, active_session_id, in_split_pane)
+        let docked = pane_data.panes_docked_below(is_editor_pane);
+        let focus_state = ctx.add_model(|ctx| {
+            let mut focus_state = focus_state::PaneGroupFocusState::new(
+                focused_pane,
+                active_session_id,
+                in_split_pane,
+            );
+            focus_state.set_docked_below_editor(docked, ctx);
+            focus_state
         });
         ctx.subscribe_to_model(&focus_state, |me, _, event, ctx| {
             me.handle_focus_state_event(event, ctx);
@@ -3894,8 +3925,9 @@ impl PaneGroup {
                 ctx.emit(Event::ActiveSessionChanged);
                 ctx.notify();
             }
-            PaneGroupFocusEvent::InSplitPaneChanged => ctx.notify(),
-            PaneGroupFocusEvent::FocusedPaneMaximizedChanged => ctx.notify(),
+            PaneGroupFocusEvent::InSplitPaneChanged
+            | PaneGroupFocusEvent::FocusedPaneMaximizedChanged
+            | PaneGroupFocusEvent::DockedPanesChanged => ctx.notify(),
         }
     }
 
@@ -3955,18 +3987,6 @@ impl PaneGroup {
         );
         ctx.emit(Event::AppStateChanged);
         new_pane_id
-    }
-
-    /// Splits `base_pane_id` with a new terminal pane on its `direction` side
-    /// (e.g. to open a Claude thread dropped from the Threads panel there).
-    pub(crate) fn split_terminal_pane_from(
-        &mut self,
-        base_pane_id: PaneId,
-        direction: Direction,
-        ctx: &mut ViewContext<Self>,
-    ) -> Option<ViewHandle<TerminalView>> {
-        let new_pane_id = self.insert_terminal_pane(direction, base_pane_id, None, ctx);
-        self.terminal_view_from_pane_id(new_pane_id, ctx)
     }
 
     /// Used when splitting panes.
@@ -4412,6 +4432,7 @@ impl PaneGroup {
                 focus_state.set_focused_pane_maximized(false, ctx);
             }
         });
+        self.sync_docked_panes(ctx);
 
         ctx.notify();
         ctx.emit(Event::TerminalViewStateChanged);
@@ -5500,6 +5521,7 @@ impl PaneGroup {
         if terminals.contains(&focused) {
             self.focus_pane(editor, true, ctx);
         }
+        self.handle_pane_count_change(ctx);
         ctx.notify();
         ctx.emit(Event::TerminalViewStateChanged);
         ctx.emit(Event::AppStateChanged);
@@ -5512,6 +5534,7 @@ impl PaneGroup {
         if stowed.is_empty() {
             return false;
         }
+        self.handle_pane_count_change(ctx);
         ctx.notify();
         ctx.emit(Event::TerminalViewStateChanged);
         ctx.emit(Event::AppStateChanged);
@@ -6261,6 +6284,16 @@ impl PaneGroup {
         self.focus_state.update(ctx, |focus_state, ctx| {
             focus_state.set_in_split_pane(in_split_pane, ctx);
         });
+        self.sync_docked_panes(ctx);
+    }
+
+    /// Tells panes whether they sit under an editor (see
+    /// [`focus_state::PaneFocusHandle::is_docked_below_editor`]).
+    fn sync_docked_panes(&mut self, ctx: &mut ViewContext<Self>) {
+        let docked = self.panes.panes_docked_below(is_editor_pane);
+        self.focus_state.update(ctx, |focus_state, ctx| {
+            focus_state.set_docked_below_editor(docked, ctx);
+        });
     }
 
     // Instantiate the terminal view with the given parameters. Note that the active
@@ -6807,8 +6840,10 @@ impl PaneGroup {
             let ignore_custom_startup_directory =
                 self.should_ignore_custom_startup_directory(&chosen_shell, ctx);
 
-            let initial_directory_from_current_session =
-                self.startup_path_for_new_session(base_pane_id_for_context, ctx);
+            // A split of a native chat opens in the chat's folder, like a split of a terminal does.
+            let initial_directory_from_current_session = base_pane_id_for_split
+                .and_then(|pane_id| self.claude_chat_cwd(pane_id, ctx))
+                .or_else(|| self.startup_path_for_new_session(base_pane_id_for_context, ctx));
 
             SessionSettings::handle(ctx).read(ctx, |settings, _ctx| {
                 settings
@@ -7117,6 +7152,13 @@ impl PaneGroup {
     /// This returns the active (parent) session's current directory if the active session is local
     /// (not an SSH session) and if the active session is done bootstrapping. Else, it returns the
     /// the current session's startup directory.
+    /// The folder Claude runs in, when `pane_id` is a native chat.
+    fn claude_chat_cwd(&self, pane_id: PaneId, ctx: &AppContext) -> Option<PathBuf> {
+        let pane = self.downcast_pane_by_id::<ClaudeChatPane>(pane_id)?;
+        let session = pane.backing_view(ctx).as_ref(ctx).session().clone();
+        Some(session.as_ref(ctx).cwd().to_path_buf())
+    }
+
     pub fn startup_path_for_new_session(
         &self,
         base_pane_id: Option<TerminalPaneId>,
@@ -7662,6 +7704,7 @@ impl PaneGroup {
                 focus_state.set_focused_pane_maximized(false, ctx);
             }
         });
+        self.sync_docked_panes(ctx);
 
         if let Some(child_terminal_view) = self.terminal_view_from_pane_id(child_pane_id, ctx) {
             child_terminal_view.update(ctx, |view, ctx| {

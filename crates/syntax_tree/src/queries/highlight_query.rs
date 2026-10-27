@@ -43,6 +43,11 @@ impl HighlightQuery {
         Self { highlight_map }
     }
 
+    /// The color for the query's capture at `index`, if it has one.
+    pub(crate) fn color_for_capture(&self, index: u32) -> Option<ColorU> {
+        self.highlight_map.get(index as usize).copied().flatten()
+    }
+
     /// Given the a character range, return its corresponding highlight colors.
     pub fn get_highlighted_chunks(
         &self,

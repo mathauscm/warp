@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+#
+# Quick iteration loop for Picolas Code: builds the debug app (incremental, no bundle or DMG) and
+# relaunches it next to the installed app. The dev app keeps its data apart (WARP_DATA_PROFILE),
+# seeded once from the installed app's projects, threads and settings.
+#
+# Usage:
+#   ./script/picolas-dev          build and (re)launch
+#   ./script/picolas-dev --stop   quit the dev app
+#   ./script/picolas-dev --log    follow the dev app's log
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")"/.. && pwd)"
+cd "$REPO_ROOT"
+
+PROFILE="${WARP_DATA_PROFILE:-teste}"
+PID_FILE="target/picolas-dev.pid"
+LOG_FILE="target/picolas-dev.log"
+INSTALLED_DATA_DIR="$HOME/.warp-oss"
+DEV_DATA_DIR="$HOME/.warp-oss-$PROFILE"
+SEEDED_FILES=(claude_threads.toml project_manager.toml projects.json settings.toml keybindings.yaml)
+
+stop_dev_app() {
+  if [[ -f "$PID_FILE" ]]; then
+    local pid
+    pid="$(cat "$PID_FILE")"
+    if kill -0 "$pid" 2>/dev/null; then
+      kill "$pid"
+      for _ in $(seq 1 50); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+      done
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$PID_FILE"
+  fi
+}
+
+case "${1:-}" in
+  --stop)
+    stop_dev_app
+    exit 0
+    ;;
+  --log)
+    exec tail -f "$LOG_FILE"
+    ;;
+esac
+
+CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}" cargo build --bin warp-oss --features gui
+
+mkdir -p "$DEV_DATA_DIR"
+for file in "${SEEDED_FILES[@]}"; do
+  if [[ ! -e "$DEV_DATA_DIR/$file" && -e "$INSTALLED_DATA_DIR/$file" ]]; then
+    cp "$INSTALLED_DATA_DIR/$file" "$DEV_DATA_DIR/$file"
+  fi
+done
+
+stop_dev_app
+WARP_DATA_PROFILE="$PROFILE" nohup target/debug/warp-oss >"$LOG_FILE" 2>&1 &
+echo $! >"$PID_FILE"
+echo "Picolas Code (dev) is running; log: $LOG_FILE"

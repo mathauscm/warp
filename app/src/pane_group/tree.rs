@@ -551,6 +551,18 @@ impl PaneData {
             .collect()
     }
 
+    /// The visible panes stacked under a visible pane matching `is_anchor` (an editor), like a
+    /// terminal docked below code.
+    pub fn panes_docked_below(&self, is_anchor: impl Fn(PaneId) -> bool) -> HashSet<PaneId> {
+        let is_shown_anchor =
+            |pane_id: PaneId| is_anchor(pane_id) && !self.is_pane_hidden(&pane_id);
+        let mut docked = HashSet::new();
+        self.root
+            .collect_docked_below(&is_shown_anchor, &mut docked);
+        docked.retain(|pane_id| !self.is_pane_hidden(pane_id) && !is_anchor(*pane_id));
+        docked
+    }
+
     /// Returns true if the given pane is hidden for any reason.
     pub fn is_pane_hidden(&self, pane_id: &PaneId) -> bool {
         self.hidden_panes
@@ -773,6 +785,26 @@ impl PaneNode {
         match self {
             PaneNode::Leaf(pane) => vec![*pane],
             PaneNode::Branch(branch) => branch.get_children(),
+        }
+    }
+
+    /// Adds to `docked` every pane of a column that sits under a node holding an anchor.
+    fn collect_docked_below(
+        &self,
+        is_anchor: &dyn Fn(PaneId) -> bool,
+        docked: &mut HashSet<PaneId>,
+    ) {
+        let PaneNode::Branch(branch) = self else {
+            return;
+        };
+        let mut anchor_above = false;
+        for (_, node) in &branch.nodes {
+            if anchor_above && matches!(branch.axis, SplitDirection::Vertical) {
+                docked.extend(node.pane_ids());
+            } else {
+                node.collect_docked_below(is_anchor, docked);
+            }
+            anchor_above |= node.pane_ids().into_iter().any(is_anchor);
         }
     }
 

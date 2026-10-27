@@ -87,6 +87,7 @@ impl EditorAndCodeReviewPageView {
             Box::new(ProjectExplorerToggleWidget::default()),
             Box::new(GlobalSearchToggleWidget::default()),
             Box::new(ShowHiddenFilesToggleWidget::default()),
+            Box::new(LspSuggestionsToggleWidget::default()),
             Box::new(FormatOnSaveToggleWidget::default()),
             Box::new(AutoSaveToggleWidget::default()),
         ]);
@@ -153,6 +154,7 @@ pub enum EditorAndCodeReviewPageAction {
     ToggleProjectExplorer,
     ToggleGlobalSearch,
     ToggleShowHiddenFiles,
+    ToggleShowLspSuggestions,
     ToggleFormatOnSave,
     ToggleAutoSave,
     SetCodeEditorLineNumberMode(CodeEditorLineNumberMode),
@@ -188,6 +190,12 @@ impl TypedActionView for EditorAndCodeReviewPageView {
             EditorAndCodeReviewPageAction::ToggleGlobalSearch => {
                 CodeSettings::handle(ctx).update(ctx, |settings, ctx| {
                     report_if_error!(settings.show_global_search.toggle_and_save_value(ctx));
+                });
+                ctx.notify();
+            }
+            EditorAndCodeReviewPageAction::ToggleShowLspSuggestions => {
+                CodeSettings::handle(ctx).update(ctx, |settings, ctx| {
+                    report_if_error!(settings.show_lsp_suggestions.toggle_and_save_value(ctx));
                 });
                 ctx.notify();
             }
@@ -325,6 +333,14 @@ pub fn init_actions_from_parent_view<T: Action + Clone>(
                 )),
                 context,
                 flags::SHOW_GLOBAL_SEARCH,
+            ),
+            ToggleSettingActionPair::new(
+                "language support suggestions in the editor",
+                builder(SettingsAction::EditorAndCodeReview(
+                    EditorAndCodeReviewPageAction::ToggleShowLspSuggestions,
+                )),
+                context,
+                flags::SHOW_LSP_SUGGESTIONS,
             ),
             ToggleSettingActionPair::new(
                 "show hidden files in project explorer",
@@ -610,6 +626,50 @@ impl SettingsWidget for ShowHiddenFilesToggleWidget {
                 .finish(),
             Some(
                 "Show dotfiles and hidden files (starting with .) in the project explorer.".into(),
+            ),
+        )
+    }
+}
+
+#[derive(Default)]
+struct LspSuggestionsToggleWidget {
+    switch_state: SwitchStateHandle,
+}
+
+impl SettingsWidget for LspSuggestionsToggleWidget {
+    type View = EditorAndCodeReviewPageView;
+
+    fn search_terms(&self) -> &str {
+        "language support server lsp suggestion footer enable typescript sugestão linguagem"
+    }
+
+    fn render(
+        &self,
+        _view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        render_body_item::<EditorAndCodeReviewPageAction>(
+            "Sugerir suporte de linguagem no editor".into(),
+            None,
+            LocalOnlyIconState::Hidden,
+            ToggleState::Enabled,
+            appearance,
+            appearance
+                .ui_builder()
+                .switch(self.switch_state.clone())
+                .check(*CodeSettings::as_ref(app).show_lsp_suggestions)
+                .build()
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(
+                        EditorAndCodeReviewPageAction::ToggleShowLspSuggestions,
+                    );
+                })
+                .finish(),
+            Some(
+                "Mostra no rodapé do editor a sugestão de ativar o servidor de linguagem \
+                 (autocompletar, ir para definição, erros). O × na própria barra desliga."
+                    .into(),
             ),
         )
     }

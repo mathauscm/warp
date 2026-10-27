@@ -14,8 +14,13 @@ use pathfinder_geometry::vector::{Vector2F, vec2f};
 use sum_tree::SumTree;
 
 use super::new_scrollable::{NewScrollableElement, ScrollableAxis};
-use super::{AppContext, Axis, Element, ScrollData, ScrollableElement, SizeConstraint};
+use super::{
+    AppContext, Axis, Element, ScrollData, ScrollableElement, SelectableElement, Selection,
+    SelectionFragment, SizeConstraint, SmartSelectFn,
+};
 use crate::ClipBounds;
+use crate::text::word_boundaries::WordBoundariesPolicy;
+use crate::text::{IsRect, SelectionDirection, SelectionType};
 use crate::units::{IntoPixels, Pixels};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, PartialOrd)]
@@ -286,7 +291,93 @@ impl<T: 'static> List<T> {
     }
 }
 
+impl<T: 'static> SelectableElement for List<T> {
+    fn get_selection(
+        &self,
+        selection_start: Vector2F,
+        selection_end: Vector2F,
+        is_rect: IsRect,
+    ) -> Option<Vec<SelectionFragment>> {
+        let mut fragments: Vec<SelectionFragment> = Vec::new();
+        for child in &self.children {
+            let Some(child_fragments) = child
+                .as_selectable_element()
+                .and_then(|child| child.get_selection(selection_start, selection_end, is_rect))
+            else {
+                continue;
+            };
+            // The items are stacked vertically, like the lines of a vertical Flex.
+            if let Some(last) = fragments.last() {
+                fragments.push(SelectionFragment {
+                    text: "\n".to_owned(),
+                    origin: last.origin,
+                });
+            }
+            fragments.extend(child_fragments);
+        }
+        (!fragments.is_empty()).then_some(fragments)
+    }
+
+    fn expand_selection(
+        &self,
+        point: Vector2F,
+        direction: SelectionDirection,
+        unit: SelectionType,
+        word_boundaries_policy: &WordBoundariesPolicy,
+    ) -> Option<Vector2F> {
+        let mut expanded = None;
+        for child in &self.children {
+            let Some(selection) = child.as_selectable_element().and_then(|child| {
+                child.expand_selection(point, direction, unit, word_boundaries_policy)
+            }) else {
+                continue;
+            };
+            match direction {
+                SelectionDirection::Backward => return Some(selection),
+                SelectionDirection::Forward => expanded = Some(selection),
+            }
+        }
+        expanded
+    }
+
+    fn is_point_semantically_before(
+        &self,
+        absolute_point: Vector2F,
+        absolute_point_other: Vector2F,
+    ) -> Option<bool> {
+        self.children.iter().find_map(|child| {
+            child
+                .as_selectable_element()?
+                .is_point_semantically_before(absolute_point, absolute_point_other)
+        })
+    }
+
+    fn smart_select(
+        &self,
+        absolute_point: Vector2F,
+        smart_select_fn: SmartSelectFn,
+    ) -> Option<(Vector2F, Vector2F)> {
+        self.children.iter().find_map(|child| {
+            child
+                .as_selectable_element()?
+                .smart_select(absolute_point, smart_select_fn)
+        })
+    }
+
+    fn calculate_clickable_bounds(&self, current_selection: Option<Selection>) -> Vec<RectF> {
+        self.children
+            .iter()
+            .filter_map(|child| child.as_selectable_element())
+            .flat_map(|child| child.calculate_clickable_bounds(current_selection))
+            .collect()
+    }
+}
+
 impl<T: 'static> Element for List<T> {
+    fn as_selectable_element(&self) -> Option<&dyn SelectableElement> {
+        Some(self as &dyn SelectableElement)
+    }
+
     fn layout(
         &mut self,
         constraint: super::SizeConstraint,

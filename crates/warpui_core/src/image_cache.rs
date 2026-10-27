@@ -582,7 +582,8 @@ fn resize_image(img: &image::RgbaImage, bounds: Vector2I, fit_type: FitType) -> 
         return img.clone();
     }
 
-    let filter = FilterType::Triangle;
+    // Catmull-Rom keeps detail when shrinking illustrations a lot, which a triangle filter blurs.
+    let filter = FilterType::CatmullRom;
     match fit_type {
         // This logic is adapted from image::DynamicImage::resize_to_fill().
         FitType::Cover => {

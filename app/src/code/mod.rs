@@ -172,3 +172,34 @@ impl DropTargetData for EditorTabBarDropTargetData {
         self
     }
 }
+
+/// `PICOLAS_OPEN_CODE=<file>` opens that file in a new tab when the first window opens, and
+/// `PICOLAS_DOCK_TERMINAL=1` then toggles the terminal panel under it (`=hidden` toggles it twice,
+/// leaving it put away). Debug builds only.
+pub fn take_dev_open_code_actions() -> Vec<crate::workspace::WorkspaceAction> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use crate::workspace::WorkspaceAction;
+
+    static TAKEN: AtomicBool = AtomicBool::new(false);
+    if !cfg!(debug_assertions) || TAKEN.swap(true, Ordering::Relaxed) {
+        return Vec::new();
+    }
+    let Ok(path) = std::env::var("PICOLAS_OPEN_CODE") else {
+        return Vec::new();
+    };
+    let mut actions = vec![WorkspaceAction::OpenFileInNewTab {
+        full_path: path.into(),
+        line_and_column: None,
+    }];
+    let toggles = match std::env::var("PICOLAS_DOCK_TERMINAL").as_deref() {
+        Ok("hidden") => 2,
+        Ok(_) => 1,
+        Err(_) => 0,
+    };
+    actions.extend(std::iter::repeat_n(
+        WorkspaceAction::ToggleTerminalPanel,
+        toggles,
+    ));
+    actions
+}

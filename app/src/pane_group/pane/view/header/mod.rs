@@ -45,6 +45,8 @@ mod sharing;
 pub(crate) mod components;
 
 pub(crate) const PANE_HEADER_HEIGHT: f32 = 34.;
+/// Height of a [`HeaderContent::Compact`] bar.
+pub(crate) const COMPACT_PANE_HEADER_HEIGHT: f32 = 26.;
 const DRAG_SPLIT_THRESHOLD: f32 = 0.18;
 
 pub trait ActionPayload: Debug + Send + Sync + Clone + 'static {}
@@ -201,6 +203,7 @@ impl<P: BackingView> PaneHeader<P> {
             |_me, _, event, ctx| match event {
                 PaneGroupFocusEvent::InSplitPaneChanged
                 | PaneGroupFocusEvent::FocusedPaneMaximizedChanged
+                | PaneGroupFocusEvent::DockedPanesChanged
                 | PaneGroupFocusEvent::FocusChanged { .. } => ctx.notify(),
                 PaneGroupFocusEvent::ActiveSessionChanged { .. } => {}
             },
@@ -780,10 +783,12 @@ impl<P: BackingView> View for PaneHeader<P> {
             .as_ref(app)
             .render_header_content(&header_ctx, app);
 
+        // A compact bar is too slim for the corner triangle, which would cover its title.
         let show_active_pane_indicator = self
             .pane_configuration
             .as_ref(app)
-            .show_active_pane_indicator;
+            .show_active_pane_indicator
+            && !matches!(header_content, HeaderContent::Compact { .. });
 
         let should_wrap_with_draggable = !matches!(
             header_content,
@@ -803,6 +808,12 @@ impl<P: BackingView> View for PaneHeader<P> {
             HeaderContent::Custom { element, .. } => Clipped::new(
                 ConstrainedBox::new(element)
                     .with_height(PANE_HEADER_HEIGHT)
+                    .finish(),
+            )
+            .finish(),
+            HeaderContent::Compact { element } => Clipped::new(
+                ConstrainedBox::new(element)
+                    .with_height(COMPACT_PANE_HEADER_HEIGHT)
                     .finish(),
             )
             .finish(),

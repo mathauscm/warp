@@ -10,6 +10,8 @@
 //! used to render a [`PaneView`] which internally renders the pane, including the [`BackingView`].
 pub(super) mod ai_document_pane;
 pub(super) mod ai_fact_pane;
+pub(super) mod artifacts_pane;
+pub(super) mod claude_chat_pane;
 pub(super) mod code_diff_pane;
 pub(super) mod code_diff_pane_model;
 pub(super) mod code_pane;
@@ -54,6 +56,8 @@ use crate::code::view::CodeView;
 use crate::drive::sharing::ShareableObject;
 use crate::env_vars::view::env_var_collection::EnvVarCollectionView;
 use crate::menu::MenuItem;
+use crate::native_chat::ClaudeChatView;
+use crate::native_chat::artifacts_view::ArtifactsView;
 use crate::notebooks::file::FileNotebookView;
 use crate::notebooks::notebook::NotebookView;
 use crate::pane_group::focus_state::PaneFocusHandle;
@@ -146,6 +150,8 @@ pub(crate) enum IPaneType {
     ExecutionProfileEditor,
     GetStarted,
     NetworkLog,
+    ClaudeChat,
+    Artifacts,
     DeferredPlaceholder,
     /// A pane type only for tests.
     #[cfg(test)]
@@ -170,6 +176,8 @@ impl Display for IPaneType {
             IPaneType::ExecutionProfileEditor => write!(f, "Execution Profile Editor"),
             IPaneType::GetStarted => write!(f, "GetStarted"),
             IPaneType::NetworkLog => write!(f, "Network Log"),
+            IPaneType::ClaudeChat => write!(f, "Claude Chat"),
+            IPaneType::Artifacts => write!(f, "Artifacts"),
             IPaneType::DeferredPlaceholder => write!(f, "Placeholder"),
             #[cfg(test)]
             IPaneType::Dummy => write!(f, "Dummy"),
@@ -274,6 +282,14 @@ impl PaneId {
         Self::new_from_ctx(IPaneType::NetworkLog, ctx)
     }
 
+    pub fn from_claude_chat_pane_ctx(ctx: &ViewContext<PaneView<ClaudeChatView>>) -> Self {
+        Self::new_from_ctx(IPaneType::ClaudeChat, ctx)
+    }
+
+    pub fn from_artifacts_pane_ctx(ctx: &ViewContext<PaneView<ArtifactsView>>) -> Self {
+        Self::new_from_ctx(IPaneType::Artifacts, ctx)
+    }
+
     /// Creates a [`PaneId`] from a [`PaneView<TerminalView>`] entity ID.
     pub fn from_terminal_pane_view(
         terminal_pane_view: &ViewHandle<terminal_pane::TerminalPaneView>,
@@ -376,6 +392,14 @@ impl PaneId {
         network_log_pane_view: &ViewHandle<PaneView<NetworkLogView>>,
     ) -> Self {
         Self::new(IPaneType::NetworkLog, network_log_pane_view)
+    }
+
+    pub fn from_claude_chat_pane_view(pane_view: &ViewHandle<PaneView<ClaudeChatView>>) -> Self {
+        Self::new(IPaneType::ClaudeChat, pane_view)
+    }
+
+    pub fn from_artifacts_pane_view(pane_view: &ViewHandle<PaneView<ArtifactsView>>) -> Self {
+        Self::new(IPaneType::Artifacts, pane_view)
     }
 
     #[cfg_attr(not(feature = "local_fs"), allow(dead_code))]
@@ -496,6 +520,12 @@ impl PaneId {
             }
             IPaneType::NetworkLog => {
                 ChildView::<PaneView<NetworkLogView>>::with_id(self.0.pane_view_id).finish()
+            }
+            IPaneType::ClaudeChat => {
+                ChildView::<PaneView<ClaudeChatView>>::with_id(self.0.pane_view_id).finish()
+            }
+            IPaneType::Artifacts => {
+                ChildView::<PaneView<ArtifactsView>>::with_id(self.0.pane_view_id).finish()
             }
             IPaneType::DeferredPlaceholder => warpui::elements::Empty::new().finish(),
             #[cfg(test)]

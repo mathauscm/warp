@@ -36,6 +36,7 @@ asset_cache = { path = "crates/asset_cache" }
 asset_macro = { path = "crates/asset_macro" }
 build_cache = { path = "crates/build_cache" }
 channel_versions = { path = "crates/channel_versions", default-features = false }
+claude_chat = { path = "crates/claude_chat" }
 command = { path = "crates/command" }
 cloud_objects = { path = "crates/cloud_objects" }
 cloud_object_client = { path = "crates/cloud_object_client" }
@@ -62,6 +63,7 @@ natural_language_detection = { path = "crates/natural_language_detection" }
 node_runtime = { path = "crates/node_runtime" }
 onboarding = { path = "crates/onboarding" }
 persistence = { path = "crates/persistence" }
+picolas_webview = { path = "crates/picolas_webview" }
 prevent_sleep = { path = "crates/prevent_sleep" }
 regex_dfas = { path = "crates/regex_dfas" }
 remote_server = { path = "crates/remote_server" }
@@ -231,6 +233,7 @@ objc2-core-graphics = "0.3.2"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std"] }
 objc2-metal = { version = "0.3.2", default-features = false }
 objc2-quartz-core = { version = "0.3.2", default-features = false }
+objc2-web-kit = { version = "0.3.2", default-features = false }
 dispatch2 = { version = "0.3.0", default-features = false, features = ["std", "block2"] }
 once_cell = "1.20.2"
 ordered-float = { version = "3.0.0", features = ["serde"] }

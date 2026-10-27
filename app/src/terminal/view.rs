@@ -2746,6 +2746,8 @@ pub struct TerminalView {
     claude_close_button_mouse_state: MouseStateHandle,
     /// What the "Mencionar" pill would send to Claude, while it shows; see `claude_mention`.
     claude_mention: Option<claude_mention::ClaudeMention>,
+    /// The "×" of the slim bar shown while docked under an editor.
+    docked_close_mouse_state: MouseStateHandle,
     /// A left-button drag being forwarded to Claude, which may select and copy text.
     claude_drag: Option<claude_mention::ClaudeDrag>,
     claude_mention_button_mouse_state: MouseStateHandle,
@@ -4484,6 +4486,7 @@ impl TerminalView {
             hidden_pending_command: None,
             claude_close_button_mouse_state: Default::default(),
             claude_mention: None,
+            docked_close_mouse_state: Default::default(),
             claude_drag: None,
             claude_mention_button_mouse_state: Default::default(),
             claude_composer,

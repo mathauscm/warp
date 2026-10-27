@@ -127,6 +127,10 @@ pub enum HeaderContent {
         /// part of the header (the empty space) should be draggable.
         has_custom_draggable_behavior: bool,
     },
+
+    /// A slim bar, like the panel tabs of an editor, for panes docked under another one. The
+    /// framework wraps it with draggable behavior.
+    Compact { element: Box<dyn Element> },
 }
 
 impl HeaderContent {
