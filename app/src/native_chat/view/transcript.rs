@@ -15,6 +15,7 @@ use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use base64::Engine as _;
@@ -36,25 +37,30 @@ use warpui::elements::shimmering_text::{
     ShimmerConfig, ShimmeringTextElement, ShimmeringTextStateHandle,
 };
 use warpui::elements::{
-    Align, Border, ChildAnchor, ClippedScrollStateHandle, ConstrainedBox, Container, CornerRadius,
-    CrossAxisAlignment, DispatchEventResult, DropShadow, Empty, EventHandler, Fill, Flex,
-    Hoverable, Image, ListState, MainAxisSize, MouseStateHandle, NewScrollable, OffsetPositioning,
-    ParentAnchor, ParentElement, ParentOffsetBounds, Radius, SavePosition, ScrollStateHandle,
-    ScrollbarWidth, SelectableArea, SelectionHandle, Stack, Text,
+    Align, Border, ChildAnchor, ChildView, ClippedScrollStateHandle, ConstrainedBox, Container,
+    CornerRadius, CrossAxisAlignment, DispatchEventResult, DropShadow, Empty, EventHandler, Fill,
+    Flex, Hoverable, Image, ListState, MainAxisSize, MouseStateHandle, NewScrollable,
+    OffsetPositioning, ParentAnchor, ParentElement, ParentOffsetBounds, Radius, SavePosition,
+    ScrollStateHandle, ScrollbarWidth, SelectableArea, SelectionDragEnd, SelectionHandle, Stack,
+    Text,
 };
 use warpui::fonts::{FamilyId, Properties, Weight};
 use warpui::image_cache::{CacheOption, ImageType};
+use warpui::keymap::FixedBinding;
 use warpui::platform::Cursor;
+use warpui::units::IntoPixels;
 use warpui::{
     AppContext, Element, Entity, ModelHandle, SingletonEntity, TypedActionView, View, ViewContext,
-    WeakViewHandle,
+    ViewHandle, WeakViewHandle,
 };
 
 use self::markdown::Block;
 use self::render::{RowContext, Style, icon};
-use self::viewport::{Viewport, ViewportState};
+use self::viewport::{ScrollFollow, Viewport, ViewportState};
+use crate::menu::{Event as MenuEvent, Menu, MenuItem, MenuItemFields};
 use crate::native_chat::design::{ChatDesign, ChatDesignEvent, Palette};
 use crate::native_chat::session::{ClaudeChatSession, ClaudeChatSessionEvent};
+use crate::util::bindings::CustomAction;
 
 /// SF Mono under the names macOS knows it by.
 const INLINE_CODE_FONTS: [&str; 3] = [".AppleSystemUIFontMonospaced", ".SF NS Mono", "SF Mono"];
@@ -64,9 +70,10 @@ const EMPTY_STATE_ICON_SIZE: f32 = 96.;
 const ICON_FOLDER: &str = "bundled/svg/picolas-folder.svg";
 const ICON_ARROW_DOWN: &str = "bundled/svg/picolas-arrow-down.svg";
 const ICON_MENTION: &str = "bundled/svg/picolas-mention.svg";
-/// Space between the last selected line and the "Mencionar" pill.
+/// Space between the line a selection's drag ended on and the "Mencionar" pill.
 const MENTION_OFFSET: f32 = 6.;
 const MENTION_HEIGHT: f32 = 26.;
+const CONTEXT_MENU_WIDTH: f32 = 200.;
 /// Space between the "↓" button and the bottom of the transcript.
 const SCROLL_BUTTON_MARGIN: f32 = 14.;
 
@@ -95,12 +102,26 @@ pub enum TranscriptAction {
     /// Opens a local file in its default app.
     OpenFile(String),
     ScrollToBottom,
-    SelectionChanged(Option<String>),
-    MouseDown,
-    /// The left button went up at this window position.
-    MouseUp(Vector2F),
+    SelectionChanged {
+        text: Option<String>,
+        /// Set when a drag that made the selection just ended.
+        ended_drag: Option<SelectionDragEnd>,
+    },
     Mention,
     CopySelection,
+    /// A right-click at this window position.
+    OpenContextMenu(Vector2F),
+    /// Copies the whole message of a top-level row.
+    CopyRow(usize),
+}
+
+/// Where a selection's drag ended, for placing the "Mencionar" pill beside it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct MentionAnchor {
+    /// The end of the drag relative to the top-left of the transcript's content, so the pill
+    /// stays with the selection as the conversation scrolls.
+    tail: Vector2F,
+    is_reversed: bool,
 }
 
 /// A code block's syntax colors, by character range.
@@ -132,12 +153,10 @@ pub struct TranscriptView {
     image_assets: HashSet<String>,
     selection_handle: SelectionHandle,
     selection: Option<String>,
-    /// Where the "Mencionar" pill goes, relative to the transcript.
-    mention_at: Option<Vector2F>,
-    is_mouse_down: bool,
-    /// Where the last drag ended, relative to the transcript, for placing the pill once the
-    /// selection is known.
-    last_mouse_up: Option<Vector2F>,
+    mention: Option<MentionAnchor>,
+    context_menu: ViewHandle<Menu<TranscriptAction>>,
+    /// Where the open context menu is, relative to the transcript.
+    context_menu_at: Option<Vector2F>,
     copied: Option<String>,
     is_ticking: bool,
     position_id: String,
@@ -150,6 +169,7 @@ pub struct TranscriptView {
 
 impl TranscriptView {
     pub fn new(session: ModelHandle<ClaudeChatSession>, ctx: &mut ViewContext<Self>) -> Self {
+        register_bindings(ctx);
         ctx.subscribe_to_model(&session, |me, _, event, ctx| {
             me.on_session_event(event, ctx)
         });
@@ -158,6 +178,19 @@ impl TranscriptView {
                 me.viewport.remeasure();
                 ctx.notify();
             }
+        });
+        let context_menu = ctx.add_typed_action_view(|_| {
+            Menu::new()
+                .prevent_interaction_with_other_elements()
+                .with_drop_shadow()
+                .with_width(CONTEXT_MENU_WIDTH)
+        });
+        ctx.subscribe_to_view(&context_menu, |me, _, event, ctx| match event {
+            MenuEvent::Close { .. } => {
+                me.context_menu_at = None;
+                ctx.notify();
+            }
+            MenuEvent::ItemSelected | MenuEvent::ItemHovered => {}
         });
         let handle: WeakViewHandle<Self> = ctx.handle();
         let list_state = ListState::new(move |index, _, app| match handle.upgrade(app) {
@@ -177,9 +210,9 @@ impl TranscriptView {
             image_assets: HashSet::new(),
             selection_handle: SelectionHandle::default(),
             selection: None,
-            mention_at: None,
-            is_mouse_down: false,
-            last_mouse_up: None,
+            mention: None,
+            context_menu,
+            context_menu_at: None,
             copied: None,
             is_ticking: false,
             inline_code_font: warpui::fonts::Cache::handle(ctx).update(ctx, |cache, _| {
@@ -540,9 +573,9 @@ impl TranscriptView {
         });
     }
 
-    fn set_mention_at(&mut self, at: Option<Vector2F>, ctx: &mut ViewContext<Self>) {
-        if self.mention_at != at {
-            self.mention_at = at;
+    fn set_mention(&mut self, mention: Option<MentionAnchor>, ctx: &mut ViewContext<Self>) {
+        if self.mention != mention {
+            self.mention = mention;
             ctx.notify();
         }
     }
@@ -552,9 +585,113 @@ impl TranscriptView {
             return;
         };
         self.selection_handle.clear();
-        self.mention_at = None;
+        self.mention = None;
         ctx.emit(TranscriptEvent::Mention(text));
         ctx.notify();
+    }
+
+    /// Opens the right-click menu at `position`, in window coordinates, leaving the selection as
+    /// it is.
+    fn open_context_menu(&mut self, position: Vector2F, ctx: &mut ViewContext<Self>) {
+        let Some(bounds) = ctx.element_position_by_id(&self.position_id) else {
+            return;
+        };
+        let mut items: Vec<MenuItem<TranscriptAction>> = Vec::new();
+        if self.selection.is_some() {
+            items.push(
+                MenuItemFields::new("Copiar")
+                    .with_key_shortcut_label(Some("⌘C"))
+                    .with_on_select_action(TranscriptAction::CopySelection)
+                    .into_item(),
+            );
+            items.push(
+                MenuItemFields::new("Mencionar")
+                    .with_key_shortcut_label(Some("⌘L"))
+                    .with_on_select_action(TranscriptAction::Mention)
+                    .into_item(),
+            );
+        }
+        if let Some(row) = self
+            .list_state
+            .item_at(position)
+            .filter(|row| self.row_copy_text(*row, ctx).is_some())
+        {
+            items.push(
+                MenuItemFields::new("Copiar mensagem")
+                    .with_on_select_action(TranscriptAction::CopyRow(row))
+                    .into_item(),
+            );
+        }
+        if items.is_empty() {
+            return;
+        }
+        self.context_menu
+            .update(ctx, |menu, ctx| menu.set_items(items, ctx));
+        self.context_menu_at = Some(position - bounds.origin());
+        ctx.notify();
+    }
+
+    /// The text of a message row, for copying it whole.
+    fn row_copy_text(&self, row: usize, app: &AppContext) -> Option<String> {
+        let items = self.session.as_ref(app).conversation().items();
+        match self.rows.get(row)? {
+            Row::UserBubble { index } => {
+                let TimelineItem::User(message) = items.get(*index)? else {
+                    return None;
+                };
+                Some(message.text.clone())
+            }
+            Row::AssistantProse { index } => {
+                let TimelineItem::Assistant(text) = items.get(*index)? else {
+                    return None;
+                };
+                Some(text.markdown.clone())
+            }
+            Row::Thinking { .. }
+            | Row::Tool { .. }
+            | Row::ToolBatch(_)
+            | Row::Notice { .. }
+            | Row::WorkGroup(_)
+            | Row::TurnError { .. } => None,
+        }
+    }
+
+    /// Copies the selected text, if any.
+    pub fn copy_selection(&mut self, ctx: &mut ViewContext<Self>) {
+        if let Some(selection) = self.selection.clone() {
+            ctx.clipboard()
+                .write(ClipboardContent::plain_text(selection));
+        }
+    }
+
+    fn on_selection_changed(
+        &mut self,
+        text: Option<String>,
+        ended_drag: Option<SelectionDragEnd>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.selection = text.filter(|text| !text.trim().is_empty());
+        if self.selection.is_none() {
+            self.set_mention(None, ctx);
+            return;
+        }
+        // A mouse-up that didn't end a drag here (a click in the composer, say) keeps the pill and
+        // the focus where they are.
+        let Some(ended_drag) = ended_drag else {
+            return;
+        };
+        if let Some(bounds) = ctx.element_position_by_id(&self.position_id) {
+            let tail = ended_drag.tail - bounds.origin() + vec2f(0., self.viewport.scroll_start());
+            self.set_mention(
+                Some(MentionAnchor {
+                    tail,
+                    is_reversed: ended_drag.is_reversed,
+                }),
+                ctx,
+            );
+        }
+        // So ⌘C and ⌘L reach the transcript's bindings.
+        ctx.focus_self();
     }
 
     // --- Whole-view states -----------------------------------------------------------------
@@ -719,6 +856,67 @@ impl TranscriptView {
     }
 }
 
+/// Registers the transcript's key bindings the first time one is created. Binding the menu's
+/// actions, rather than handling the keys, is what makes ⌘C and ⌘L work: macOS sends them to the
+/// Edit menu before the view sees them.
+fn register_bindings(app: &mut AppContext) {
+    static REGISTERED: AtomicBool = AtomicBool::new(false);
+    if REGISTERED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    use warpui::keymap::macros::*;
+
+    let context = id!(TranscriptView::ui_name()) & !id!("IMEOpen");
+    app.register_fixed_bindings([
+        FixedBinding::custom(
+            CustomAction::Copy,
+            TranscriptAction::CopySelection,
+            "Copiar",
+            context.clone(),
+        ),
+        FixedBinding::custom(
+            CustomAction::FocusInput,
+            TranscriptAction::Mention,
+            "Mencionar seleção",
+            context,
+        ),
+    ]);
+}
+
+/// Where the "Mencionar" pill goes for a selection whose drag ended at `tail`, relative to the
+/// transcript, and which of its corners goes there: beside the line the drag ended on, on the side
+/// away from the selected text — below it when the drag went forward, above it when it went
+/// backward, or along the line when there's no room.
+fn mention_placement(
+    tail: Vector2F,
+    is_reversed: bool,
+    line_height: f32,
+    visible_height: f32,
+) -> (Vector2F, ChildAnchor) {
+    let half_line = line_height / 2.;
+    if is_reversed {
+        let above = tail.y() - half_line - MENTION_OFFSET;
+        if above - MENTION_HEIGHT >= 0. {
+            (vec2f(tail.x(), above), ChildAnchor::BottomLeft)
+        } else {
+            (
+                vec2f(tail.x() - MENTION_OFFSET, tail.y()),
+                ChildAnchor::MiddleRight,
+            )
+        }
+    } else {
+        let below = tail.y() + half_line + MENTION_OFFSET;
+        if below + MENTION_HEIGHT <= visible_height {
+            (vec2f(tail.x(), below), ChildAnchor::TopRight)
+        } else {
+            (
+                vec2f(tail.x() + MENTION_OFFSET, tail.y()),
+                ChildAnchor::MiddleLeft,
+            )
+        }
+    }
+}
+
 fn image_asset_id(message_id: &str, position: usize) -> String {
     format!("native_chat_image:{message_id}:{position}")
 }
@@ -809,39 +1007,37 @@ impl View for TranscriptView {
         // No scrollbar at all, so rows get the column's full width.
         .with_vertical_scrollbar(ScrollableAppearance::new(ScrollbarWidth::None, true))
         .finish();
+        let list_state = self.list_state.clone();
+        let viewport = self.viewport.clone();
         let selectable = SelectableArea::new(
             self.selection_handle.clone(),
             |args, ctx, _| {
-                ctx.dispatch_typed_action(TranscriptAction::SelectionChanged(args.selection))
+                ctx.dispatch_typed_action(TranscriptAction::SelectionChanged {
+                    text: args.selection,
+                    ended_drag: args.ended_drag,
+                })
             },
             scroller,
         )
+        .with_autoscroll(move |step, _| {
+            if step < 0. {
+                viewport.stick_to_bottom.set(false);
+            }
+            list_state.scroll_by(step.into_pixels());
+        })
         .finish();
+        // ⌘L also mentions from the composer, whose editor doesn't bind it.
         let events = EventHandler::new(selectable)
-            .with_always_handle()
-            .on_left_mouse_down(|ctx, _, _| {
-                ctx.dispatch_typed_action(TranscriptAction::MouseDown);
-                DispatchEventResult::PropagateToParent
-            })
-            .on_left_mouse_up(|ctx, _, position| {
-                ctx.dispatch_typed_action(TranscriptAction::MouseUp(position));
-                DispatchEventResult::PropagateToParent
+            .on_right_mouse_down(|ctx, _, position, _| {
+                ctx.dispatch_typed_action(TranscriptAction::OpenContextMenu(position));
+                DispatchEventResult::StopPropagation
             })
             .on_keydown(|ctx, _, keystroke| {
-                if !keystroke.cmd || keystroke.ctrl || keystroke.alt {
-                    return DispatchEventResult::PropagateToParent;
+                if keystroke.cmd && !keystroke.ctrl && !keystroke.alt && keystroke.key == "l" {
+                    ctx.dispatch_typed_action(TranscriptAction::Mention);
+                    return DispatchEventResult::StopPropagation;
                 }
-                match keystroke.key.as_str() {
-                    "l" => {
-                        ctx.dispatch_typed_action(TranscriptAction::Mention);
-                        DispatchEventResult::StopPropagation
-                    }
-                    "c" => {
-                        ctx.dispatch_typed_action(TranscriptAction::CopySelection);
-                        DispatchEventResult::StopPropagation
-                    }
-                    _ => DispatchEventResult::PropagateToParent,
-                }
+                DispatchEventResult::PropagateToParent
             })
             .finish();
 
@@ -857,18 +1053,42 @@ impl View for TranscriptView {
                 ),
             );
         }
-        if let Some(at) = self.mention_at.filter(|_| self.selection.is_some()) {
-            stack.add_positioned_overlay_child(
-                self.render_mention_pill(&style),
-                OffsetPositioning::offset_from_parent(
-                    // The drag ends somewhere inside the last selected line; the pill goes under it.
-                    at + vec2f(
-                        0.,
-                        style.sizes.font_size * style.sizes.line_height_ratio / 2. + MENTION_OFFSET,
+        if let Some(mention) = self.mention.filter(|_| self.selection.is_some()) {
+            let scroll_start = self.viewport.scroll_start();
+            let visible_height = self.viewport.visible_height();
+            let tail = mention.tail - vec2f(0., scroll_start);
+            // Hidden while the end of the selection is scrolled out of view.
+            if (0.0..=visible_height).contains(&tail.y()) {
+                let (offset, child_anchor) = mention_placement(
+                    tail,
+                    mention.is_reversed,
+                    style.sizes.font_size * style.sizes.line_height_ratio,
+                    visible_height,
+                );
+                stack.add_positioned_overlay_child(
+                    ScrollFollow::new(
+                        self.render_mention_pill(&style),
+                        self.viewport.clone(),
+                        scroll_start,
+                    )
+                    .finish(),
+                    OffsetPositioning::offset_from_parent(
+                        offset,
+                        ParentOffsetBounds::ParentByPosition,
+                        ParentAnchor::TopLeft,
+                        child_anchor,
                     ),
-                    ParentOffsetBounds::ParentByPosition,
+                );
+            }
+        }
+        if let Some(at) = self.context_menu_at {
+            stack.add_positioned_overlay_child(
+                ChildView::new(&self.context_menu).finish(),
+                OffsetPositioning::offset_from_parent(
+                    at,
+                    ParentOffsetBounds::WindowByPosition,
                     ParentAnchor::TopLeft,
-                    ChildAnchor::TopRight,
+                    ChildAnchor::TopLeft,
                 ),
             );
         }
@@ -898,46 +1118,15 @@ impl TypedActionView for TranscriptView {
                 self.viewport.stick_to_bottom.set(true);
                 ctx.notify();
             }
-            TranscriptAction::SelectionChanged(selection) => {
-                self.selection = selection
-                    .clone()
-                    .filter(|selection| !selection.trim().is_empty());
-                match (
-                    self.selection.is_some(),
-                    self.is_mouse_down,
-                    self.last_mouse_up,
-                ) {
-                    (false, _, _) => self.set_mention_at(None, ctx),
-                    // The selection settles after the mouse-up that ended the drag.
-                    (true, false, Some(at)) => {
-                        ctx.focus_self();
-                        self.set_mention_at(Some(at), ctx);
-                    }
-                    (true, _, _) => {}
-                }
-            }
-            TranscriptAction::MouseDown => {
-                self.is_mouse_down = true;
-                self.last_mouse_up = None;
-                self.set_mention_at(None, ctx);
-            }
-            TranscriptAction::MouseUp(position) => {
-                self.is_mouse_down = false;
-                let Some(bounds) = ctx.element_position_by_id(&self.position_id) else {
-                    return;
-                };
-                let at = *position - bounds.origin();
-                self.last_mouse_up = Some(at);
-                if self.selection.is_some() {
-                    ctx.focus_self();
-                    self.set_mention_at(Some(at), ctx);
-                }
+            TranscriptAction::SelectionChanged { text, ended_drag } => {
+                self.on_selection_changed(text.clone(), *ended_drag, ctx);
             }
             TranscriptAction::Mention => self.mention_selection(ctx),
-            TranscriptAction::CopySelection => {
-                if let Some(selection) = self.selection.clone() {
-                    ctx.clipboard()
-                        .write(ClipboardContent::plain_text(selection));
+            TranscriptAction::CopySelection => self.copy_selection(ctx),
+            TranscriptAction::OpenContextMenu(position) => self.open_context_menu(*position, ctx),
+            TranscriptAction::CopyRow(row) => {
+                if let Some(text) = self.row_copy_text(*row, ctx) {
+                    ctx.clipboard().write(ClipboardContent::plain_text(text));
                 }
             }
         }

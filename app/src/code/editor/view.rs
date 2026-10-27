@@ -1013,6 +1013,14 @@ impl CodeEditorView {
         self
     }
 
+    /// Scrolls without drawing scrollbars, as the full-size editor does next to its minimap.
+    pub(crate) fn with_hidden_scrollbars(mut self) -> Self {
+        let hidden = ScrollableAppearance::new(warpui::elements::ScrollbarWidth::None, true);
+        self.display_options.horizontal_scrollbar_appearance = hidden;
+        self.display_options.vertical_scrollbar_appearance = hidden;
+        self
+    }
+
     pub(crate) fn starting_line_number(&self) -> Option<usize> {
         self.display_options.starting_line_number
     }

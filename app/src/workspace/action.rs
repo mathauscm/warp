@@ -862,7 +862,8 @@ pub enum WorkspaceAction {
         /// name yet (e.g. the project folder of a Claude thread).
         group: Option<String>,
     },
-    /// Open a native Claude chat in a new tab, or focus the tab already showing the conversation.
+    /// Open a native Claude chat: focus the pane already showing the conversation, show it in the
+    /// most recent chat tab that holds nothing unsaved, or open a new tab.
     OpenClaudeChat {
         cwd: PathBuf,
         /// The conversation to resume; `None` starts a new one.
@@ -871,7 +872,7 @@ pub enum WorkspaceAction {
         draft: Option<String>,
         /// The kind of artifact (`ArtifactKind::as_str`) the first message asks for.
         artifact_kind: Option<String>,
-        /// Tab group to put the new tab in, like the thread's project.
+        /// Tab group to put the chat's tab in, like the thread's project.
         group: Option<String>,
     },
     /// Open the gallery of local artifacts, or an artifact in it.
@@ -913,6 +914,11 @@ pub enum WorkspaceAction {
     /// Closes the pane running a Claude thread that is being deleted, in whichever window holds it.
     CloseClaudeThreadPane {
         terminal_view_id: EntityId,
+    },
+    /// Closes the native chat showing a conversation, in whichever window holds it, ending its
+    /// Claude process.
+    CloseClaudeChat {
+        session_id: String,
     },
     /// Open a file in the code editor, split to the right of the active pane
     /// (so it gets a close button even while the tab list is hidden).
@@ -1195,6 +1201,7 @@ impl WorkspaceAction {
             | DragClaudeThread { .. }
             | DropClaudeThread { .. }
             | CloseClaudeThreadPane { .. }
+            | CloseClaudeChat { .. }
             | OpenFileInSplitPane { .. }
             | OpenWorktreeAddRepoPicker
             | Crash

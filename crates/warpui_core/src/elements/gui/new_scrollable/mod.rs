@@ -12,8 +12,8 @@ pub use single_axis_config::*;
 
 use self::util::adjust_scroll_delta_with_sensitivity_config;
 use super::{
-    Axis, ClippedScrollStateHandle, CornerRadius, F32Ext, Fill, Point, Radius, ScrollData,
-    ScrollbarWidth, SelectableElement, SelectionFragment, ZIndex, scrollbar_size,
+    Axis, ClippedScrollStateHandle, ContentAnchor, CornerRadius, F32Ext, Fill, Point, Radius,
+    ScrollData, ScrollbarWidth, SelectableElement, SelectionFragment, ZIndex, scrollbar_size,
 };
 use crate::elements::Vector2FExt;
 use crate::event::{DispatchedEvent, ModifiersState};
@@ -272,6 +272,29 @@ impl ScrollableState {
         match self {
             Self::BothAxes { config, .. } => config.child_as_selectable_element(),
             Self::SingleAxis { config, .. } => config.child_as_selectable_element(),
+        }
+    }
+
+    /// The child, when it scrolls its own content; a clipped child is shifted by the scrollable,
+    /// which already keeps selections on their content.
+    fn manual_child_as_selectable_element(&self) -> Option<&dyn SelectableElement> {
+        match self {
+            Self::BothAxes {
+                config: config @ DualAxisConfig::Manual { .. },
+                ..
+            } => config.child_as_selectable_element(),
+            Self::SingleAxis {
+                config: config @ SingleAxisConfig::Manual { .. },
+                ..
+            } => config.child_as_selectable_element(),
+            Self::BothAxes {
+                config: DualAxisConfig::Clipped { .. },
+                ..
+            }
+            | Self::SingleAxis {
+                config: SingleAxisConfig::Clipped { .. },
+                ..
+            } => None,
         }
     }
 
@@ -1572,6 +1595,18 @@ impl SelectableElement for NewScrollable {
                 )
             })
             .unwrap_or_default()
+    }
+
+    fn content_anchor(&self, absolute_point: Vector2F) -> Option<ContentAnchor> {
+        self.state
+            .manual_child_as_selectable_element()?
+            .content_anchor(absolute_point)
+    }
+
+    fn content_anchor_position(&self, anchor: ContentAnchor) -> Option<Vector2F> {
+        self.state
+            .manual_child_as_selectable_element()?
+            .content_anchor_position(anchor)
     }
 }
 

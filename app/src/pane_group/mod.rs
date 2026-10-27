@@ -8209,6 +8209,18 @@ impl PaneGroup {
         })
     }
 
+    /// The folders native chats in this group run in.
+    pub fn claude_chat_paths<'a>(
+        &'a self,
+        ctx: &'a AppContext,
+    ) -> impl Iterator<Item = (EntityId, LocalOrRemotePath)> + 'a {
+        self.panes_of::<ClaudeChatPane>().map(move |pane| {
+            let view = pane.backing_view(ctx);
+            let cwd = view.as_ref(ctx).session().as_ref(ctx).cwd().to_path_buf();
+            (view.id(), LocalOrRemotePath::Local(cwd))
+        })
+    }
+
     pub fn code_diff_view_paths<'a>(
         &'a self,
         ctx: &'a AppContext,

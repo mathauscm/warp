@@ -456,6 +456,10 @@ impl PaneId {
         matches!(self.0.pane_type, IPaneType::CodeDiff)
     }
 
+    pub fn is_claude_chat_pane(&self) -> bool {
+        matches!(self.0.pane_type, IPaneType::ClaudeChat)
+    }
+
     pub fn is_environment_management_pane(&self) -> bool {
         matches!(self.0.pane_type, IPaneType::EnvironmentManagement)
     }

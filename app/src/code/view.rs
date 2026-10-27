@@ -389,12 +389,7 @@ impl CodeView {
                             ctx,
                         )
                         .with_minimap()
-                        .with_horizontal_scrollbar_appearance(
-                            warpui::elements::new_scrollable::ScrollableAppearance::new(
-                                warpui::elements::ScrollbarWidth::Auto,
-                                true,
-                            ),
-                        )
+                        .with_hidden_scrollbars()
                     })
                 },
                 false,
@@ -434,12 +429,7 @@ impl CodeView {
                 CodeEditorRenderOptions::new(VerticalExpansionBehavior::FillMaxHeight),
                 ctx,
             )
-            .with_horizontal_scrollbar_appearance(
-                warpui::elements::new_scrollable::ScrollableAppearance::new(
-                    warpui::elements::ScrollbarWidth::Auto,
-                    true,
-                ),
-            )
+            .with_hidden_scrollbars()
         });
 
         ctx.add_typed_action_view(|ctx| {

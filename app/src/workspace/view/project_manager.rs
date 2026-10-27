@@ -9,7 +9,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use pathfinder_geometry::vector::vec2f;
@@ -18,22 +18,28 @@ use warp_core::ui::theme::Fill as WarpThemeFill;
 use warp_core::ui::theme::color::internal_colors;
 use warpui::r#async::Timer;
 use warpui::elements::{
-    ChildAnchor, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox, Container,
+    ChildAnchor, ChildView, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox, Container,
     CornerRadius, CrossAxisAlignment, Element, Empty, Fill as ElementFill, Flex, Hoverable,
     MainAxisAlignment, MainAxisSize, MouseStateHandle, OffsetPositioning, Padding, ParentAnchor,
-    ParentElement, ParentOffsetBounds, Radius, ScrollbarWidth, Shrinkable, Stack, Text, Wrap,
+    ParentElement, ParentOffsetBounds, PositionedElementAnchor, PositionedElementOffsetBounds,
+    Radius, SavePosition, ScrollbarWidth, Shrinkable, Stack, Text, Wrap,
 };
-use warpui::platform::{Cursor, FilePickerConfiguration};
+use warpui::platform::{Cursor, FilePickerConfiguration, SaveFilePickerConfiguration};
 use warpui::text_layout::ClipConfig;
 use warpui::ui_components::components::{UiComponent, UiComponentStyles};
 use warpui::ui_components::text_input::TextInput;
-use warpui::{AppContext, Entity, SingletonEntity, TypedActionView, View, ViewContext, ViewHandle};
+use warpui::{
+    AppContext, Entity, SingletonEntity, TypedActionView, View, ViewContext, ViewHandle, WindowId,
+};
 
 use crate::appearance::Appearance;
 use crate::editor::{EditorView, Event as EditorEvent, SingleLineEditorOptions, TextOptions};
+use crate::menu::{Event as MenuEvent, Menu, MenuItem, MenuItemFields};
 use crate::project_manager::{self, NO_TAG_LABEL, Project, ViewPrefs};
 use crate::terminal::CLIAgent;
+use crate::view_components::DismissibleToast;
 use crate::workspace::WorkspaceAction;
+use crate::workspace::toast_stack::ToastStack;
 
 /// How often `projects.json` is checked for edits while the panel is visible.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -49,11 +55,22 @@ const ACTION_BUTTON_PADDING: f32 = 2.;
 const ICON_TEXT_GAP: f32 = 8.;
 const TITLE_FONT_SIZE: f32 = 12.;
 const META_FONT_SIZE: f32 = 10.;
+const ADD_MENU_WIDTH: f32 = 210.;
+/// Gap between the `+` button and the menu below it.
+const ADD_MENU_OFFSET: f32 = 4.;
+const ADD_BUTTON_POSITION_ID: &str = "project_manager_add_button";
+/// Where a new project folder is suggested, when it exists.
+const PROJECTS_FOLDER: &str = "projects";
+const NEW_PROJECT_FOLDER_NAME: &str = "novo-projeto";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectManagerAction {
+    /// Shows or hides the `+` menu: an existing folder or a new one.
+    ToggleAddMenu,
     /// Pick a folder in the macOS picker and save it as a project.
     AddFolder,
+    /// Name a new folder in the save panel, create it and save it as a project.
+    CreateFolder,
     /// Save the active tab's folder as a project.
     SaveActiveDirectory,
     /// Open `projects.json` in the editor.
@@ -104,6 +121,8 @@ pub struct ProjectManagerView {
     scroll_state: ClippedScrollStateHandle,
     /// Hover state of each row and button, keyed by what it belongs to.
     mouse_states: RefCell<HashMap<String, MouseStateHandle>>,
+    add_menu: ViewHandle<Menu<ProjectManagerAction>>,
+    is_add_menu_open: bool,
 }
 
 impl ProjectManagerView {
@@ -127,6 +146,20 @@ impl ProjectManagerView {
             _ => {}
         });
 
+        let add_menu = ctx.add_typed_action_view(|_| {
+            Menu::new()
+                .prevent_interaction_with_other_elements()
+                .with_drop_shadow()
+                .with_width(ADD_MENU_WIDTH)
+        });
+        ctx.subscribe_to_view(&add_menu, |me, _, event, ctx| match event {
+            MenuEvent::Close { .. } => {
+                me.is_add_menu_open = false;
+                ctx.notify();
+            }
+            MenuEvent::ItemSelected | MenuEvent::ItemHovered => {}
+        });
+
         let mut view = Self {
             projects: Vec::new(),
             load_error: None,
@@ -142,6 +175,8 @@ impl ProjectManagerView {
             editing: None,
             scroll_state: ClippedScrollStateHandle::default(),
             mouse_states: RefCell::new(HashMap::new()),
+            add_menu,
+            is_add_menu_open: false,
         };
         view.reload();
         view
@@ -165,6 +200,12 @@ impl ProjectManagerView {
     /// Saves `path` as a project, unless it's already saved, and opens the
     /// tags editor so it can be filed under a tag right away.
     pub fn add_project(&mut self, path: PathBuf, ctx: &mut ViewContext<Self>) {
+        let index = self.save_project(&path);
+        self.start_edit(index, EditField::Tags, ctx);
+    }
+
+    /// Saves `path` as a project, unless it's already saved, and returns its index.
+    fn save_project(&mut self, path: &Path) -> usize {
         let index = match self
             .projects
             .iter()
@@ -175,12 +216,12 @@ impl ProjectManagerView {
                 index
             }
             None => {
-                self.projects.push(Project::new(&path));
+                self.projects.push(Project::new(path));
                 self.projects.len() - 1
             }
         };
         self.save();
-        self.start_edit(index, EditField::Tags, ctx);
+        index
     }
 
     fn reload(&mut self) {
@@ -242,6 +283,44 @@ impl ProjectManagerView {
                 }
             },
             FilePickerConfiguration::new().folders_only(),
+        );
+    }
+
+    fn toggle_add_menu(&mut self, ctx: &mut ViewContext<Self>) {
+        self.is_add_menu_open = !self.is_add_menu_open;
+        if self.is_add_menu_open {
+            let items = add_folder_menu_items(
+                ProjectManagerAction::AddFolder,
+                ProjectManagerAction::CreateFolder,
+            );
+            self.add_menu
+                .update(ctx, |menu, ctx| menu.set_items(items, ctx));
+        }
+        ctx.notify();
+    }
+
+    /// Creates a folder named in the save panel, saves it as a project and starts a chat in it.
+    fn create_folder(&mut self, ctx: &mut ViewContext<Self>) {
+        let window_id = ctx.window_id();
+        ctx.open_save_file_picker(
+            move |path, me, ctx| {
+                let Some(path) = path.and_then(|path| create_project_folder(&path, window_id, ctx))
+                else {
+                    return;
+                };
+                // The chat takes the focus, which would cancel the tags editor right away.
+                let index = me.save_project(&path);
+                let name = me.projects[index].name.clone();
+                ctx.notify();
+                ctx.dispatch_typed_action_deferred(WorkspaceAction::OpenClaudeChat {
+                    cwd: path,
+                    session_id: None,
+                    draft: None,
+                    artifact_kind: None,
+                    group: Some(name),
+                });
+            },
+            new_project_folder_picker(),
         );
     }
 
@@ -332,6 +411,78 @@ fn projects_file_modified() -> Option<SystemTime> {
         .ok()
 }
 
+/// The `+` menu of a projects list: pick an existing folder, or create one.
+pub(super) fn add_folder_menu_items<A: warpui::Action + Clone>(
+    open_existing: A,
+    create_new: A,
+) -> Vec<MenuItem<A>> {
+    vec![
+        MenuItemFields::new("Abrir pasta existente…")
+            .with_icon(WarpIcon::Folder)
+            .with_on_select_action(open_existing)
+            .into_item(),
+        MenuItemFields::new("Nova pasta…")
+            .with_icon(WarpIcon::Plus)
+            .with_on_select_action(create_new)
+            .into_item(),
+    ]
+}
+
+/// Hangs a `+` menu below its button, right-aligned with it so it stays in the sidebar.
+pub(super) fn add_menu_positioning(button_position_id: &str) -> OffsetPositioning {
+    OffsetPositioning::offset_from_save_position_element(
+        button_position_id,
+        vec2f(0., ADD_MENU_OFFSET),
+        PositionedElementOffsetBounds::WindowByPosition,
+        PositionedElementAnchor::BottomRight,
+        ChildAnchor::TopRight,
+    )
+}
+
+/// The save panel that names a new project folder, opened in `~/projects` when there is one.
+pub(super) fn new_project_folder_picker() -> SaveFilePickerConfiguration {
+    let config = SaveFilePickerConfiguration::new()
+        .with_default_filename(NEW_PROJECT_FOLDER_NAME.to_owned());
+    match dirs::home_dir() {
+        Some(home) => config.with_default_directory(default_projects_directory(&home)),
+        None => config,
+    }
+}
+
+/// `~/projects` when it's a folder, otherwise the home folder.
+fn default_projects_directory(home: &Path) -> PathBuf {
+    let projects = home.join(PROJECTS_FOLDER);
+    if projects.is_dir() {
+        projects
+    } else {
+        home.to_path_buf()
+    }
+}
+
+/// Creates the folder picked for a new project. On failure, says why in a toast and returns
+/// `None`.
+pub(super) fn create_project_folder(
+    path: &str,
+    window_id: WindowId,
+    ctx: &mut AppContext,
+) -> Option<PathBuf> {
+    let path = PathBuf::from(path);
+    match std::fs::create_dir_all(&path) {
+        Ok(()) => Some(path),
+        Err(err) => {
+            log::warn!("Failed to create project folder: {err}");
+            let toast = DismissibleToast::error(format!(
+                "Não foi possível criar a pasta {}: {err}",
+                path.display()
+            ));
+            ToastStack::handle(ctx).update(ctx, |stack, ctx| {
+                stack.add_ephemeral_toast(toast, window_id, ctx);
+            });
+            None
+        }
+    }
+}
+
 impl Entity for ProjectManagerView {
     type Event = ();
 }
@@ -341,7 +492,9 @@ impl TypedActionView for ProjectManagerView {
 
     fn handle_action(&mut self, action: &Self::Action, ctx: &mut ViewContext<Self>) {
         match action {
+            ProjectManagerAction::ToggleAddMenu => self.toggle_add_menu(ctx),
             ProjectManagerAction::AddFolder => self.pick_folder(ctx),
+            ProjectManagerAction::CreateFolder => self.create_folder(ctx),
             ProjectManagerAction::SaveActiveDirectory => {
                 ctx.dispatch_typed_action_deferred(WorkspaceAction::SaveActiveDirectoryAsProject);
             }
@@ -554,9 +707,17 @@ impl View for ProjectManagerView {
         if self.show_tag_filter {
             panel.add_child(self.render_tag_filter(palette, appearance));
         }
-        panel
+        let panel = panel
             .with_child(Shrinkable::new(1., scrollable).finish())
-            .finish()
+            .finish();
+        let mut stack = Stack::new().with_child(panel);
+        if self.is_add_menu_open {
+            stack.add_positioned_overlay_child(
+                ChildView::new(&self.add_menu).finish(),
+                add_menu_positioning(ADD_BUTTON_POSITION_ID),
+            );
+        }
+        stack.finish()
     }
 }
 
@@ -592,7 +753,7 @@ impl ProjectManagerView {
             (
                 WarpIcon::Plus,
                 "Adicionar pasta",
-                ProjectManagerAction::AddFolder,
+                ProjectManagerAction::ToggleAddMenu,
             ),
             (
                 WarpIcon::Edit,
@@ -620,14 +781,20 @@ impl ProjectManagerView {
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_spacing(2.);
         for (index, (icon, tooltip, action)) in buttons.into_iter().enumerate() {
-            button_row.add_child(render_icon_button(
+            let is_add_button = action == ProjectManagerAction::ToggleAddMenu;
+            let button = render_icon_button(
                 icon,
                 tooltip,
                 self.mouse_state(format!("header:{index}")),
                 action,
                 palette,
                 appearance,
-            ));
+            );
+            button_row.add_child(if is_add_button {
+                SavePosition::new(button, ADD_BUTTON_POSITION_ID).finish()
+            } else {
+                button
+            });
         }
 
         Container::new(

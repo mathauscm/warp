@@ -7,14 +7,16 @@
 
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use lazy_static::lazy_static;
 use pathfinder_geometry::vector::{Vector2F, vec2f};
 use string_offset::ByteOffset;
 
 use super::{
-    AfterLayoutContext, AppContext, ColorU, Element, Event, EventContext, LayoutContext,
-    PaintContext, Point, SelectionFragment, SizeConstraint, ZIndex,
+    AfterLayoutContext, AppContext, ColorU, ContentAnchor, Element, Event, EventContext,
+    LayoutContext, PaintContext, Point, SelectableElement, SelectionFragment, SizeConstraint,
+    ZIndex,
 };
 use crate::event::{DispatchedEvent, ModifiersState};
 use crate::text::word_boundaries::WordBoundariesPolicy;
@@ -23,6 +25,14 @@ use crate::text::{IsRect, SelectionDirection, SelectionType};
 /// A function that, given some content and a double-click index offset in that content,
 /// returns the resulting smart selection range.
 pub type SmartSelectFn = fn(content: &str, click_offset: ByteOffset) -> Option<Range<ByteOffset>>;
+
+/// How often the content scrolls while a selection is dragged past an edge.
+const AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(16);
+/// How far inside an edge dragging starts scrolling.
+const AUTOSCROLL_EDGE: f32 = 6.;
+/// The slowest and fastest autoscroll, in pixels per tick.
+const AUTOSCROLL_MIN_STEP: f32 = 1.;
+const AUTOSCROLL_MAX_STEP: f32 = 60.;
 
 pub struct SelectableArea {
     child: Box<dyn Element>,
@@ -47,6 +57,8 @@ pub struct SelectableArea {
     // instead of the origin's z-index so child content that starts its own layers (e.g. a clipped
     // scrollable) isn't treated as covering this element; later-painted overlays still are.
     child_max_z_index: Option<ZIndex>,
+
+    autoscroll: Option<AutoscrollHandler>,
 }
 
 /// Stores the selection start and end points. We include the option to store
@@ -77,6 +89,8 @@ pub struct InternalSelection {
     /// The semantic selection unit.
     pub unit: SelectionType,
     pub is_selecting: bool,
+    /// Where the pointer is while a selection is dragged, in window coordinates.
+    pub pointer: Option<Vector2F>,
     /// If true, head is after tail.
     pub is_reversed: bool,
     /// Whether we should return the smart selection's start when computing the selection start.
@@ -155,22 +169,43 @@ pub enum SelectionBound {
     Top { x_bound: f32 },
     /// Start from the bottom column of the SelectableArea. The row is defined by the x_bound.
     Bottom { x_bound: f32 },
+    /// On the content of a child that scrolls its own content.
+    Anchored(ContentAnchor),
 }
 
 impl SelectionBound {
-    fn as_absolute_point(&self, size: Vector2F, origin: Vector2F) -> Vector2F {
+    fn as_absolute_point(
+        &self,
+        size: Vector2F,
+        origin: Vector2F,
+        child: Option<&dyn SelectableElement>,
+    ) -> Vector2F {
         match self {
             SelectionBound::Relative(point) => *point + origin,
             SelectionBound::TopLeft => origin,
             SelectionBound::BottomRight => origin + size,
             SelectionBound::Top { x_bound } => vec2f(*x_bound, origin.y()),
             SelectionBound::Bottom { x_bound } => vec2f(*x_bound, size.y() + origin.y()),
+            SelectionBound::Anchored(anchor) => child
+                .and_then(|child| child.content_anchor_position(*anchor))
+                .unwrap_or(origin),
         }
     }
 }
 
 pub struct SelectionUpdateArgs {
     pub selection: Option<String>,
+    /// Set when this update ends a drag that made a selection in this area.
+    pub ended_drag: Option<SelectionDragEnd>,
+}
+
+/// Where a drag that made a selection ended.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SelectionDragEnd {
+    /// The selection's tail, in window coordinates.
+    pub tail: Vector2F,
+    /// Whether the tail is before the point the drag started from.
+    pub is_reversed: bool,
 }
 
 lazy_static! {
@@ -185,6 +220,7 @@ pub struct SelectionHandle {
 pub type SelectionHandler = Box<dyn FnMut(SelectionUpdateArgs, &mut EventContext, &AppContext)>;
 type SelectionUpdatedHandler = Box<dyn FnMut(&mut EventContext, &AppContext)>;
 type SelectionRightClickHandler = Box<dyn FnMut(&mut EventContext, Vector2F)>;
+type AutoscrollHandler = Box<dyn FnMut(f32, &AppContext)>;
 
 impl SelectionHandle {
     /// This isn't meant for general use. It's used specifically in cases where a selection is started
@@ -239,7 +275,38 @@ impl SelectableArea {
             smart_select_fn: None,
             should_support_rect_select: false,
             child_max_z_index: None,
+            autoscroll: None,
         }
+    }
+
+    /// Scrolls the content while a selection is dragged past the top or bottom edge, and keeps
+    /// the selection's tail on the content under the pointer as the content scrolls, as browsers
+    /// do. The tail stays within the area, so it's always on content that's laid out.
+    /// `scroll_by` scrolls the content by the given pixels, towards its end when positive.
+    pub fn with_autoscroll<F>(self, scroll_by: F) -> Self
+    where
+        F: 'static + FnMut(f32, &AppContext),
+    {
+        Self {
+            autoscroll: Some(Box::new(scroll_by)),
+            ..self
+        }
+    }
+
+    /// Where `absolute_point` is kept in the selection state: on the content under it when the
+    /// child scrolls its own content, otherwise relative to this area.
+    fn bound_at(&self, absolute_point: Vector2F, origin: Vector2F) -> SelectionBound {
+        self.child
+            .as_selectable_element()
+            .and_then(|child| child.content_anchor(absolute_point))
+            .map_or(
+                SelectionBound::Relative(absolute_point - origin),
+                SelectionBound::Anchored,
+            )
+    }
+
+    fn absolute_point(&self, bound: SelectionBound, size: Vector2F, origin: Vector2F) -> Vector2F {
+        bound.as_absolute_point(size, origin, self.child.as_selectable_element())
     }
 
     pub fn should_support_rect_select(mut self) -> Self {
@@ -326,8 +393,9 @@ impl SelectableArea {
             SelectionType::Lines
         };
         selection_state.unit = unit;
-        selection_state.head = Some(SelectionBound::Relative(position - origin.xy));
-        selection_state.tail = Some(SelectionBound::Relative(position - origin.xy));
+        selection_state.head = Some(self.bound_at(position, origin.xy));
+        selection_state.tail = Some(self.bound_at(position, origin.xy));
+        selection_state.pointer = Some(position);
 
         // First, try smart selection if it's configured and this is a double click.
         let smart_select_range = match (unit, self.smart_select_fn) {
@@ -341,8 +409,8 @@ impl SelectableArea {
             // If smart_select_range is set, use that as expanded head / tail.
             Some((start, end)) => {
                 selection_state.initial_smart_selection = Some(InitialSmartSelection {
-                    start: SelectionBound::Relative(start - origin.xy),
-                    end: SelectionBound::Relative(end - origin.xy),
+                    start: self.bound_at(start, origin.xy),
+                    end: self.bound_at(end, origin.xy),
                 });
                 (Some(start), Some(end))
             }
@@ -367,8 +435,8 @@ impl SelectableArea {
         // Set the expanded head and tail. Since the resulting expanded selection could be
         // non-empty, we should invoke the selection update handler as well.
         if let Some((head, tail)) = expanded_head.zip(expanded_tail) {
-            selection_state.expanded_head = Some(SelectionBound::Relative(head - origin.xy));
-            selection_state.expanded_tail = Some(SelectionBound::Relative(tail - origin.xy));
+            selection_state.expanded_head = Some(self.bound_at(head, origin.xy));
+            selection_state.expanded_tail = Some(self.bound_at(tail, origin.xy));
 
             if head != tail
                 && let Some(selection_updated_handler) = self.selection_updated_handler.as_mut()
@@ -432,8 +500,13 @@ impl SelectableArea {
         else {
             return false;
         };
+        let tail_absolute_position = if self.autoscroll.is_some() {
+            clamp_into_rows(tail_absolute_position, origin.xy(), size)
+        } else {
+            tail_absolute_position
+        };
 
-        let new_selection_tail = SelectionBound::Relative(tail_absolute_position - origin.xy);
+        let new_selection_tail = self.bound_at(tail_absolute_position, origin.xy());
         // Don't update or cache the selection if it hasn't changed
         if selection_state
             .tail
@@ -447,7 +520,8 @@ impl SelectableArea {
 
         // Compute whether the selection is reversed. This is needed
         // to determine how to expand the selection.
-        let head_absolute_position = relative_selection_head.as_absolute_point(size, origin.xy());
+        let head_absolute_position =
+            self.absolute_point(relative_selection_head, size, origin.xy());
         let is_reversed = if matches!(
             relative_selection_head,
             SelectionBound::TopLeft | SelectionBound::Top { .. }
@@ -493,7 +567,7 @@ impl SelectableArea {
             &self.word_boundaries_policy,
         );
         selection_state.expanded_tail =
-            expanded_tail.map(|expanded_tail| SelectionBound::Relative(expanded_tail - origin.xy));
+            expanded_tail.map(|expanded_tail| self.bound_at(expanded_tail, origin.xy()));
         if selection_state.is_reversed != is_reversed_selection {
             let expanded_head = selectable_child_ref.expand_selection(
                 head_absolute_position,
@@ -501,8 +575,8 @@ impl SelectableArea {
                 selection_state.unit,
                 &self.word_boundaries_policy,
             );
-            selection_state.expanded_head = expanded_head
-                .map(|expanded_head| SelectionBound::Relative(expanded_head - origin.xy));
+            selection_state.expanded_head =
+                expanded_head.map(|expanded_head| self.bound_at(expanded_head, origin.xy()));
         }
         selection_state.is_reversed = is_reversed_selection;
         // Now that we've set the new expanded head and tail, make sure our new selection is not smaller than
@@ -520,10 +594,8 @@ impl SelectableArea {
         // Use the smart selection start/end if they would make the selection range bigger than the expanded selection.
         if selectable_child_ref
             .is_point_semantically_before(
-                initial_smart_selection
-                    .start
-                    .as_absolute_point(size, origin.xy()),
-                new_start.as_absolute_point(size, origin.xy()),
+                self.absolute_point(initial_smart_selection.start, size, origin.xy()),
+                self.absolute_point(new_start, size, origin.xy()),
             )
             .unwrap_or(false)
         {
@@ -531,10 +603,8 @@ impl SelectableArea {
         }
         if selectable_child_ref
             .is_point_semantically_before(
-                new_end.as_absolute_point(size, origin.xy()),
-                initial_smart_selection
-                    .end
-                    .as_absolute_point(size, origin.xy()),
+                self.absolute_point(new_end, size, origin.xy()),
+                self.absolute_point(initial_smart_selection.end, size, origin.xy()),
             )
             .unwrap_or(false)
         {
@@ -558,10 +628,59 @@ impl SelectableArea {
         };
 
         Some(Selection {
-            start: start.as_absolute_point(size, origin.xy()),
-            end: end.as_absolute_point(size, origin.xy()),
+            start: self.absolute_point(start, size, origin.xy()),
+            end: self.absolute_point(end, size, origin.xy()),
             is_rect: selection.unit.into(),
         })
+    }
+
+    /// Where the drag that made the current selection ended, once it ended.
+    fn drag_end(&self) -> Option<SelectionDragEnd> {
+        let (Some(origin), Some(size)) = (self.origin, self.size) else {
+            return None;
+        };
+        let selection = self
+            .selectable_area_state
+            .selection
+            .lock()
+            .expect("Should not be poisoned.");
+        Some(SelectionDragEnd {
+            tail: self.absolute_point(selection.tail?, size, origin.xy()),
+            is_reversed: selection.is_reversed,
+        })
+    }
+
+    /// While a selection is dragged, moves its tail to the content now under the pointer and
+    /// scrolls when the pointer is past an edge.
+    fn autoscroll(&mut self, ctx: &mut PaintContext, app: &AppContext) {
+        if self.autoscroll.is_none() {
+            return;
+        }
+        let pointer = {
+            let selection = self
+                .selectable_area_state
+                .selection
+                .lock()
+                .expect("Should not be poisoned.");
+            if !selection.is_selecting {
+                return;
+            }
+            selection.pointer
+        };
+        let (Some(pointer), Some(origin), Some(size)) = (pointer, self.origin, self.size) else {
+            return;
+        };
+        // The content may have moved under a still pointer since the last drag event.
+        let tail_moved = self.update_selection(pointer);
+        let step = autoscroll_step(pointer.y(), origin.y(), origin.y() + size.y());
+        if step != 0.
+            && let Some(scroll_by) = self.autoscroll.as_mut()
+        {
+            scroll_by(step, app);
+        }
+        if tail_moved || step != 0. {
+            ctx.repaint_after(AUTOSCROLL_INTERVAL);
+        }
     }
 
     fn get_current_selection_text_fragments(&self) -> Option<Vec<SelectionFragment>> {
@@ -582,12 +701,18 @@ impl SelectableArea {
             .is_empty()
     }
 
-    fn invoke_selection_handler(&mut self, ctx: &mut EventContext, app: &AppContext) {
+    fn invoke_selection_handler(
+        &mut self,
+        ended_drag: Option<SelectionDragEnd>,
+        ctx: &mut EventContext,
+        app: &AppContext,
+    ) {
         let text_fragments = self.get_current_selection_text_fragments();
         let update_args = SelectionUpdateArgs {
             // If `text_fragments` is `None`, we still need to invoke the selection_handler accordingly.
             // Otherwise, clicking away from text within an AIBlock won't clear the underlying selected_text state.
             selection: text_fragments.map(order_and_concatenate_fragments),
+            ended_drag,
         };
         (self.selection_handler)(update_args, ctx, app);
         ctx.notify();
@@ -614,7 +739,30 @@ fn is_mouse_in(
         .is_some_and(|bound| bound.contains_point(position))
 }
 
-fn order_and_concatenate_fragments(mut selection_fragments: Vec<SelectionFragment>) -> String {
+/// Keeps `point` inside the area vertically, so it stays on content that's laid out.
+fn clamp_into_rows(point: Vector2F, origin: Vector2F, size: Vector2F) -> Vector2F {
+    let top = origin.y() + 1.;
+    let bottom = (origin.y() + size.y() - 1.).max(top);
+    vec2f(point.x(), point.y().clamp(top, bottom))
+}
+
+/// How far to scroll per tick for a pointer at `pointer_y` while a selection is dragged, towards
+/// the end of the content when positive: faster the further past the edge the pointer is.
+fn autoscroll_step(pointer_y: f32, top: f32, bottom: f32) -> f32 {
+    let past_edge = if pointer_y < top + AUTOSCROLL_EDGE {
+        pointer_y - (top + AUTOSCROLL_EDGE)
+    } else if pointer_y > bottom - AUTOSCROLL_EDGE {
+        pointer_y - (bottom - AUTOSCROLL_EDGE)
+    } else {
+        return 0.;
+    };
+    let speed = (past_edge.abs().powf(1.5) / 40.).clamp(AUTOSCROLL_MIN_STEP, AUTOSCROLL_MAX_STEP);
+    speed.copysign(past_edge)
+}
+
+pub(super) fn order_and_concatenate_fragments(
+    mut selection_fragments: Vec<SelectionFragment>,
+) -> String {
     selection_fragments.sort_by(|a, b| {
         if a.origin.y() == b.origin.y() {
             a.origin.x().total_cmp(&b.origin.x())
@@ -657,6 +805,7 @@ impl Element for SelectableArea {
         self.child.paint(origin, ctx, app);
         ctx.current_selection = None;
         self.child_max_z_index = Some(ctx.scene.max_active_z_index());
+        self.autoscroll(ctx, app);
     }
 
     fn dispatch_event(
@@ -670,8 +819,11 @@ impl Element for SelectableArea {
         // are not being used to create a non-trivial selection in this `SelectableArea`.
         // Do not handle the event with this element if the child handles it, as doing so
         // could result in nested `SelectableArea` elements being unnecessarily cleared.
-        let should_dispatch_to_child =
-            !self.selectable_area_state.is_selecting() || self.is_current_selection_empty();
+        // An autoscrolling area also lets the content scroll under a selection being dragged.
+        let should_dispatch_to_child = !self.selectable_area_state.is_selecting()
+            || self.is_current_selection_empty()
+            || (self.autoscroll.is_some()
+                && matches!(event.raw_event(), Event::ScrollWheel { .. }));
         if should_dispatch_to_child {
             let handled = self.child.as_mut().dispatch_event(event, ctx, app);
             if handled {
@@ -701,7 +853,7 @@ impl Element for SelectableArea {
 
                 // Invoking the selection handler is necessary to notify parent views that we've
                 // cleared the internal selection state of the `SelectableArea`.
-                self.invoke_selection_handler(ctx, app);
+                self.invoke_selection_handler(None, ctx, app);
                 selection_started
             }
             Event::LeftMouseDragged { position, .. } => {
@@ -712,9 +864,21 @@ impl Element for SelectableArea {
                     return false;
                 };
 
+                self.selectable_area_state
+                    .selection
+                    .lock()
+                    .expect("Should not be poisoned.")
+                    .pointer = Some(*position);
                 let selection_updated = self.update_selection(*position);
                 if !selection_updated {
-                    return false;
+                    // A pointer held past an edge keeps the tail where it is, but has to start
+                    // autoscrolling, which runs on paint.
+                    let starts_autoscroll = self.autoscroll.is_some()
+                        && autoscroll_step(position.y(), origin.y(), origin.y() + size.y()) != 0.;
+                    if starts_autoscroll {
+                        ctx.notify();
+                    }
+                    return starts_autoscroll;
                 }
                 if let Some(selection_updated_handler) = self.selection_updated_handler.as_mut() {
                     selection_updated_handler(ctx, app);
@@ -727,7 +891,7 @@ impl Element for SelectableArea {
                 if origin.y() < 0.
                     || origin.y() + size.y() > app.windows().active_display_bounds().height()
                 {
-                    self.invoke_selection_handler(ctx, app)
+                    self.invoke_selection_handler(None, ctx, app)
                 }
 
                 // Returning true ensures that this SelectableArea's ongoing selections won't
@@ -736,12 +900,17 @@ impl Element for SelectableArea {
                 true
             }
             Event::LeftMouseUp { position, .. } => {
-                self.selectable_area_state
-                    .selection
-                    .lock()
-                    .expect("Should not be poisoned.")
-                    .is_selecting = false;
-                self.invoke_selection_handler(ctx, app);
+                let was_selecting = {
+                    let mut selection = self
+                        .selectable_area_state
+                        .selection
+                        .lock()
+                        .expect("Should not be poisoned.");
+                    selection.pointer = None;
+                    std::mem::replace(&mut selection.is_selecting, false)
+                };
+                let ended_drag = if was_selecting { self.drag_end() } else { None };
+                self.invoke_selection_handler(ended_drag, ctx, app);
 
                 // If the mouse is inside this element no other element needs to handle this event
                 // because this is the "lowest level" element so we return `true`. If the mouse is

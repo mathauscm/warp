@@ -306,6 +306,14 @@ impl ClaudeChatSession {
         ctx.emit(ClaudeChatSessionEvent::Changed(changes));
     }
 
+    /// Ends Claude's process right away, like when the conversation is deleted, so it can't write
+    /// to the transcript afterwards.
+    pub fn kill(&self) {
+        if let Some(process) = &self.process {
+            process.kill();
+        }
+    }
+
     /// Starts Claude again after it exited, resuming the same conversation.
     pub fn restart(&mut self, ctx: &mut ModelContext<Self>) {
         if self.process.is_some() {
