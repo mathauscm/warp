@@ -456,10 +456,10 @@ fn initialize_result(params: &Value) -> Value {
     })
 }
 
-const SERVER_INSTRUCTIONS: &str = "Picolas Artifacts: create rich, interactive HTML pages \
-(documents, slide decks, dashboards, design mocks, animations) that the user views in the \
-Artefatos gallery of the Picolas app. Prefer an artifact over a long chat answer whenever the \
-user asks for something they would want to look at, present or share.";
+const SERVER_INSTRUCTIONS: &str = "Saves self-contained HTML pages (documents, slide decks, \
+dashboards, design mocks, animations) to the Artefatos gallery of the Picolas app, which renders \
+them interactively. Use these tools when the user asks for an artifact or for a page meant to be \
+viewed in the app; otherwise answer in the chat as usual.";
 
 const HTML_GUIDANCE: &str = "The `html` must be one complete, self-contained HTML document \
 (<!doctype html>, inline <style> and <script>, a <title>). It renders locally in a WebKit view: \
@@ -473,17 +473,11 @@ fn tool_definitions() -> Vec<Value> {
         json!({
             "name": TOOL_CREATE,
             "description": format!(
-                "Create a new artifact: a standalone interactive HTML page saved to the user's \
-                 Artefatos gallery in the Picolas app. Use it whenever the user asks for a \
-                 document, report, one-pager, slide deck/presentation, dashboard, chart or data \
-                 visualization, UI/design mock, landing page, or animation/motion piece that they \
-                 would want to view, present or share, instead of pasting long HTML or markdown \
-                 into the chat. Do not also write the HTML to a file with other tools. Pick \
-                 `kind`: document (reports, docs, articles), presentation (slide decks with \
-                 keyboard navigation), design (UI mocks, landing pages, visual designs), \
-                 dashboard (KPIs, charts, data views), motion (animations), other. To revise an \
-                 existing artifact use update_artifact instead of creating a new one. After \
-                 creating it, reply with a short summary; the user sees the artifact as a card. \
+                "Save a new artifact: a standalone interactive HTML page in the user's Artefatos \
+                 gallery, shown to the user as a card, so don't repeat its HTML in the chat or \
+                 write it to a file. `kind`: document (reports, docs), presentation (slide deck \
+                 with keyboard navigation), design (UI mocks, landing pages), dashboard (KPIs, \
+                 charts), motion (animations), other. To revise an artifact use update_artifact. \
                  {HTML_GUIDANCE}"
             ),
             "inputSchema": {

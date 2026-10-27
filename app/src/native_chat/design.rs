@@ -1,7 +1,7 @@
 //! Every color, size and radius of the native chat and the artifacts, as tokens. With the Claude
 //! theme setting on "Warp" the palette is derived from the current Warp theme; otherwise it is one of
-//! the Claude desktop app's palettes. The accent comes from the chat accent setting.
-//! `picolas_design.toml` in the data dir overrides any token on top of all that (`[dark]` applies
+//! the Claude desktop app's palettes. The accent comes from the chat accent setting, and the sizes
+//! scale from the chat font size setting. `picolas_design.toml` in the data dir overrides any token on top of all that (`[dark]` applies
 //! to every dark palette, `[light]` to every light one) and is re-read whenever it changes, so the
 //! look can be tuned while the app runs.
 //!
@@ -27,7 +27,9 @@ use warpui::{AppContext, Entity, ModelContext, ModelHandle, SingletonEntity};
 use watcher::{BulkFilesystemWatcher, BulkFilesystemWatcherEvent};
 
 use crate::appearance::{Appearance, AppearanceEvent};
-use crate::settings::{ClaudeChatAccent, ClaudeTheme, ThemeSettings};
+use crate::settings::{
+    ClaudeChatAccent, ClaudeChatFont, ClaudeChatFontSize, ClaudeTheme, ThemeSettings,
+};
 
 const FILE_NAME: &str = "picolas_design.toml";
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(150);
@@ -432,6 +434,40 @@ impl Default for Sizes {
     }
 }
 
+impl Sizes {
+    /// These sizes with the text at `font_size` and everything sized by the text (other text,
+    /// icons, row heights, bubble padding) scaled along. Widths and radii keep their size.
+    pub fn scaled_to(self, font_size: f32) -> Self {
+        let factor = font_size / self.font_size;
+        let scale = |value: f32| (value * factor * 2.).round() / 2.;
+        Self {
+            font_size,
+            small_font_size: scale(self.small_font_size),
+            tiny_font_size: scale(self.tiny_font_size),
+            title_font_size: scale(self.title_font_size),
+            code_font_size: scale(self.code_font_size),
+            message_spacing: scale(self.message_spacing),
+            bubble_padding_x: scale(self.bubble_padding_x),
+            bubble_padding_y: scale(self.bubble_padding_y),
+            composer_min_height: scale(self.composer_min_height),
+            chip_height: scale(self.chip_height),
+            button_size: scale(self.button_size),
+            icon_size: scale(self.icon_size),
+            small_icon_size: scale(self.small_icon_size),
+            tool_row_height: scale(self.tool_row_height),
+            ..self
+        }
+    }
+}
+
+/// The chat's body text size for `choice`, following `warp_font_size` (the terminal text size the
+/// user set in Warp) when it doesn't name a size.
+pub fn chat_font_size(choice: ClaudeChatFontSize, warp_font_size: f32) -> f32 {
+    choice
+        .points()
+        .unwrap_or_else(|| warp_font_size.clamp(10., 24.))
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct DesignTokens {
@@ -482,12 +518,13 @@ impl DesignTokens {
 pub struct DesignFile {
     pub dark: toml::Table,
     pub light: toml::Table,
-    pub sizes: Sizes,
+    pub sizes: toml::Table,
 }
 
 impl DesignFile {
     pub fn from_toml(text: &str) -> Result<Self, toml::de::Error> {
-        let sizes = DesignTokens::from_toml(text)?.sizes;
+        // Rejects the whole file when any token is invalid.
+        DesignTokens::from_toml(text)?;
         let mut value: toml::Table = toml::from_str(text)?;
         let mut table = |key| match value.remove(key) {
             Some(toml::Value::Table(table)) => table,
@@ -496,7 +533,19 @@ impl DesignFile {
         Ok(Self {
             dark: table("dark"),
             light: table("light"),
-            sizes,
+            sizes: table("sizes"),
+        })
+    }
+
+    /// The default sizes scaled to `font_size`, with the file's sizes laid over them.
+    pub fn sizes_at(&self, font_size: f32) -> Sizes {
+        let sizes = Sizes::default().scaled_to(font_size);
+        if self.sizes.is_empty() {
+            return sizes;
+        }
+        merge(sizes.clone(), toml::Value::Table(self.sizes.clone())).unwrap_or_else(|err| {
+            log::warn!("Ignoring the sizes of {FILE_NAME}: {err}");
+            sizes
         })
     }
 
@@ -674,6 +723,7 @@ impl serde::Serialize for Sizes {
 pub struct ChatDesign {
     file: DesignFile,
     palettes: ResolvedPalettes,
+    sizes: Sizes,
     path: PathBuf,
     /// Kept alive so the file stays watched.
     _watcher: Option<ModelHandle<BulkFilesystemWatcher>>,
@@ -690,14 +740,15 @@ impl ChatDesign {
         let path = warp_core::paths::data_dir().join(FILE_NAME);
         let file = read_file(&path);
         let palettes = resolve_palettes(&file, ctx);
-        ctx.subscribe_to_model(&Appearance::handle(ctx), |me, _, event, ctx| {
-            if matches!(event, AppearanceEvent::ThemeChanged) {
-                me.refresh_palettes(ctx);
-            }
+        let sizes = resolve_sizes(&file, ctx);
+        ctx.subscribe_to_model(&Appearance::handle(ctx), |me, _, event, ctx| match event {
+            AppearanceEvent::ThemeChanged => me.refresh(ctx),
+            AppearanceEvent::MonospaceFontSizeChanged { .. } => me.refresh(ctx),
+            _ => {}
         });
         ctx.subscribe_to_model(&ThemeSettings::handle(ctx), |me, _, _, ctx| {
-            me.refresh_palettes(ctx);
-            // The Claude theme picks among the palettes without changing them.
+            me.refresh(ctx);
+            // The Claude theme and the chat font pick among cached values without changing them.
             ctx.emit(ChatDesignEvent::Changed);
         });
         let watcher = path.parent().map(|dir| {
@@ -720,13 +771,15 @@ impl ChatDesign {
         Self {
             file,
             palettes,
+            sizes,
             path,
             _watcher: watcher,
         }
     }
 
+    /// The sizes, scaled to the chat font size setting.
     pub fn sizes(&self) -> &Sizes {
-        &self.file.sizes
+        &self.sizes
     }
 
     /// The palette the Claude theme setting picks.
@@ -743,10 +796,12 @@ impl ChatDesign {
         }
     }
 
-    fn refresh_palettes(&mut self, ctx: &mut ModelContext<Self>) {
+    fn refresh(&mut self, ctx: &mut ModelContext<Self>) {
         let palettes = resolve_palettes(&self.file, ctx);
-        if palettes != self.palettes {
+        let sizes = resolve_sizes(&self.file, ctx);
+        if palettes != self.palettes || sizes != self.sizes {
             self.palettes = palettes;
+            self.sizes = sizes;
             ctx.emit(ChatDesignEvent::Changed);
         }
     }
@@ -771,6 +826,7 @@ impl ChatDesign {
         if file != self.file {
             self.file = file;
             self.palettes = resolve_palettes(&self.file, ctx);
+            self.sizes = resolve_sizes(&self.file, ctx);
             ctx.emit(ChatDesignEvent::Changed);
         }
     }
@@ -784,6 +840,13 @@ fn resolve_palettes(file: &DesignFile, app: &AppContext) -> ResolvedPalettes {
     )
 }
 
+fn resolve_sizes(file: &DesignFile, app: &AppContext) -> Sizes {
+    file.sizes_at(chat_font_size(
+        *ThemeSettings::as_ref(app).claude_chat_font_size.value(),
+        Appearance::as_ref(app).monospace_font_size(),
+    ))
+}
+
 fn read_file(path: &Path) -> DesignFile {
     let Ok(text) = std::fs::read_to_string(path) else {
         return DesignFile::default();
@@ -794,8 +857,8 @@ fn read_file(path: &Path) -> DesignFile {
     })
 }
 
-/// The fonts of the chat: the system font (SF Pro) for prose and controls, the terminal's font for
-/// code.
+/// The fonts of the chat: the chat font setting's family (the system font, SF Pro, by default) for
+/// prose and controls, the terminal's font for code.
 #[derive(Debug, Clone, Copy)]
 pub struct ChatFonts {
     pub ui: FamilyId,
@@ -804,9 +867,13 @@ pub struct ChatFonts {
 
 pub fn fonts(app: &AppContext) -> ChatFonts {
     let appearance = Appearance::as_ref(app);
-    ChatFonts {
-        ui: crate::appearance::system_ui_font_family_cached(app)
+    let ui = match *ThemeSettings::as_ref(app).claude_chat_font.value() {
+        ClaudeChatFont::System => crate::appearance::system_ui_font_family_cached(app)
             .unwrap_or_else(|| appearance.ui_font_family()),
+        ClaudeChatFont::Warp => appearance.ui_font_family(),
+    };
+    ChatFonts {
+        ui,
         mono: appearance.monospace_font_family(),
     }
 }

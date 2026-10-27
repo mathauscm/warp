@@ -69,6 +69,26 @@ define_settings_group!(ThemeSettings, settings: [
         toml_path: "appearance.themes.claude_chat_accent",
         description: "The highlight color of the native Claude chat.",
     },
+    claude_chat_font: ClaudeChatFontSetting {
+        type: ClaudeChatFont,
+        default: ClaudeChatFont::default(),
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Never,
+        surface: settings::SettingSurfaces::GUI,
+        private: false,
+        toml_path: "appearance.themes.claude_chat_font",
+        description: "The font of the native Claude chat's text; code keeps the terminal font.",
+    },
+    claude_chat_font_size: ClaudeChatFontSizeSetting {
+        type: ClaudeChatFontSize,
+        default: ClaudeChatFontSize::default(),
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Never,
+        surface: settings::SettingSurfaces::GUI,
+        private: false,
+        toml_path: "appearance.themes.claude_chat_font_size",
+        description: "The text size of the native Claude chat.",
+    },
 ]);
 
 /// The colors a pane takes while Claude Code runs in it.
@@ -166,6 +186,110 @@ impl ClaudeChatAccent {
             Self::Orange => "Laranja",
             Self::Pink => "Rosa",
             Self::Theme => "Do tema",
+        }
+    }
+}
+
+/// The font family of the native Claude chat's prose and controls.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(
+    description = "The font of the native Claude chat's text.",
+    rename_all = "snake_case"
+)]
+pub enum ClaudeChatFont {
+    /// The system font (SF Pro on macOS).
+    #[default]
+    System,
+    /// Warp's UI font.
+    Warp,
+}
+
+impl ClaudeChatFont {
+    /// In the order the pickers list them.
+    pub const ALL: [Self; 2] = [Self::System, Self::Warp];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::System => "Sistema (SF Pro)",
+            Self::Warp => "Mesma do Warp",
+        }
+    }
+}
+
+/// The body text size of the native Claude chat; its other sizes scale with it.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(
+    description = "The text size of the native Claude chat.",
+    rename_all = "snake_case"
+)]
+pub enum ClaudeChatFontSize {
+    /// Warp's text size (Appearance → Text → font size).
+    #[default]
+    FollowWarp,
+    Size12,
+    Size13,
+    Size14,
+    Size15,
+    Size16,
+    Size18,
+}
+
+impl ClaudeChatFontSize {
+    /// In the order the pickers list them.
+    pub const ALL: [Self; 7] = [
+        Self::FollowWarp,
+        Self::Size12,
+        Self::Size13,
+        Self::Size14,
+        Self::Size15,
+        Self::Size16,
+        Self::Size18,
+    ];
+
+    /// The fixed size in logical pixels, or `None` to follow Warp.
+    pub fn points(self) -> Option<f32> {
+        match self {
+            Self::FollowWarp => None,
+            Self::Size12 => Some(12.),
+            Self::Size13 => Some(13.),
+            Self::Size14 => Some(14.),
+            Self::Size15 => Some(15.),
+            Self::Size16 => Some(16.),
+            Self::Size18 => Some(18.),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::FollowWarp => "Seguir o Warp",
+            Self::Size12 => "12",
+            Self::Size13 => "13",
+            Self::Size14 => "14",
+            Self::Size15 => "15",
+            Self::Size16 => "16",
+            Self::Size18 => "18",
         }
     }
 }

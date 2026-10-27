@@ -222,6 +222,40 @@ pub fn icon_button(
     .finish()
 }
 
+/// A small icon button for secondary actions in a list row; `emphasized` (the row is hovered)
+/// raises its color, and it fills when hovered itself.
+pub fn subtle_icon_button(
+    look: &Look,
+    mouse_state: MouseStateHandle,
+    warp_icon: WarpIcon,
+    emphasized: bool,
+    action: ComposerAction,
+) -> Box<dyn Element> {
+    let look = look.clone();
+    Hoverable::new(mouse_state, move |state| {
+        let palette = &look.palette;
+        let size = look.sizes.chip_height - 6.;
+        let icon_size = look.sizes.small_icon_size - 1.;
+        let color = if state.is_hovered() {
+            palette.text.0
+        } else if emphasized {
+            palette.text_muted.0
+        } else {
+            palette.text_faint.0
+        };
+        let mut container = Container::new(icon(warp_icon, color, icon_size))
+            .with_uniform_padding((size - icon_size) / 2.)
+            .with_corner_radius(look.radius(look.sizes.chip_radius - 2.));
+        if state.is_hovered() {
+            container = container.with_background_color(palette.surface_strong.0);
+        }
+        container.finish()
+    })
+    .with_cursor(Cursor::PointingHand)
+    .on_click(move |ctx, _, _| ctx.dispatch_typed_action(action.clone()))
+    .finish()
+}
+
 /// A borderless footer control: text with an optional leading icon and a chevron, filled on
 /// hover.
 pub fn footer_control(

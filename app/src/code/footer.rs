@@ -10,11 +10,13 @@ use pathfinder_color::ColorU;
 use pathfinder_geometry::vector::vec2f;
 #[cfg(feature = "local_fs")]
 use repo_metadata::repositories::DetectedRepositories;
+use settings::Setting as _;
 use warp_core::send_telemetry_from_ctx;
 use warp_core::ui::Icon;
 use warp_core::ui::appearance::Appearance;
 use warp_core::ui::theme::color::internal_colors;
 use warp_core::ui::theme::{AnsiColorIdentifier, Fill as ThemeFill, WarpTheme};
+use warp_errors::report_if_error;
 #[cfg(feature = "local_fs")]
 use warp_util::local_or_remote_path::LocalOrRemotePath;
 use warpui::elements::{
@@ -36,7 +38,7 @@ use crate::ai::persisted_workspace::{
     LSPEnablementResultForFile, LspRepoStatus, PersistedWorkspace,
 };
 use crate::code::lsp_telemetry::{LspControlActionType, LspEnablementSource, LspTelemetryEvent};
-use crate::settings::AISettings;
+use crate::settings::{AISettings, CodeSettings};
 use crate::ui_components::blended_colors;
 #[cfg(feature = "local_fs")]
 use crate::user_config::is_tab_config_toml;
@@ -44,6 +46,9 @@ use crate::view_components::action_button::{
     ActionButton, ButtonSize, NakedTheme, PaneHeaderTheme,
 };
 
+/// How the footer's suggestion to enable language support starts.
+const LSP_SUGGESTION_PREFIX: &str = "Language support is";
+const DISMISS_ICON_SIZE: f32 = 12.;
 const FOOTER_HEIGHT: f32 = 24.;
 /// Margin around the LSP icon container
 const ICON_MARGIN: f32 = 4.;
@@ -133,6 +138,8 @@ impl FooterMode {
 #[derive(Debug, Clone, PartialEq)]
 pub enum CodeFooterViewAction {
     CloseMenu,
+    /// Stops suggesting language support, until it's turned back on in Settings > Code.
+    DismissLspSuggestion,
     #[cfg_attr(not(feature = "local_fs"), allow(dead_code))]
     ToggleMenu,
     EnableLSP,
@@ -210,6 +217,7 @@ pub struct CodeFooterView {
     is_lsp_menu_open: bool,
     /// Whether to render the top border. Disabled for code review footer.
     show_border: bool,
+    dismiss_suggestion_mouse_state: MouseStateHandle,
 }
 
 /// Wraps the per-server-type status map and enforces a single invariant on
@@ -341,6 +349,7 @@ impl CodeFooterView {
 
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn new(path: PathBuf, ctx: &mut ViewContext<Self>) -> Self {
+        ctx.subscribe_to_model(&CodeSettings::handle(ctx), |_, _, _, ctx| ctx.notify());
         let lsp_status_button = Self::create_lsp_status_button(true, ctx);
         if Self::is_tab_config_path(&path) {
             let tab_config_skill_button = Self::create_tab_config_skill_button(ctx);
@@ -353,6 +362,7 @@ impl CodeFooterView {
                 tab_config_skill_button: Some(tab_config_skill_button),
                 is_lsp_menu_open: false,
                 show_border: true,
+                dismiss_suggestion_mouse_state: Default::default(),
             };
             footer.sync_tab_config_skill_button(ctx);
             ctx.subscribe_to_model(&AISettings::handle(ctx), |me, _, _, ctx| {
@@ -449,6 +459,7 @@ impl CodeFooterView {
             enable_lsp_button,
             tab_config_skill_button: None,
             show_border: true,
+            dismiss_suggestion_mouse_state: Default::default(),
         }
     }
 
@@ -456,6 +467,7 @@ impl CodeFooterView {
     /// Used by code review to show a single aggregated footer.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn new_for_workspace(root_path: PathBuf, ctx: &mut ViewContext<Self>) -> Self {
+        ctx.subscribe_to_model(&CodeSettings::handle(ctx), |_, _, _, ctx| ctx.notify());
         let lsp_status_button = Self::create_lsp_status_button(true, ctx);
 
         // Subscribe to LspManagerModel to auto-track server lifecycle
@@ -583,6 +595,7 @@ impl CodeFooterView {
             enable_lsp_button: None,
             tab_config_skill_button: None,
             show_border: false,
+            dismiss_suggestion_mouse_state: Default::default(),
         };
 
         // Populate initial servers from the manager
@@ -1447,6 +1460,28 @@ impl CodeFooterView {
         element.finish()
     }
 
+    /// The "×" that stops the language-support suggestion from showing.
+    fn render_dismiss_suggestion_button(&self, appearance: &Appearance) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let button = Hoverable::new(self.dismiss_suggestion_mouse_state.clone(), move |state| {
+            let color = if state.is_hovered() {
+                blended_colors::text_main(theme, theme.background())
+            } else {
+                blended_colors::text_sub(theme, theme.background())
+            };
+            ConstrainedBox::new(Icon::X.to_warpui_icon(color.into()).finish())
+                .with_width(DISMISS_ICON_SIZE)
+                .with_height(DISMISS_ICON_SIZE)
+                .finish()
+        })
+        .with_cursor(Cursor::PointingHand)
+        .on_click(|ctx, _, _| ctx.dispatch_typed_action(CodeFooterViewAction::DismissLspSuggestion))
+        .finish();
+        Container::new(button)
+            .with_margin_left(ICON_MARGIN)
+            .finish()
+    }
+
     fn render_status_text(
         theme: &WarpTheme,
         appearance: &Appearance,
@@ -1525,6 +1560,20 @@ impl CodeFooterView {
         } else {
             None
         }
+    }
+
+    /// The status to show, minus the suggestion to enable language support when the user turned
+    /// suggestions off. The flag says whether that suggestion (and its button) is showing.
+    fn visible_status_message(&self, app: &AppContext) -> (Option<String>, bool) {
+        let (message, show_enable_button) = self.compute_status_message(app);
+        let is_suggestion = show_enable_button
+            || message
+                .as_deref()
+                .is_some_and(|message| message.starts_with(LSP_SUGGESTION_PREFIX));
+        if is_suggestion && !*CodeSettings::as_ref(app).show_lsp_suggestions {
+            return (None, false);
+        }
+        (message, show_enable_button)
     }
 
     /// Computes the aggregated status message across all servers.
@@ -1742,9 +1791,20 @@ impl View for CodeFooterView {
                 );
             }
         } else {
+            let (status_message, should_show_enable_button) = self.visible_status_message(app);
+            // Without a server or a message, the lightning icon has no menu to open and the bar
+            // would be an empty strip under the editor.
+            if status_message.is_none() && self.live_servers(app).is_empty() {
+                return ConstrainedBox::new(Empty::new().finish())
+                    .with_height(0.)
+                    .finish();
+            }
             footer_content.add_child(self.render_lsp_icon(appearance, app));
 
-            let (status_message, should_show_enable_button) = self.compute_status_message(app);
+            let is_suggestion = should_show_enable_button
+                || status_message
+                    .as_deref()
+                    .is_some_and(|message| message.starts_with(LSP_SUGGESTION_PREFIX));
 
             if let Some(status_message) = status_message {
                 footer_content.add_child(
@@ -1764,6 +1824,9 @@ impl View for CodeFooterView {
                         .with_margin_left(ICON_MARGIN)
                         .finish(),
                 );
+            }
+            if is_suggestion {
+                footer_content.add_child(self.render_dismiss_suggestion_button(appearance));
             }
         }
 
@@ -1795,6 +1858,12 @@ impl TypedActionView for CodeFooterView {
         match action {
             CodeFooterViewAction::ToggleMenu => {
                 self.is_lsp_menu_open = !self.is_lsp_menu_open;
+                ctx.notify();
+            }
+            CodeFooterViewAction::DismissLspSuggestion => {
+                CodeSettings::handle(ctx).update(ctx, |settings, ctx| {
+                    report_if_error!(settings.show_lsp_suggestions.set_value(false, ctx));
+                });
                 ctx.notify();
             }
             CodeFooterViewAction::CloseMenu => {

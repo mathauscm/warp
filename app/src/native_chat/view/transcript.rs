@@ -13,6 +13,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
+use std::path::Path;
 use std::rc::Rc;
 use std::time::{Duration, SystemTime};
 
@@ -68,7 +69,6 @@ const MENTION_OFFSET: f32 = 6.;
 const MENTION_HEIGHT: f32 = 26.;
 /// Space between the "↓" button and the bottom of the transcript.
 const SCROLL_BUTTON_MARGIN: f32 = 14.;
-const SCROLLBAR_WIDTH: f32 = 6.;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TranscriptEvent {
@@ -92,6 +92,8 @@ pub enum TranscriptAction {
     },
     OpenUrl(String),
     OpenArtifact(String),
+    /// Opens a local file in its default app.
+    OpenFile(String),
     ScrollToBottom,
     SelectionChanged(Option<String>),
     MouseDown,
@@ -204,6 +206,7 @@ impl TranscriptView {
             ClaudeChatSessionEvent::TitleChanged
             | ClaudeChatSessionEvent::SessionIdAssigned
             | ClaudeChatSessionEvent::FileSuggestions { .. }
+            | ClaudeChatSessionEvent::QueuedMessageCancelled { .. }
             | ClaudeChatSessionEvent::Error(_) => {}
         }
     }
@@ -793,21 +796,18 @@ impl View for TranscriptView {
             return Self::render_empty_state(&style, &folder);
         }
 
-        let palette = &style.palette;
         let scroller = NewScrollable::vertical(
             SingleAxisConfig::Manual {
                 handle: self.scroll_state.clone(),
                 child: Viewport::new(self.list_state.clone(), self.viewport.clone())
                     .finish_scrollable(),
             },
-            Fill::Solid(palette.border_strong.0),
-            Fill::Solid(palette.text_faint.0),
+            Fill::None,
+            Fill::None,
             Fill::None,
         )
-        .with_vertical_scrollbar(ScrollableAppearance::new(
-            ScrollbarWidth::Custom(SCROLLBAR_WIDTH),
-            false,
-        ))
+        // No scrollbar at all, so rows get the column's full width.
+        .with_vertical_scrollbar(ScrollableAppearance::new(ScrollbarWidth::None, true))
         .finish();
         let selectable = SelectableArea::new(
             self.selection_handle.clone(),
@@ -890,6 +890,7 @@ impl TypedActionView for TranscriptView {
             }
             TranscriptAction::Copy { key, text } => self.copy(key.clone(), text.clone(), ctx),
             TranscriptAction::OpenUrl(url) => ctx.open_url(url),
+            TranscriptAction::OpenFile(path) => ctx.open_file_path(Path::new(path)),
             TranscriptAction::OpenArtifact(id) => {
                 ctx.emit(TranscriptEvent::OpenArtifact(id.clone()));
             }

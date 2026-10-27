@@ -209,7 +209,8 @@ pub enum StartupScreen {
     /// A terminal tab.
     #[default]
     Terminal,
-    /// A native Claude chat in the home folder, with the threads list open.
+    /// A native Claude chat in the home folder, with the threads list open; restored windows
+    /// open the threads list too.
     Threads,
 }
 
@@ -219,7 +220,7 @@ impl StartupScreen {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Terminal => "Terminal",
+            Self::Terminal => "Painel de abas",
             Self::Threads => "Threads",
         }
     }

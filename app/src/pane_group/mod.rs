@@ -6840,8 +6840,10 @@ impl PaneGroup {
             let ignore_custom_startup_directory =
                 self.should_ignore_custom_startup_directory(&chosen_shell, ctx);
 
-            let initial_directory_from_current_session =
-                self.startup_path_for_new_session(base_pane_id_for_context, ctx);
+            // A split of a native chat opens in the chat's folder, like a split of a terminal does.
+            let initial_directory_from_current_session = base_pane_id_for_split
+                .and_then(|pane_id| self.claude_chat_cwd(pane_id, ctx))
+                .or_else(|| self.startup_path_for_new_session(base_pane_id_for_context, ctx));
 
             SessionSettings::handle(ctx).read(ctx, |settings, _ctx| {
                 settings
@@ -7150,6 +7152,13 @@ impl PaneGroup {
     /// This returns the active (parent) session's current directory if the active session is local
     /// (not an SSH session) and if the active session is done bootstrapping. Else, it returns the
     /// the current session's startup directory.
+    /// The folder Claude runs in, when `pane_id` is a native chat.
+    fn claude_chat_cwd(&self, pane_id: PaneId, ctx: &AppContext) -> Option<PathBuf> {
+        let pane = self.downcast_pane_by_id::<ClaudeChatPane>(pane_id)?;
+        let session = pane.backing_view(ctx).as_ref(ctx).session().clone();
+        Some(session.as_ref(ctx).cwd().to_path_buf())
+    }
+
     pub fn startup_path_for_new_session(
         &self,
         base_pane_id: Option<TerminalPaneId>,

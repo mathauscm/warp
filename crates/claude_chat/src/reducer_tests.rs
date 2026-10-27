@@ -1034,6 +1034,139 @@ fn hidden_messages_are_removed_from_the_timeline() {
 }
 
 #[test]
+fn withdrawn_messages_leave_the_timeline() {
+    let now = start_time();
+    let mut conversation = Conversation::new(None);
+    conversation.push_local_user_message("a", "first", Vec::new(), now);
+    conversation.push_local_user_message("b", "queued", Vec::new(), now);
+    let changes = conversation.withdraw_user_message("b", now);
+    assert!(changes.contains(&ConversationChange::ItemRemoved {
+        index: 1,
+        id: "b".to_owned()
+    }));
+    assert_eq!(conversation.index_of("b"), None);
+    assert_eq!(conversation.index_of("a"), Some(0));
+}
+
+fn lifecycle(uuid: &str, state: &str) -> Value {
+    json!({"type": "command_lifecycle", "command_uuid": uuid, "state": state, "uuid": "x", "session_id": "s"})
+}
+
+fn user_ids(conversation: &Conversation) -> Vec<&str> {
+    conversation
+        .items()
+        .iter()
+        .filter_map(|item| match item {
+            TimelineItem::User(user) => Some(user.id.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A conversation whose first message is mid-turn, with some of Claude's reply streamed.
+fn busy_conversation(now: SystemTime) -> Conversation {
+    let mut conversation = Conversation::new(Some("s".to_owned()));
+    conversation.push_local_user_message("a", "first", Vec::new(), now);
+    for frame in [
+        lifecycle("a", "queued"),
+        lifecycle("a", "started"),
+        stream(
+            json!({"type": "message_start", "message": {"id": "msg_1", "model": "m", "usage": {}}}),
+        ),
+        stream(
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": "Working"}}),
+        ),
+    ] {
+        apply_json(&mut conversation, frame, now);
+    }
+    conversation
+}
+
+#[test]
+fn queued_messages_join_the_timeline_when_claude_takes_them_in() {
+    let now = start_time();
+    let mut conversation = busy_conversation(now);
+    assert!(conversation.tracks_queue());
+
+    let changes = conversation.push_local_user_message("b", "also this", Vec::new(), now);
+    assert!(changes.is_empty());
+    assert!(conversation.is_queued("b"));
+    assert_eq!(user_ids(&conversation), ["a"]);
+
+    apply_json(&mut conversation, lifecycle("b", "queued"), now);
+    assert!(conversation.is_queued("b"));
+
+    // Folded into the running turn: it shows up after what Claude wrote before reading it.
+    let changes = apply_json(&mut conversation, lifecycle("b", "started"), now);
+    assert!(!conversation.is_queued("b"));
+    let index = conversation.index_of("b").unwrap();
+    assert_eq!(index, conversation.items().len() - 1);
+    assert!(changes.contains(&ConversationChange::ItemInserted {
+        index,
+        id: "b".to_owned()
+    }));
+    assert!(index > conversation.index_of("msg_1:0").unwrap());
+    assert_eq!(user_ids(&conversation), ["a", "b"]);
+    assert!(matches!(
+        conversation.status(),
+        ConversationStatus::Working { .. }
+    ));
+}
+
+#[test]
+fn queued_messages_the_cli_drops_leave_the_queue() {
+    let now = start_time();
+    let mut conversation = busy_conversation(now);
+    conversation.push_local_user_message("b", "dropped", Vec::new(), now);
+    conversation.push_local_user_message("c", "answered", Vec::new(), now);
+    conversation.push_local_user_message("d", "echoed", Vec::new(), now);
+
+    apply_json(&mut conversation, lifecycle("b", "cancelled"), now);
+    // A terminal state without `started` still means Claude got the message.
+    apply_json(&mut conversation, lifecycle("c", "completed"), now);
+    apply_json(
+        &mut conversation,
+        json!({"type": "user", "uuid": "d", "message": {"role": "user", "content": "echoed"}, "parent_tool_use_id": null}),
+        now,
+    );
+
+    assert!(conversation.queued_messages().is_empty());
+    assert_eq!(user_ids(&conversation), ["a", "c", "d"]);
+}
+
+#[test]
+fn queued_messages_stay_visible_when_the_process_exits() {
+    let now = start_time();
+    let mut conversation = busy_conversation(now);
+    conversation.push_local_user_message("b", "never read", Vec::new(), now);
+    conversation.mark_exited(None, now);
+    assert!(conversation.queued_messages().is_empty());
+    assert_eq!(user_ids(&conversation), ["a", "b"]);
+}
+
+#[test]
+fn withdrawn_queued_messages_never_reach_the_timeline() {
+    let now = start_time();
+    let mut conversation = busy_conversation(now);
+    conversation.push_local_user_message("b", "take it back", Vec::new(), now);
+    conversation.withdraw_user_message("b", now);
+    assert!(!conversation.is_queued("b"));
+    apply_json(&mut conversation, lifecycle("b", "started"), now);
+    assert_eq!(user_ids(&conversation), ["a"]);
+}
+
+#[test]
+fn without_lifecycle_frames_messages_go_straight_to_the_timeline() {
+    let now = start_time();
+    let mut conversation = Conversation::new(None);
+    conversation.push_local_user_message("a", "first", Vec::new(), now);
+    conversation.push_local_user_message("b", "second", Vec::new(), now);
+    assert!(!conversation.tracks_queue());
+    assert!(conversation.queued_messages().is_empty());
+    assert_eq!(user_ids(&conversation), ["a", "b"]);
+}
+
+#[test]
 fn parses_rfc3339_timestamps() {
     assert_eq!(
         parse_rfc3339("2026-10-26T22:20:00.097901+00:00"),

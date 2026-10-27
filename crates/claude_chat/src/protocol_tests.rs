@@ -308,6 +308,18 @@ fn decodes_typed_responses_from_captures() {
 }
 
 #[test]
+fn parses_command_lifecycle_frames() {
+    let line = r#"{"type":"command_lifecycle","command_uuid":"c1","state":"started","uuid":"u","session_id":"s"}"#;
+    assert_eq!(
+        StdoutMessage::parse_line(line).unwrap(),
+        StdoutMessage::CommandLifecycle(CommandLifecycle {
+            command_uuid: "c1".to_owned(),
+            state: "started".to_owned(),
+        })
+    );
+}
+
+#[test]
 fn local_command_stdout_strips_tags() {
     assert_eq!(
         local_command_stdout("<local-command-stdout>Compacted </local-command-stdout>"),
@@ -362,6 +374,19 @@ fn builds_control_requests() {
         (
             ControlRequestBody::Interrupt,
             json!({"subtype": "interrupt"}),
+        ),
+        (
+            ControlRequestBody::CancelAsyncMessage {
+                message_uuid: "u1".to_owned(),
+            },
+            json!({"subtype": "cancel_async_message", "message_uuid": "u1"}),
+        ),
+        (
+            ControlRequestBody::SendNow {
+                message_uuid: "u1".to_owned(),
+                send_now: true,
+            },
+            json!({"subtype": "interrupt", "message_uuid": "u1", "send_now": true}),
         ),
         (
             ControlRequestBody::SetModel {

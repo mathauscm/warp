@@ -84,7 +84,7 @@ use crate::terminal::alt_screen_reporting::{
 };
 use crate::terminal::general_settings::{
     GeneralSettings, LinkTooltip, LoginItem, QuitOnLastWindowClosed, RestoreSession,
-    ShowWarningBeforeQuitting, StartupScreen, StartupScreenSetting,
+    ShowWarningBeforeQuitting,
 };
 use crate::terminal::input::OPEN_COMPLETIONS_KEYBINDING_NAME;
 use crate::terminal::keys_settings::{
@@ -816,7 +816,6 @@ pub enum FeaturesPageAction {
     SetNewTabPlacement(NewTabPlacement),
     SetOsc52ClipboardAccess(Osc52ClipboardAccess),
     SetDefaultSessionMode(DefaultSessionMode),
-    SetStartupScreen(StartupScreen),
     SetDefaultTabConfig(String),
     SearchForKeybinding(String),
     ToggleAutosuggestions,
@@ -1247,10 +1246,6 @@ impl FeaturesPageAction {
                 action: "SetDefaultSessionMode".to_string(),
                 value: format!("{mode:?}"),
             },
-            Self::SetStartupScreen(screen) => TelemetryEvent::FeaturesPageAction {
-                action: "SetStartupScreen".to_string(),
-                value: format!("{screen:?}"),
-            },
             Self::SetDefaultTabConfig(path) => TelemetryEvent::FeaturesPageAction {
                 action: "SetDefaultTabConfig".to_string(),
                 value: path.clone(),
@@ -1454,7 +1449,6 @@ pub struct FeaturesPageView {
     new_tab_placement_dropdown: ViewHandle<Dropdown<FeaturesPageAction>>,
     osc52_clipboard_access_dropdown: ViewHandle<Dropdown<FeaturesPageAction>>,
     default_session_mode_dropdown: ViewHandle<FilterableDropdown<FeaturesPageAction>>,
-    startup_screen_dropdown: ViewHandle<Dropdown<FeaturesPageAction>>,
     tab_behavior: Tracked<TabBehavior>,
     completions_keystroke: Tracked<String>,
     autosuggestions_keystroke: Tracked<String>,
@@ -2032,11 +2026,6 @@ impl TypedActionView for FeaturesPageView {
                 });
             }
             SetDefaultSessionMode(mode) => self.set_default_session_mode(mode, ctx),
-            SetStartupScreen(screen) => {
-                GeneralSettings::handle(ctx).update(ctx, |settings, ctx| {
-                    report_if_error!(settings.startup_screen.set_value(*screen, ctx));
-                });
-            }
             SetDefaultTabConfig(path) => {
                 AISettings::handle(ctx).update(ctx, |ai_settings, ctx| {
                     report_if_error!(
@@ -2320,13 +2309,7 @@ impl FeaturesPageView {
                 ctx.notify()
             },
         );
-        ctx.subscribe_to_model(&GeneralSettings::handle(ctx), |me, _, _, ctx| {
-            let screen = *GeneralSettings::as_ref(ctx).startup_screen;
-            me.startup_screen_dropdown.update(ctx, |dropdown, ctx| {
-                dropdown.set_selected_by_action(FeaturesPageAction::SetStartupScreen(screen), ctx);
-            });
-            ctx.notify();
-        });
+        ctx.subscribe_to_model(&GeneralSettings::handle(ctx), |_, _, _, ctx| ctx.notify());
         ctx.subscribe_to_model(&KeysSettings::handle(ctx), |me, _, _, ctx| {
             me.handle_hotkey_settings_update(ctx);
         });
@@ -2771,7 +2754,6 @@ impl FeaturesPageView {
             new_tab_placement_dropdown,
             osc52_clipboard_access_dropdown,
             default_session_mode_dropdown,
-            startup_screen_dropdown: Self::build_startup_screen_dropdown(ctx),
             tab_behavior: Default::default(),
 
             window_id: ctx.window_id(),
@@ -2791,36 +2773,9 @@ impl FeaturesPageView {
         features_page_view
     }
 
-    fn build_startup_screen_dropdown(
-        ctx: &mut ViewContext<Self>,
-    ) -> ViewHandle<Dropdown<FeaturesPageAction>> {
-        ctx.add_typed_action_view(|ctx| {
-            let mut dropdown = Dropdown::new(ctx);
-            dropdown.set_items(
-                StartupScreen::ALL
-                    .into_iter()
-                    .map(|screen| {
-                        DropdownItem::new(
-                            screen.label(),
-                            FeaturesPageAction::SetStartupScreen(screen),
-                        )
-                    })
-                    .collect(),
-                ctx,
-            );
-            dropdown.set_selected_by_action(
-                FeaturesPageAction::SetStartupScreen(*GeneralSettings::as_ref(ctx).startup_screen),
-                ctx,
-            );
-            dropdown
-        })
-    }
-
     fn build_page(ctx: &mut ViewContext<Self>) -> PageType<Self> {
-        let mut general_widgets: Vec<Box<dyn SettingsWidget<View = Self>>> = vec![
-            Box::new(StartupScreenWidget),
-            Box::new(DefaultSessionModeWidget::default()),
-        ];
+        let mut general_widgets: Vec<Box<dyn SettingsWidget<View = Self>>> =
+            vec![Box::new(DefaultSessionModeWidget::default())];
 
         let native_preference_settings = NativePreferenceSettings::as_ref(ctx);
         if native_preference_settings
@@ -7448,41 +7403,6 @@ impl SettingsWidget for Osc52ClipboardAccessWidget {
             ),
             None,
             &view.osc52_clipboard_access_dropdown,
-        )
-    }
-}
-
-struct StartupScreenWidget;
-
-impl SettingsWidget for StartupScreenWidget {
-    type View = FeaturesPageView;
-
-    fn search_terms(&self) -> &str {
-        "tela inicial startup screen new window nova janela terminal threads claude chat"
-    }
-
-    fn render(
-        &self,
-        view: &Self::View,
-        appearance: &Appearance,
-        app: &AppContext,
-    ) -> Box<dyn Element> {
-        render_dropdown_item(
-            appearance,
-            "Tela inicial",
-            Some("O que uma janela nova mostra. Janelas restauradas mantêm suas abas."),
-            None,
-            LocalOnlyIconState::for_setting(
-                StartupScreenSetting::storage_key(),
-                StartupScreenSetting::sync_to_cloud(),
-                &mut view
-                    .button_mouse_states
-                    .local_only_icon_tooltip_states
-                    .borrow_mut(),
-                app,
-            ),
-            None,
-            &view.startup_screen_dropdown,
         )
     }
 }

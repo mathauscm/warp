@@ -10,19 +10,21 @@ use claude_chat::timeline::{
 use markdown_parser::{FormattedTable, FormattedText, FormattedTextLine};
 use pathfinder_color::ColorU;
 use pathfinder_geometry::vector::Vector2F;
+use warpui::elements::new_scrollable::{ScrollableAppearance, SingleAxisConfig};
 use warpui::elements::shimmering_text::{ShimmerConfig, ShimmeringTextElement};
 use warpui::elements::{
-    Border, ClippedScrollable, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, Empty,
-    Expanded, Fill, Flex, FormattedTextElement, HeadingFontSizeMultipliers, Highlight,
-    HighlightedRange, Hoverable, Icon as SvgIcon, MainAxisAlignment, MainAxisSize, ParentElement,
-    Point, Radius, ScrollbarWidth, Shrinkable, Text,
+    Align, Border, Clipped, ClippedScrollable, ConstrainedBox, Container, CornerRadius,
+    CrossAxisAlignment, Empty, Expanded, Fill, Flex, FormattedTextElement,
+    HeadingFontSizeMultipliers, Highlight, HighlightedRange, Hoverable, Icon as SvgIcon,
+    MainAxisAlignment, MainAxisSize, NewScrollable, ParentElement, Point, Radius, ScrollbarWidth,
+    SelectableElement, Shrinkable, Text,
 };
 use warpui::event::DispatchedEvent;
 use warpui::fonts::{FamilyId, Properties, Weight};
 use warpui::platform::Cursor;
 use warpui::text_layout::{ClipConfig, TextBorder};
 use warpui::{
-    AfterLayoutContext, AppContext, Element, EventContext, LayoutContext, PaintContext,
+    AfterLayoutContext, AppContext, ClipBounds, Element, EventContext, LayoutContext, PaintContext,
     SingletonEntity, SizeConstraint,
 };
 
@@ -40,9 +42,11 @@ const ICON_ALERT: &str = "bundled/svg/picolas-alert.svg";
 const ICON_STOP: &str = "bundled/svg/picolas-stop.svg";
 const ICON_IMAGE: &str = "bundled/svg/picolas-image.svg";
 
-/// Thumbnails of images attached to a message.
-const THUMBNAIL_WIDTH: f32 = 120.;
-const THUMBNAIL_HEIGHT: f32 = 90.;
+/// Images attached to a message show as square crops of this side.
+const THUMBNAIL_SIZE: f32 = 112.;
+const THUMBNAIL_GAP: f32 = 6.;
+const THUMBNAIL_RADIUS: f32 = 8.;
+const THUMBNAIL_SCROLLBAR_WIDTH: f32 = 4.;
 /// The first line of a thinking block shown while it's folded.
 const THINKING_PREVIEW_CHARS: usize = 90;
 /// Space between a row's blocks (paragraph runs, code, tables).
@@ -307,7 +311,9 @@ fn render_command_output(cx: &RowContext, key: &str, output: &str) -> Box<dyn El
 
 fn render_thumbnails(cx: &RowContext, message: &UserMessage) -> Box<dyn Element> {
     let palette = cx.palette();
-    let mut row = Flex::row().with_spacing(6.);
+    let mut thumbnails = Flex::row()
+        .with_spacing(THUMBNAIL_GAP)
+        .with_main_axis_size(MainAxisSize::Min);
     for (position, image) in message.images.iter().enumerate() {
         let source = match &image.path {
             Some(path) => Some(warpui::assets::asset_cache::AssetSource::LocalFile {
@@ -319,31 +325,57 @@ fn render_thumbnails(cx: &RowContext, message: &UserMessage) -> Box<dyn Element>
                 .image_asset_id(&message.id, position)
                 .map(|id| warpui::assets::asset_cache::AssetSource::Raw { id }),
         };
+        let radius = CornerRadius::with_all(Radius::Pixels(THUMBNAIL_RADIUS));
+        // `BySize` crops a cover-fit image to the box; `Original` would paint it past the box.
         let tile = match source {
             Some(source) => {
-                warpui::elements::Image::new(source, warpui::image_cache::CacheOption::Original)
+                warpui::elements::Image::new(source, warpui::image_cache::CacheOption::BySize)
                     .cover()
-                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+                    .with_corner_radius(radius)
                     .finish()
             }
-            None => Container::new(icon(ICON_IMAGE, palette.text_muted.0, 20.))
-                .with_uniform_padding(35.)
-                .finish(),
+            None => Align::new(icon(ICON_IMAGE, palette.text_muted.0, 20.)).finish(),
         };
-        row.add_child(
-            ConstrainedBox::new(
-                Container::new(tile)
-                    .with_background_color(palette.surface.0)
-                    .with_border(Border::all(1.).with_border_color(palette.border.0))
-                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
-                    .finish(),
+        let tile = ConstrainedBox::new(
+            Container::new(Clipped::new(tile).finish())
+                .with_background_color(palette.surface.0)
+                .with_border(Border::all(1.).with_border_color(palette.border.0))
+                .with_corner_radius(radius)
+                .finish(),
+        )
+        .with_width(THUMBNAIL_SIZE)
+        .with_height(THUMBNAIL_SIZE)
+        .finish();
+        let tile = match image.path.clone() {
+            Some(path) => Hoverable::new(
+                cx.view.mouse(&format!("image:{}:{position}", message.id)),
+                move |_| tile,
             )
-            .with_width(THUMBNAIL_WIDTH)
-            .with_height(THUMBNAIL_HEIGHT)
+            .with_cursor(Cursor::PointingHand)
+            .on_click(move |ctx, _, _| {
+                ctx.dispatch_typed_action(TranscriptAction::OpenFile(path.clone()))
+            })
             .finish(),
-        );
+            None => tile,
+        };
+        thumbnails.add_child(tile);
     }
-    row.finish()
+    // A wheel that's mostly vertical goes on to the transcript.
+    NewScrollable::horizontal(
+        SingleAxisConfig::Clipped {
+            handle: cx.view.scroll_handle(&format!("images:{}", message.id)),
+            child: thumbnails.finish(),
+        },
+        Fill::Solid(palette.border_strong.0),
+        Fill::Solid(palette.text_faint.0),
+        Fill::None,
+    )
+    .with_horizontal_scrollbar(ScrollableAppearance::new(
+        ScrollbarWidth::Custom(THUMBNAIL_SCROLLBAR_WIDTH),
+        true,
+    ))
+    .with_propagate_mousewheel_if_not_handled(true)
+    .finish()
 }
 
 /// The line under a message: its time and a copy button, shown on hover. It always takes its
@@ -682,13 +714,18 @@ fn render_table(cx: &RowContext, table: &FormattedTable, tone: MarkdownTone) -> 
         if header {
             element = element.with_weight(Weight::Semibold);
         }
-        Container::new(element.finish())
-            .with_horizontal_padding(12.)
-            .with_vertical_padding(7.)
-            .finish()
+        ClampedWidth::new(
+            Container::new(element.finish())
+                .with_horizontal_padding(12.)
+                .with_vertical_padding(7.)
+                .finish(),
+        )
+        .finish()
     };
     let row = |cells: &[markdown_parser::FormattedTextInline], header: bool, last: bool| {
-        let mut row = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Start);
+        let mut row = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Start)
+            .with_main_axis_size(MainAxisSize::Max);
         for (column, weight) in weights.iter().enumerate() {
             let content = cells
                 .get(column)
@@ -1114,6 +1151,74 @@ impl Element for FractionWidth {
         app: &AppContext,
     ) -> bool {
         self.child.dispatch_event(event, ctx, app)
+    }
+}
+
+/// Reports at most the width it's given and clips what paints past it. Text can't wrap a word
+/// longer than its line (a file path in a narrow table column), and a wider cell would push the
+/// table's right edge out of the transcript.
+struct ClampedWidth {
+    child: Box<dyn Element>,
+    size: Option<Vector2F>,
+}
+
+impl ClampedWidth {
+    fn new(child: Box<dyn Element>) -> Self {
+        Self { child, size: None }
+    }
+}
+
+impl Element for ClampedWidth {
+    fn layout(
+        &mut self,
+        constraint: SizeConstraint,
+        ctx: &mut LayoutContext,
+        app: &AppContext,
+    ) -> Vector2F {
+        let child_size = self.child.layout(constraint, ctx, app);
+        let size = Vector2F::new(child_size.x().min(constraint.max.x()), child_size.y());
+        self.size = Some(size);
+        size
+    }
+
+    fn after_layout(&mut self, ctx: &mut AfterLayoutContext, app: &AppContext) {
+        self.child.after_layout(ctx, app);
+    }
+
+    fn paint(&mut self, origin: Vector2F, ctx: &mut PaintContext, app: &AppContext) {
+        let Some(size) = self.size else {
+            return;
+        };
+        let Some(bounds) = ctx
+            .scene
+            .visible_rect(Point::from_vec2f(origin, ctx.scene.z_index()), size)
+        else {
+            return;
+        };
+        ctx.scene.start_layer(ClipBounds::BoundedBy(bounds));
+        self.child.paint(origin, ctx, app);
+        ctx.scene.stop_layer();
+    }
+
+    fn size(&self) -> Option<Vector2F> {
+        self.size
+    }
+
+    fn origin(&self) -> Option<Point> {
+        self.child.origin()
+    }
+
+    fn dispatch_event(
+        &mut self,
+        event: &DispatchedEvent,
+        ctx: &mut EventContext,
+        app: &AppContext,
+    ) -> bool {
+        self.child.dispatch_event(event, ctx, app)
+    }
+
+    fn as_selectable_element(&self) -> Option<&dyn SelectableElement> {
+        self.child.as_selectable_element()
     }
 }
 

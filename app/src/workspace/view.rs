@@ -3677,7 +3677,14 @@ impl Workspace {
             create_auth_secret_modal: None,
         };
 
+        let is_restored = matches!(workspace_setting, NewWorkspaceSource::Restored { .. });
         ws.configure_new_workspace(workspace_setting, ctx);
+        if is_restored && *GeneralSettings::as_ref(ctx).startup_screen == StartupScreen::Threads {
+            if !ws.vertical_tabs_panel_open {
+                ws.toggle_vertical_tabs_panel(ctx);
+            }
+            ws.set_vertical_tabs_content(VerticalTabsContent::Threads, ctx);
+        }
         ws.sync_panel_positions_from_config(ctx);
         ws.sync_window_button_visibility(ctx);
         ws.update_titlebar_height(ctx);
@@ -3698,6 +3705,9 @@ impl Workspace {
             ctx.dispatch_typed_action_deferred(action);
         }
         if let Some(action) = crate::native_chat::take_dev_open_settings_action() {
+            ctx.dispatch_typed_action_deferred(action);
+        }
+        for action in crate::code::take_dev_open_code_actions() {
             ctx.dispatch_typed_action_deferred(action);
         }
 
@@ -27271,6 +27281,9 @@ impl View for Workspace {
         }
         if *CodeSettings::as_ref(app).show_hidden_files {
             context.set.insert(flags::SHOW_HIDDEN_FILES);
+        }
+        if *CodeSettings::as_ref(app).show_lsp_suggestions {
+            context.set.insert(flags::SHOW_LSP_SUGGESTIONS);
         }
 
         if self.team_uid(app).is_some() {

@@ -3,9 +3,10 @@
 use settings::Setting as _;
 use warp_core::context_flag::ContextFlag;
 use warpui::elements::{
-    ConstrainedBox, CrossAxisAlignment, Empty, Flex, MainAxisAlignment, MainAxisSize,
-    ParentElement, Shrinkable,
+    ConstrainedBox, CrossAxisAlignment, Empty, Flex, Hoverable, MainAxisAlignment, MainAxisSize,
+    ParentElement, Shrinkable, Text,
 };
+use warpui::platform::Cursor;
 use warpui::prelude::{ChildView, Container};
 use warpui::text_layout::ClipConfig;
 use warpui::ui_components::components::UiComponent;
@@ -50,6 +51,7 @@ use crate::terminal::{TerminalManager, TerminalView};
 use crate::ui_components::agent_icon::terminal_view_agent_icon_variant;
 use crate::ui_components::buttons::icon_button_with_color;
 use crate::ui_components::icon_with_status::render_icon_with_status;
+use crate::ui_components::icons::Icon;
 use crate::ui_components::{blended_colors, icons};
 use crate::util::bindings::keybinding_name_to_display_string;
 use crate::workspace::tab_settings::TabSettings;
@@ -62,6 +64,9 @@ use crate::workspace::{WorkspaceAction, WorkspaceRegistry};
 /// few pixels of vertical buffer.
 const PANE_HEADER_AGENT_SIZE: f32 = 26.;
 
+const DOCKED_HEADER_FONT_SIZE: f32 = 12.;
+const DOCKED_HEADER_ICON_SIZE: f32 = 12.;
+const DOCKED_HEADER_PADDING: f32 = 10.;
 impl TerminalView {
     /// Returns a reference to the focus handle if one has been set.
     pub fn focus_handle(&self) -> Option<&PaneFocusHandle> {
@@ -568,6 +573,56 @@ impl TerminalView {
         }
     }
 
+    /// Whether this terminal sits under an editor, like VS Code's terminal panel.
+    fn is_docked_below_editor(&self, app: &AppContext) -> bool {
+        self.focus_handle
+            .as_ref()
+            .is_some_and(|focus_handle| focus_handle.is_docked_below_editor(app))
+    }
+
+    /// The slim bar of a terminal docked under an editor: its title and an "×" that hides it
+    /// (⌘J brings it back).
+    fn render_docked_header(&self, app: &AppContext) -> Box<dyn Element> {
+        let appearance = Appearance::as_ref(app);
+        let theme = appearance.theme();
+        let muted = blended_colors::text_sub(theme, theme.background());
+        let title = Text::new_inline(
+            self.pane_configuration.as_ref(app).title().to_owned(),
+            appearance.ui_font_family(),
+            DOCKED_HEADER_FONT_SIZE,
+        )
+        .with_color(muted)
+        .with_clip(ClipConfig::start())
+        .finish();
+        let close = Hoverable::new(self.docked_close_mouse_state.clone(), move |state| {
+            let color = if state.is_hovered() {
+                blended_colors::text_main(theme, theme.background())
+            } else {
+                muted
+            };
+            ConstrainedBox::new(Icon::X.to_warpui_icon(color.into()).finish())
+                .with_width(DOCKED_HEADER_ICON_SIZE)
+                .with_height(DOCKED_HEADER_ICON_SIZE)
+                .finish()
+        })
+        .with_cursor(Cursor::PointingHand)
+        .on_click(|ctx, _, _| {
+            ctx.dispatch_typed_action(PaneHeaderAction::<TerminalAction, TerminalAction>::Close);
+        })
+        .finish();
+        Container::new(
+            Flex::row()
+                .with_main_axis_size(MainAxisSize::Max)
+                .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_child(Shrinkable::new(1., title).finish())
+                .with_child(close)
+                .finish(),
+        )
+        .with_horizontal_padding(DOCKED_HEADER_PADDING)
+        .finish()
+    }
+
     fn render_terminal_pane_header(
         &self,
         header_ctx: &view::HeaderRenderContext,
@@ -732,16 +787,11 @@ impl BackingView for TerminalView {
             .is_sharer_or_viewer();
         let is_fullscreen_agent_view = FeatureFlag::AgentView.is_enabled()
             && self.agent_view_controller.as_ref(app).is_fullscreen();
-        // A terminal docked under code is separated by a plain divider, like VS Code's panel.
-        let is_docked_below_editor = self
-            .focus_handle
-            .as_ref()
-            .is_some_and(|focus_handle| focus_handle.is_docked_below_editor(app));
         is_shared
             || is_fullscreen_agent_view
+            || self.is_docked_below_editor(app)
             || FeatureFlag::ContextWindowUsageV2.is_enabled()
                 && self.split_pane_state(app).is_in_split_pane()
-                && !is_docked_below_editor
     }
 
     fn render_header_content(
@@ -749,6 +799,11 @@ impl BackingView for TerminalView {
         header_ctx: &view::HeaderRenderContext<'_>,
         app: &AppContext,
     ) -> view::HeaderContent {
+        if self.is_docked_below_editor(app) {
+            return view::HeaderContent::Compact {
+                element: self.render_docked_header(app),
+            };
+        }
         view::HeaderContent::Custom {
             element: self.render_terminal_pane_header(header_ctx, app),
             // We wrap only the title row in the drag handler ourselves;

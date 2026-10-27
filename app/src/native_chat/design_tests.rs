@@ -145,3 +145,48 @@ fn file_overrides_apply_on_top_of_the_warp_palette() {
 fn the_claude_theme_follows_warp_by_default() {
     assert_eq!(ClaudeTheme::default(), ClaudeTheme::Warp);
 }
+
+#[test]
+fn the_font_size_choice_maps_to_points() {
+    assert_eq!(chat_font_size(ClaudeChatFontSize::FollowWarp, 13.), 13.);
+    assert_eq!(chat_font_size(ClaudeChatFontSize::FollowWarp, 40.), 24.);
+    assert_eq!(chat_font_size(ClaudeChatFontSize::Size15, 13.), 15.);
+    assert_eq!(chat_font_size(ClaudeChatFontSize::Size18, 13.), 18.);
+    assert_eq!(
+        ClaudeChatFontSize::default(),
+        ClaudeChatFontSize::FollowWarp
+    );
+    let fixed: Vec<_> = ClaudeChatFontSize::ALL
+        .into_iter()
+        .filter_map(ClaudeChatFontSize::points)
+        .collect();
+    assert!(fixed.windows(2).all(|pair| pair[0] < pair[1]));
+}
+
+#[test]
+fn sizes_scale_with_the_font_size() {
+    let base = Sizes::default();
+    let bigger = base.clone().scaled_to(base.font_size * 2.);
+
+    assert_eq!(bigger.font_size, base.font_size * 2.);
+    assert_eq!(bigger.code_font_size, base.code_font_size * 2.);
+    assert_eq!(bigger.small_font_size, base.small_font_size * 2.);
+    assert_eq!(bigger.tool_row_height, base.tool_row_height * 2.);
+    assert_eq!(bigger.column_max_width, base.column_max_width);
+    assert_eq!(bigger.card_radius, base.card_radius);
+    assert_eq!(base.clone().scaled_to(base.font_size), base);
+}
+
+#[test]
+fn file_sizes_win_over_the_scaled_ones() {
+    let file = DesignFile::from_toml("[sizes]\ncode_font_size = 20.0").unwrap();
+    let sizes = file.sizes_at(13.);
+
+    assert_eq!(sizes.font_size, 13.);
+    assert_eq!(sizes.code_font_size, 20.);
+    assert!(sizes.small_font_size < Sizes::default().small_font_size);
+    assert_eq!(
+        DesignFile::default().sizes_at(13.),
+        Sizes::default().scaled_to(13.)
+    );
+}

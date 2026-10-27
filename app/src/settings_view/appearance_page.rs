@@ -59,6 +59,7 @@ use crate::server::telemetry::{InputUXChangeOrigin, TelemetryEvent};
 use crate::settings::app_icon::{AppIcon, AppIconSettings, ShowDockIconState};
 use crate::settings::{
     AIFontName, AISettings, AppEditorSettings, ClaudeChatAccent, ClaudeChatAccentSetting,
+    ClaudeChatFont, ClaudeChatFontSetting, ClaudeChatFontSize, ClaudeChatFontSizeSetting,
     ClaudeTheme, ClaudeThemeSetting, CodeSettings, CursorBlink, CursorBlinkEnabled,
     CursorDisplayType, DEFAULT_MONOSPACE_FONT_NAME, EnforceMinimumContrast, FocusPaneOnHover,
     FontSettings, FontSettingsChangedEvent, GPUSettings, InputBoxType, InputModeSettings,
@@ -68,6 +69,7 @@ use crate::settings::{
 };
 use crate::terminal::block_list_viewport::InputMode;
 use crate::terminal::blockgrid_element::BlockGridElement;
+use crate::terminal::general_settings::{GeneralSettings, StartupScreen, StartupScreenSetting};
 use crate::terminal::ligature_settings::{LigatureRenderingEnabled, LigatureSettings};
 use crate::terminal::model::ObfuscateSecrets;
 use crate::terminal::model::blockgrid::BlockGrid;
@@ -264,6 +266,26 @@ pub fn init_actions_from_parent_view<T: Action + Clone>(
                     format!("Cor de destaque do chat: {}", accent.label()),
                     builder(SettingsAction::AppearancePageToggle(
                         AppearancePageAction::SetClaudeChatAccent(accent),
+                    )),
+                    context.to_owned(),
+                )
+                .with_group(bindings::BindingGroup::Settings.as_str())
+            }))
+            .chain(ClaudeChatFont::ALL.into_iter().map(|font| {
+                FixedBinding::empty(
+                    format!("Fonte do chat: {}", font.label()),
+                    builder(SettingsAction::AppearancePageToggle(
+                        AppearancePageAction::SetClaudeChatFont(font),
+                    )),
+                    context.to_owned(),
+                )
+                .with_group(bindings::BindingGroup::Settings.as_str())
+            }))
+            .chain(ClaudeChatFontSize::ALL.into_iter().map(|size| {
+                FixedBinding::empty(
+                    format!("Tamanho da fonte do chat: {}", size.label()),
+                    builder(SettingsAction::AppearancePageToggle(
+                        AppearancePageAction::SetClaudeChatFontSize(size),
                     )),
                     context.to_owned(),
                 )
@@ -526,6 +548,9 @@ pub enum AppearancePageAction {
     SetWindowBackdrop(WindowBackdrop),
     SetClaudeTheme(ClaudeTheme),
     SetClaudeChatAccent(ClaudeChatAccent),
+    SetClaudeChatFont(ClaudeChatFont),
+    SetClaudeChatFontSize(ClaudeChatFontSize),
+    SetStartupScreen(StartupScreen),
     ToggleVoiceInput,
     ToggleLeftPanelVisibility,
     ToggleToolsPanelProjectExplorer,
@@ -573,6 +598,9 @@ pub struct AppearanceSettingsPageView {
     window_backdrop_dropdown: ViewHandle<Dropdown<AppearancePageAction>>,
     claude_theme_dropdown: ViewHandle<Dropdown<AppearancePageAction>>,
     claude_chat_accent_dropdown: ViewHandle<Dropdown<AppearancePageAction>>,
+    claude_chat_font_dropdown: ViewHandle<Dropdown<AppearancePageAction>>,
+    claude_chat_font_size_dropdown: ViewHandle<Dropdown<AppearancePageAction>>,
+    startup_screen_dropdown: ViewHandle<Dropdown<AppearancePageAction>>,
     input_type_radio_state: RadioButtonStateHandle,
     app_icon_dropdown: ViewHandle<Dropdown<AppearancePageAction>>,
     workspace_decorations_dropdown: ViewHandle<Dropdown<AppearancePageAction>>,
@@ -667,6 +695,21 @@ impl TypedActionView for AppearanceSettingsPageView {
             SetClaudeChatAccent(accent) => {
                 ThemeSettings::handle(ctx).update(ctx, |settings, ctx| {
                     report_if_error!(settings.claude_chat_accent.set_value(*accent, ctx));
+                });
+            }
+            SetClaudeChatFont(font) => {
+                ThemeSettings::handle(ctx).update(ctx, |settings, ctx| {
+                    report_if_error!(settings.claude_chat_font.set_value(*font, ctx));
+                });
+            }
+            SetClaudeChatFontSize(size) => {
+                ThemeSettings::handle(ctx).update(ctx, |settings, ctx| {
+                    report_if_error!(settings.claude_chat_font_size.set_value(*size, ctx));
+                });
+            }
+            SetStartupScreen(screen) => {
+                GeneralSettings::handle(ctx).update(ctx, |settings, ctx| {
+                    report_if_error!(settings.startup_screen.set_value(*screen, ctx));
                 });
             }
             ToggleVoiceInput => {
@@ -940,6 +983,13 @@ impl AppearanceSettingsPageView {
             me.sync_claude_dropdowns(ctx);
         });
         ctx.subscribe_to_model(&AISettings::handle(ctx), |_, _, _, ctx| ctx.notify());
+        ctx.subscribe_to_model(&GeneralSettings::handle(ctx), |me, _, _, ctx| {
+            let screen = *GeneralSettings::as_ref(ctx).startup_screen;
+            me.startup_screen_dropdown.update(ctx, |dropdown, ctx| {
+                dropdown
+                    .set_selected_by_action(AppearancePageAction::SetStartupScreen(screen), ctx);
+            });
+        });
 
         ctx.subscribe_to_model(
             &FontSettings::handle(ctx),
@@ -1390,6 +1440,38 @@ impl AppearanceSettingsPageView {
             window_backdrop_dropdown: Self::build_window_backdrop_dropdown(ctx),
             claude_theme_dropdown: Self::build_claude_theme_dropdown(ctx),
             claude_chat_accent_dropdown: Self::build_claude_chat_accent_dropdown(ctx),
+            claude_chat_font_dropdown: Self::build_claude_dropdown(
+                ClaudeChatFont::ALL
+                    .map(|font| (font.label(), AppearancePageAction::SetClaudeChatFont(font))),
+                AppearancePageAction::SetClaudeChatFont(
+                    *ThemeSettings::as_ref(ctx).claude_chat_font,
+                ),
+                ctx,
+            ),
+            claude_chat_font_size_dropdown: Self::build_claude_dropdown(
+                ClaudeChatFontSize::ALL.map(|size| {
+                    (
+                        size.label(),
+                        AppearancePageAction::SetClaudeChatFontSize(size),
+                    )
+                }),
+                AppearancePageAction::SetClaudeChatFontSize(
+                    *ThemeSettings::as_ref(ctx).claude_chat_font_size,
+                ),
+                ctx,
+            ),
+            startup_screen_dropdown: Self::build_claude_dropdown(
+                StartupScreen::ALL.map(|screen| {
+                    (
+                        screen.label(),
+                        AppearancePageAction::SetStartupScreen(screen),
+                    )
+                }),
+                AppearancePageAction::SetStartupScreen(
+                    *GeneralSettings::as_ref(ctx).startup_screen,
+                ),
+                ctx,
+            ),
             input_type_radio_state,
             app_icon_dropdown,
             enforce_min_contrast_dropdown,
@@ -1426,8 +1508,11 @@ impl AppearanceSettingsPageView {
         )];
 
         let mut claude_chat_widgets: Vec<Box<dyn SettingsWidget<View = Self>>> = vec![
+            Box::new(StartupScreenWidget),
             Box::new(ClaudeThemeWidget),
             Box::new(ClaudeChatAccentWidget),
+            Box::new(ClaudeChatFontWidget),
+            Box::new(ClaudeChatFontSizeWidget),
         ];
         // The Warp Agent page, where voice input normally lives, is hidden in Picolas Code.
         if cfg!(feature = "voice_input")
@@ -2701,10 +2786,41 @@ impl AppearanceSettingsPageView {
         })
     }
 
+    fn build_claude_dropdown<const N: usize>(
+        items: [(&'static str, AppearancePageAction); N],
+        selected: AppearancePageAction,
+        ctx: &mut ViewContext<Self>,
+    ) -> ViewHandle<Dropdown<AppearancePageAction>> {
+        ctx.add_typed_action_view(|ctx| {
+            let mut dropdown = Dropdown::new(ctx);
+            dropdown.set_items(
+                items
+                    .into_iter()
+                    .map(|(label, action)| DropdownItem::new(label, action))
+                    .collect(),
+                ctx,
+            );
+            dropdown.set_selected_by_action(selected, ctx);
+            dropdown
+        })
+    }
+
     fn sync_claude_dropdowns(&mut self, ctx: &mut ViewContext<Self>) {
         let settings = ThemeSettings::as_ref(ctx);
         let theme = *settings.claude_theme;
         let accent = *settings.claude_chat_accent;
+        let font = *settings.claude_chat_font;
+        let font_size = *settings.claude_chat_font_size;
+        self.claude_chat_font_dropdown.update(ctx, |dropdown, ctx| {
+            dropdown.set_selected_by_action(AppearancePageAction::SetClaudeChatFont(font), ctx);
+        });
+        self.claude_chat_font_size_dropdown
+            .update(ctx, |dropdown, ctx| {
+                dropdown.set_selected_by_action(
+                    AppearancePageAction::SetClaudeChatFontSize(font_size),
+                    ctx,
+                );
+            });
         self.claude_theme_dropdown.update(ctx, |dropdown, ctx| {
             dropdown.set_selected_by_action(AppearancePageAction::SetClaudeTheme(theme), ctx);
         });
@@ -3238,6 +3354,102 @@ impl SettingsWidget for ClaudeChatAccentWidget {
             ),
             None,
             &view.claude_chat_accent_dropdown,
+        )
+    }
+}
+
+struct ClaudeChatFontWidget;
+
+impl SettingsWidget for ClaudeChatFontWidget {
+    type View = AppearanceSettingsPageView;
+
+    fn search_terms(&self) -> &str {
+        "claude chat fonte font family sistema system sf pro warp"
+    }
+
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        render_dropdown_item(
+            appearance,
+            "Fonte do chat",
+            Some("Os blocos de código usam a fonte do terminal."),
+            None,
+            LocalOnlyIconState::for_setting(
+                ClaudeChatFontSetting::storage_key(),
+                ClaudeChatFontSetting::sync_to_cloud(),
+                &mut view.local_only_icon_tooltip_states.borrow_mut(),
+                app,
+            ),
+            None,
+            &view.claude_chat_font_dropdown,
+        )
+    }
+}
+
+struct StartupScreenWidget;
+
+impl SettingsWidget for StartupScreenWidget {
+    type View = AppearanceSettingsPageView;
+
+    fn search_terms(&self) -> &str {
+        "tela inicial startup screen nova janela new window abas tabs threads claude chat"
+    }
+
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        render_dropdown_item(
+            appearance,
+            "Tela inicial",
+            Some("Threads abre o chat e a lista de threads ao iniciar o app."),
+            None,
+            LocalOnlyIconState::for_setting(
+                StartupScreenSetting::storage_key(),
+                StartupScreenSetting::sync_to_cloud(),
+                &mut view.local_only_icon_tooltip_states.borrow_mut(),
+                app,
+            ),
+            None,
+            &view.startup_screen_dropdown,
+        )
+    }
+}
+
+struct ClaudeChatFontSizeWidget;
+
+impl SettingsWidget for ClaudeChatFontSizeWidget {
+    type View = AppearanceSettingsPageView;
+
+    fn search_terms(&self) -> &str {
+        "claude chat tamanho da fonte font size texto text"
+    }
+
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        render_dropdown_item(
+            appearance,
+            "Tamanho da fonte do chat",
+            Some("\"Seguir o Warp\" usa o tamanho de texto do Warp (Text → Font size)."),
+            None,
+            LocalOnlyIconState::for_setting(
+                ClaudeChatFontSizeSetting::storage_key(),
+                ClaudeChatFontSizeSetting::sync_to_cloud(),
+                &mut view.local_only_icon_tooltip_states.borrow_mut(),
+                app,
+            ),
+            None,
+            &view.claude_chat_font_size_dropdown,
         )
     }
 }

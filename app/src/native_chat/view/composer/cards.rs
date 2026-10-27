@@ -14,11 +14,18 @@ use warpui::platform::Cursor;
 
 use super::logic::{self, PermissionPreview};
 use super::widgets::{self, ButtonKind, Look, icon, with_alpha};
-use super::{ComposerAction, ComposerView, PermissionChoice, PlanChoice, exit_error};
+use super::{
+    ComposerAction, ComposerView, PermissionChoice, PlanChoice, QueuedMessage, Withdrawal,
+    exit_error,
+};
 
 const PREVIEW_MAX_HEIGHT: f32 = 132.;
 const PLAN_MAX_HEIGHT: f32 = 300.;
 const TODO_SEGMENTS_MAX: usize = 12;
+/// More queued messages than this scroll.
+const QUEUE_VISIBLE_ROWS: usize = 3;
+const QUEUE_ROW_SPACING: f32 = 2.;
+const QUEUE_INDEX_WIDTH: f32 = 16.;
 
 impl ComposerView {
     pub(super) fn render_cards(&self, look: &Look, app: &AppContext) -> Vec<Box<dyn Element>> {
@@ -78,59 +85,80 @@ impl ComposerView {
             .finish()
     }
 
+    /// The messages waiting for Claude, oldest first, each one sendable now, editable or
+    /// deletable.
     fn render_queued(&self, look: &Look) -> Box<dyn Element> {
         let palette = &look.palette;
         let sizes = &look.sizes;
-        let mut row = warpui::elements::Wrap::row()
-            .with_spacing(6.)
-            .with_run_spacing(6.)
-            .with_child(
-                ConstrainedBox::new(
-                    Flex::row()
-                        .with_main_axis_size(MainAxisSize::Min)
-                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                        .with_spacing(6.)
-                        .with_child(icon(
-                            WarpIcon::Queued,
+        let header = ConstrainedBox::new(
+            Flex::row()
+                .with_main_axis_size(MainAxisSize::Max)
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_spacing(8.)
+                .with_child(icon(
+                    WarpIcon::Queued,
+                    palette.text_muted.0,
+                    sizes.small_icon_size,
+                ))
+                .with_child(look.medium_text("Na fila", sizes.small_font_size, palette.text.0))
+                .with_child(look.text(
+                    self.queued.len().to_string(),
+                    sizes.small_font_size,
+                    palette.text_muted.0,
+                ))
+                .with_child(
+                    Shrinkable::new(
+                        1.,
+                        look.text(
+                            "o Claude lê no próximo passo",
+                            sizes.tiny_font_size,
                             palette.text_faint.0,
-                            sizes.small_icon_size,
-                        ))
-                        .with_child(look.text(
-                            "Na fila",
-                            sizes.small_font_size,
-                            palette.text_faint.0,
-                        ))
-                        .finish(),
-                )
-                .with_height(sizes.chip_height)
-                .finish(),
-            );
-        for message in &self.queued {
-            row.add_child(
-                Container::new(
-                    ConstrainedBox::new(
-                        Flex::row()
-                            .with_main_axis_size(MainAxisSize::Min)
-                            .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                            .with_child(look.text(
-                                message.clone(),
-                                sizes.small_font_size,
-                                palette.text_muted.0,
-                            ))
-                            .finish(),
+                        ),
                     )
-                    .with_height(sizes.chip_height)
                     .finish(),
                 )
-                .with_horizontal_padding(10.)
-                .with_background_color(palette.surface.0)
-                .with_border(Border::all(1.).with_border_color(palette.border.0))
-                .with_corner_radius(look.radius(sizes.chip_height / 2.))
                 .finish(),
-            );
+        )
+        .with_height(sizes.chip_height)
+        .finish();
+
+        let mut rows = Flex::column()
+            .with_main_axis_size(MainAxisSize::Min)
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_spacing(QUEUE_ROW_SPACING);
+        for (position, message) in self.queued.iter().enumerate() {
+            rows.add_child(queued_row(look, position, message));
         }
-        Container::new(row.finish())
-            .with_horizontal_padding(4.)
+        let visible_rows = self.queued.len().min(QUEUE_VISIBLE_ROWS) as f32;
+        let list = ConstrainedBox::new(
+            ClippedScrollable::vertical(
+                self.queue_scroll.clone(),
+                rows.finish(),
+                ScrollbarWidth::Custom(4.),
+                palette.border_strong.0.into(),
+                palette.text_faint.0.into(),
+                ElementFill::None,
+            )
+            .finish(),
+        )
+        .with_max_height(
+            visible_rows * queue_row_height(look) + (visible_rows - 1.) * QUEUE_ROW_SPACING,
+        )
+        .finish();
+
+        let column = Flex::column()
+            .with_main_axis_size(MainAxisSize::Min)
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_child(header)
+            .with_child(Container::new(list).with_padding_top(2.).finish())
+            .finish();
+        Container::new(column)
+            .with_padding_left(sizes.composer_padding)
+            .with_padding_right(6.)
+            .with_vertical_padding(6.)
+            .with_background_color(palette.surface.0)
+            .with_border(Border::all(1.).with_border_color(palette.border.0))
+            .with_corner_radius(look.radius(sizes.card_radius))
             .finish()
     }
 
@@ -790,4 +818,108 @@ impl ComposerView {
             .with_child(buttons)
             .finish()
     }
+}
+
+fn queue_row_height(look: &Look) -> f32 {
+    look.sizes.chip_height - 2.
+}
+
+/// One queued message: its place in line, a one-line preview, and its actions or what is
+/// happening to it.
+fn queued_row(look: &Look, position: usize, message: &QueuedMessage) -> Box<dyn Element> {
+    let state = if message.sending_now {
+        Some("enviando agora…")
+    } else {
+        match message.withdrawing {
+            Some(Withdrawal::Edit) => Some("voltando ao editor…"),
+            Some(Withdrawal::Delete) => Some("apagando…"),
+            None => None,
+        }
+    };
+    let look = look.clone();
+    let uuid = message.uuid.clone();
+    let preview = message.preview.clone();
+    let buttons = [
+        (
+            message.send_now.clone(),
+            WarpIcon::ArrowUp,
+            ComposerAction::SendQueuedNow(uuid.clone()),
+        ),
+        (
+            message.edit.clone(),
+            WarpIcon::Pencil,
+            ComposerAction::EditQueued(uuid.clone()),
+        ),
+        (
+            message.delete.clone(),
+            WarpIcon::Trash,
+            ComposerAction::DeleteQueued(uuid),
+        ),
+    ];
+    Hoverable::new(message.row.clone(), move |row_state| {
+        let palette = &look.palette;
+        let sizes = &look.sizes;
+        let hovered = row_state.is_hovered() && state.is_none();
+        let mut row = Flex::row()
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_child(
+                ConstrainedBox::new(look.text(
+                    (position + 1).to_string(),
+                    sizes.tiny_font_size,
+                    palette.text_faint.0,
+                ))
+                .with_width(QUEUE_INDEX_WIDTH)
+                .finish(),
+            )
+            .with_child(
+                Expanded::new(
+                    1.,
+                    look.text(
+                        preview.clone(),
+                        sizes.small_font_size,
+                        match (state, hovered) {
+                            (Some(_), _) => palette.text_faint.0,
+                            (None, true) => palette.text.0,
+                            (None, false) => palette.text_muted.0,
+                        },
+                    ),
+                )
+                .finish(),
+            );
+        match state {
+            Some(state) => {
+                row.add_child(
+                    Container::new(look.text(state, sizes.tiny_font_size, palette.text_faint.0))
+                        .with_padding_left(8.)
+                        .with_padding_right(6.)
+                        .finish(),
+                );
+            }
+            None => {
+                for (mouse, warp_icon, action) in &buttons {
+                    row.add_child(widgets::subtle_icon_button(
+                        &look,
+                        mouse.clone(),
+                        *warp_icon,
+                        hovered,
+                        action.clone(),
+                    ));
+                }
+            }
+        }
+        let mut container = Container::new(
+            ConstrainedBox::new(row.finish())
+                .with_height(queue_row_height(&look))
+                .finish(),
+        )
+        .with_padding_left(6.)
+        .with_padding_right(2.)
+        .with_corner_radius(look.radius(look.sizes.chip_radius));
+        if hovered {
+            container = container.with_background_color(palette.surface_hover.0);
+        }
+        container.finish()
+    })
+    .finish()
 }

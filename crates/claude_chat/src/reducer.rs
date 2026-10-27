@@ -11,8 +11,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 
 use crate::protocol::{
-    AccountInfo, AssistantMessage, CanUseToolRequest, CommandLifecycle, CompactBoundary,
-    ContentBlock, ContentDelta, ContextUsage, ControlRequestBody, ControlResponse,
+    AccountInfo, AssistantMessage, CanUseToolRequest, CancelAsyncMessageResponse, CommandLifecycle,
+    CompactBoundary, ContentBlock, ContentDelta, ContextUsage, ControlRequestBody, ControlResponse,
     FileSuggestionsResponse, INTERRUPT_MARKER, IncomingRequest, InitializeResponse,
     InterruptResponse, McpAuthenticateResponse, McpServerStatus, McpStatusResponse, MessageContent,
     ModelInfo, RateLimitEvent, RemoteControlResponse, ResultMessage, RewindFilesResponse,
@@ -220,6 +220,11 @@ pub struct Conversation {
     hidden: HashSet<String>,
     /// The user message the CLI is processing (`command_lifecycle` `started`).
     current_command: Option<String>,
+    /// Messages sent while Claude was busy that it hasn't taken in yet, oldest first. They join
+    /// the timeline when it does, so they show up where Claude read them.
+    queued: Vec<UserMessage>,
+    /// Whether the CLI reports `command_lifecycle` frames, which tell when it takes in a message.
+    reports_lifecycle: bool,
     interrupted_this_turn: bool,
     turn_cost_baseline: f64,
 
@@ -260,6 +265,8 @@ impl Conversation {
             working_since: None,
             hidden: HashSet::new(),
             current_command: None,
+            queued: Vec::new(),
+            reports_lifecycle: false,
             interrupted_this_turn: false,
             turn_cost_baseline: 0.0,
             current_message: HashMap::new(),
@@ -284,6 +291,21 @@ impl Conversation {
 
     pub fn pending_requests(&self) -> &[PendingRequest] {
         &self.pending_requests
+    }
+
+    /// Messages Claude hasn't taken in yet, oldest first; see [`Self::tracks_queue`].
+    pub fn queued_messages(&self) -> &[UserMessage] {
+        &self.queued
+    }
+
+    pub fn is_queued(&self, uuid: &str) -> bool {
+        self.queued.iter().any(|message| message.id == uuid)
+    }
+
+    /// Whether the CLI says when it takes each message in, so [`Self::queued_messages`] is exact.
+    /// Without it, messages sent while Claude is busy go straight into the timeline.
+    pub fn tracks_queue(&self) -> bool {
+        self.reports_lifecycle
     }
 
     pub fn status(&self) -> ConversationStatus {
@@ -395,18 +417,23 @@ impl Conversation {
     ) -> Vec<ConversationChange> {
         let mut changes = Changes::default();
         let status = self.status();
-        if !self.index_by_id.contains_key(uuid) {
-            let command = self.parse_command(text);
-            self.insert_item(
-                TimelineItem::User(UserMessage {
-                    id: uuid.to_owned(),
-                    text: text.to_owned(),
-                    images,
-                    command,
-                    timestamp: Some(now),
-                }),
-                &mut changes,
+        if !self.index_by_id.contains_key(uuid) && !self.is_queued(uuid) {
+            let message = UserMessage {
+                id: uuid.to_owned(),
+                text: text.to_owned(),
+                images,
+                command: self.parse_command(text),
+                timestamp: Some(now),
+            };
+            let is_busy = matches!(
+                status,
+                ConversationStatus::Working { .. } | ConversationStatus::AwaitingUser
             );
+            if self.reports_lifecycle && is_busy {
+                self.queued.push(message);
+            } else {
+                self.insert_item(TimelineItem::User(message), &mut changes);
+            }
         }
         if !self
             .outstanding
@@ -426,6 +453,22 @@ impl Conversation {
         self.hidden.insert(uuid.to_owned());
         self.outstanding.retain(|outstanding| outstanding != uuid);
         self.remove_item(uuid, &mut changes);
+        changes.0
+    }
+
+    /// Takes back the queued message `uuid` the CLI dropped before Claude got to it.
+    pub fn withdraw_user_message(
+        &mut self,
+        uuid: &str,
+        now: SystemTime,
+    ) -> Vec<ConversationChange> {
+        let mut changes = Changes::default();
+        let status = self.status();
+        self.hidden.insert(uuid.to_owned());
+        self.outstanding.retain(|outstanding| outstanding != uuid);
+        self.queued.retain(|message| message.id != uuid);
+        self.remove_item(uuid, &mut changes);
+        self.finish(status, now, &mut changes);
         changes.0
     }
 
@@ -476,6 +519,10 @@ impl Conversation {
         }
         self.turn_running = false;
         self.outstanding.clear();
+        // Claude never read them, but their text shouldn't vanish with the process.
+        for message in std::mem::take(&mut self.queued) {
+            self.insert_item(TimelineItem::User(message), &mut changes);
+        }
         self.compacting = false;
         self.finish(status, now, &mut changes);
         changes.0
@@ -611,6 +658,7 @@ impl Conversation {
             | ReplyPayload::RewindFiles(_)
             | ReplyPayload::FileSuggestions(_)
             | ReplyPayload::Interrupt(_)
+            | ReplyPayload::CancelAsyncMessage(_)
             | ReplyPayload::Ack
             | ReplyPayload::Raw(_) => Vec::new(),
         }
@@ -630,7 +678,9 @@ impl Conversation {
             StdoutMessage::User(user) => self.apply_user(*user, now, &mut changes),
             StdoutMessage::Result(result) => self.apply_result(*result, now, &mut changes),
             StdoutMessage::RateLimit(event) => self.apply_rate_limit(event, &mut changes),
-            StdoutMessage::CommandLifecycle(lifecycle) => self.apply_lifecycle(lifecycle),
+            StdoutMessage::CommandLifecycle(lifecycle) => {
+                self.apply_lifecycle(lifecycle, &mut changes)
+            }
             StdoutMessage::ControlRequest(request) => {
                 if let IncomingRequest::CanUseTool(can_use_tool) = request.request {
                     self.add_permission_request(request.request_id, *can_use_tool, &mut changes);
@@ -1417,6 +1467,12 @@ impl Conversation {
             self.push_notice(NoticeKind::CompactSummary(text), changes);
             return;
         }
+        if let Some(uuid) = &user.uuid
+            && self.is_queued(uuid)
+        {
+            self.take_in_queued(uuid, changes);
+            return;
+        }
         let id = match user.uuid {
             Some(uuid) if self.index_by_id.contains_key(&uuid) => return,
             Some(uuid) => uuid,
@@ -1596,22 +1652,38 @@ impl Conversation {
         }
     }
 
-    fn apply_lifecycle(&mut self, lifecycle: CommandLifecycle) {
+    fn apply_lifecycle(&mut self, lifecycle: CommandLifecycle, changes: &mut Changes) {
+        self.reports_lifecycle = true;
+        let uuid = lifecycle.command_uuid;
         match lifecycle.state.as_str() {
             "started" => {
-                if !self.hidden.contains(&lifecycle.command_uuid) {
+                self.take_in_queued(&uuid, changes);
+                if !self.hidden.contains(&uuid) {
                     self.turn_running = true;
                 }
-                self.current_command = Some(lifecycle.command_uuid);
+                self.current_command = Some(uuid);
             }
-            "completed" | "cancelled" => {
-                self.outstanding
-                    .retain(|outstanding| *outstanding != lifecycle.command_uuid);
-                if self.current_command.as_ref() == Some(&lifecycle.command_uuid) {
+            "completed" | "cancelled" | "discarded" | "refused" => {
+                // A terminal state can come without `started`; only `completed` means Claude got it.
+                if lifecycle.state == "completed" {
+                    self.take_in_queued(&uuid, changes);
+                } else {
+                    self.queued.retain(|message| message.id != uuid);
+                }
+                self.outstanding.retain(|outstanding| *outstanding != uuid);
+                if self.current_command.as_ref() == Some(&uuid) {
                     self.current_command = None;
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Moves the queued message `uuid` into the timeline, now that Claude is reading it.
+    fn take_in_queued(&mut self, uuid: &str, changes: &mut Changes) {
+        if let Some(position) = self.queued.iter().position(|message| message.id == uuid) {
+            let message = self.queued.remove(position);
+            self.insert_item(TimelineItem::User(message), changes);
         }
     }
 
@@ -2064,6 +2136,7 @@ pub enum ReplyPayload {
     RewindFiles(RewindFilesResponse),
     FileSuggestions(FileSuggestionsResponse),
     Interrupt(InterruptResponse),
+    CancelAsyncMessage(CancelAsyncMessageResponse),
     /// The mode `set_permission_mode` switched to.
     PermissionMode(String),
     /// A success without a payload we model.
@@ -2155,7 +2228,10 @@ fn decode_reply(request: &ControlRequestBody, value: Value) -> ReplyPayload {
         }
         ControlRequestBody::RewindFiles { .. } => typed(value, ReplyPayload::RewindFiles),
         ControlRequestBody::FileSuggestions { .. } => typed(value, ReplyPayload::FileSuggestions),
-        ControlRequestBody::Interrupt => {
+        ControlRequestBody::CancelAsyncMessage { .. } => {
+            typed(value, ReplyPayload::CancelAsyncMessage)
+        }
+        ControlRequestBody::Interrupt | ControlRequestBody::SendNow { .. } => {
             if value.is_null() {
                 ReplyPayload::Interrupt(InterruptResponse::default())
             } else {

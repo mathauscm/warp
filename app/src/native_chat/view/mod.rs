@@ -8,6 +8,8 @@ mod transcript;
 
 use std::time::Duration;
 
+use base64::Engine as _;
+use claude_chat::protocol::OutgoingImage;
 use instant::Instant;
 use pathfinder_geometry::rect::RectF;
 use pathfinder_geometry::vector::vec2f;
@@ -145,7 +147,7 @@ impl ClaudeChatView {
         }
         if send_draft && let Some(draft) = snapshot.draft.clone() {
             session.update(ctx, |session, ctx| {
-                session.send_message(draft, Vec::new(), ctx)
+                session.send_message(draft, dev_images(), ctx)
             });
         }
 
@@ -223,6 +225,7 @@ impl ClaudeChatView {
             | ClaudeChatSessionEvent::ProcessStateChanged
             | ClaudeChatSessionEvent::HistoryLoaded
             | ClaudeChatSessionEvent::FileSuggestions { .. }
+            | ClaudeChatSessionEvent::QueuedMessageCancelled { .. }
             | ClaudeChatSessionEvent::Error(_) => {}
         }
     }
@@ -477,6 +480,22 @@ fn header_button(
         );
     })
     .finish()
+}
+
+/// `PICOLAS_CHAT_IMAGES=<png>,<png>` attaches those images to the message `PICOLAS_CHAT_SEND`
+/// sends. Debug builds only.
+fn dev_images() -> Vec<OutgoingImage> {
+    let Some(paths) = std::env::var("PICOLAS_CHAT_IMAGES").ok() else {
+        return Vec::new();
+    };
+    paths
+        .split(',')
+        .filter_map(|path| std::fs::read(path.trim()).ok())
+        .map(|bytes| OutgoingImage {
+            media_type: "image/png".to_owned(),
+            data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        })
+        .collect()
 }
 
 fn register_session(

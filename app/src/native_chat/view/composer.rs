@@ -90,7 +90,8 @@ const MAX_MODELS: usize = 32;
 const MAX_EFFORT_LEVELS: usize = 8;
 const MAX_CHIPS: usize = 16;
 const MENTION_PREVIEW_CHARS: usize = 36;
-const QUEUED_PREVIEW_CHARS: usize = 48;
+const QUEUED_PREVIEW_CHARS: usize = 160;
+const QUEUED_ALREADY_SENT: &str = "O Claude já começou a ler essa mensagem.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComposerEvent {
@@ -137,6 +138,9 @@ pub enum ComposerAction {
     Plan(PlanChoice),
     ToggleTodos,
     Restart,
+    SendQueuedNow(String),
+    EditQueued(String),
+    DeleteQueued(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,6 +210,29 @@ impl Menu {
 struct Mention {
     text: String,
     remove: MouseStateHandle,
+}
+
+/// A message sent while Claude was busy, until it gets to it.
+struct QueuedMessage {
+    uuid: String,
+    text: String,
+    preview: String,
+    images: Vec<Attachment>,
+    artifact_kind: Option<ArtifactKind>,
+    /// What the user asked for while the CLI is answering whether it could still take it back.
+    withdrawing: Option<Withdrawal>,
+    /// The user asked Claude to stop and read it now.
+    sending_now: bool,
+    row: MouseStateHandle,
+    send_now: MouseStateHandle,
+    edit: MouseStateHandle,
+    delete: MouseStateHandle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Withdrawal {
+    Edit,
+    Delete,
 }
 
 struct Attachment {
@@ -337,13 +364,13 @@ pub struct ComposerView {
     artifact_kind: Option<ArtifactKind>,
     is_artifact_kind_menu_open: bool,
     voice: VoiceState,
-    /// Messages sent while Claude was busy, until it gets to them.
-    queued: Vec<String>,
+    queued: Vec<QueuedMessage>,
     last_escape: Option<Instant>,
     question: QuestionState,
     is_todos_expanded: bool,
     plan_scroll: ClippedScrollStateHandle,
     models_scroll: ClippedScrollStateHandle,
+    queue_scroll: ClippedScrollStateHandle,
     mouse: MouseStates,
 }
 
@@ -446,11 +473,30 @@ impl ComposerView {
             is_todos_expanded: false,
             plan_scroll: Default::default(),
             models_scroll: Default::default(),
+            queue_scroll: Default::default(),
             mouse: MouseStates::default(),
         };
         me.refresh_menu(ctx);
         me.update_placeholder(ctx);
+        me.send_dev_queue(ctx);
         me
+    }
+
+    /// `PICOLAS_CHAT_QUEUE=<text>[|<text>…]` sends those messages a few seconds after the chat
+    /// opens, while `PICOLAS_CHAT_SEND`'s message keeps Claude busy, to show the queue. Debug
+    /// builds only.
+    fn send_dev_queue(&self, ctx: &mut ViewContext<Self>) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        let Ok(texts) = std::env::var("PICOLAS_CHAT_QUEUE") else {
+            return;
+        };
+        ctx.spawn(Timer::after(Duration::from_secs(6)), move |me, _, ctx| {
+            for text in texts.split('|').filter(|text| !text.trim().is_empty()) {
+                me.send(text.trim().to_owned(), ctx);
+            }
+        });
     }
 
     pub fn focus(&mut self, ctx: &mut ViewContext<Self>) {
@@ -560,26 +606,13 @@ impl ComposerView {
     fn on_session_event(&mut self, event: &ClaudeChatSessionEvent, ctx: &mut ViewContext<Self>) {
         match event {
             ClaudeChatSessionEvent::Changed(changes) => {
-                for change in changes {
-                    if let ConversationChange::ItemInserted { id, .. } = change
-                        && matches!(
-                            self.session.as_ref(ctx).conversation().item(id),
-                            Some(TimelineItem::TurnEnd(_))
-                        )
-                        && !self.queued.is_empty()
-                    {
-                        self.queued.remove(0);
-                    }
+                let queued = self.queued.len();
+                self.sync_queue(changes, ctx);
+                if self.queued.len() != queued || affects_composer(changes) {
+                    self.sync_question(ctx);
+                    self.update_placeholder(ctx);
+                    ctx.notify();
                 }
-                if !matches!(
-                    self.status(ctx),
-                    ConversationStatus::Working { .. } | ConversationStatus::AwaitingUser
-                ) {
-                    self.queued.clear();
-                }
-                self.sync_question(ctx);
-                self.update_placeholder(ctx);
-                ctx.notify();
             }
             ClaudeChatSessionEvent::FileSuggestions { query, paths } => {
                 if let Some(Menu::Files {
@@ -601,9 +634,39 @@ impl ComposerView {
                 self.update_placeholder(ctx);
                 ctx.notify();
             }
+            ClaudeChatSessionEvent::QueuedMessageCancelled { uuid, cancelled } => {
+                self.on_queued_message_cancelled(uuid, *cancelled, ctx);
+            }
             ClaudeChatSessionEvent::TitleChanged
             | ClaudeChatSessionEvent::SessionIdAssigned
             | ClaudeChatSessionEvent::Error(_) => {}
+        }
+    }
+
+    /// Drops the queued messages Claude has taken in (or the CLI dropped).
+    fn sync_queue(&mut self, changes: &[ConversationChange], ctx: &mut ViewContext<Self>) {
+        let conversation = self.session.as_ref(ctx).conversation();
+        if conversation.tracks_queue() {
+            // A withdrawal resolves in `on_queued_message_cancelled`, which needs the message.
+            self.queued.retain(|message| {
+                message.withdrawing.is_some() || conversation.is_queued(&message.uuid)
+            });
+            return;
+        }
+        // Without lifecycle frames, assume the CLI runs queued messages one turn at a time.
+        for change in changes {
+            if let ConversationChange::ItemInserted { id, .. } = change
+                && matches!(conversation.item(id), Some(TimelineItem::TurnEnd(_)))
+                && !self.queued.is_empty()
+            {
+                self.queued.remove(0);
+            }
+        }
+        if !matches!(
+            conversation.status(),
+            ConversationStatus::Working { .. } | ConversationStatus::AwaitingUser
+        ) {
+            self.queued.clear();
         }
     }
 
@@ -964,36 +1027,120 @@ impl ComposerView {
     }
 
     fn send(&mut self, message: String, ctx: &mut ViewContext<Self>) {
-        let images: Vec<OutgoingImage> = self
-            .images
-            .drain(..)
-            .map(|attachment| attachment.image)
+        let attachments: Vec<Attachment> = self.images.drain(..).collect();
+        let images: Vec<OutgoingImage> = attachments
+            .iter()
+            .map(|attachment| attachment.image.clone())
             .collect();
-        if matches!(
+        let is_busy = matches!(
             self.status(ctx),
             ConversationStatus::Working { .. } | ConversationStatus::AwaitingUser
-        ) {
-            let preview = if message.is_empty() {
-                "Imagem".to_owned()
-            } else {
-                logic::preview(&message, QUEUED_PREVIEW_CHARS)
-            };
-            self.queued.push(preview);
-        }
+        );
         let artifact_kind = self
             .artifact_kind
             .take()
             .filter(|_| !message.trim_start().starts_with('/'));
-        match artifact_kind {
+        let text = message.clone();
+        let uuid = match artifact_kind {
             Some(kind) => {
                 let instructions = logic::artifact_instructions(kind);
                 self.session.update(ctx, |session, ctx| {
                     session.send_message_with_instructions(&instructions, message, images, ctx)
-                });
+                })
             }
             None => self.session.update(ctx, |session, ctx| {
                 session.send_message(message, images, ctx)
             }),
+        };
+        let conversation = self.session.as_ref(ctx).conversation();
+        let is_queued = if conversation.tracks_queue() {
+            conversation.is_queued(&uuid)
+        } else {
+            is_busy
+        };
+        if is_queued {
+            let preview = if text.is_empty() {
+                "Imagem".to_owned()
+            } else {
+                logic::preview(&text, QUEUED_PREVIEW_CHARS)
+            };
+            self.queued.push(QueuedMessage {
+                uuid,
+                text,
+                preview,
+                images: attachments,
+                artifact_kind,
+                withdrawing: None,
+                sending_now: false,
+                row: Default::default(),
+                send_now: Default::default(),
+                edit: Default::default(),
+                delete: Default::default(),
+            });
+        }
+        self.update_placeholder(ctx);
+        ctx.notify();
+    }
+
+    fn withdraw_queued(&mut self, uuid: &str, withdrawal: Withdrawal, ctx: &mut ViewContext<Self>) {
+        let Some(message) = self.queued.iter_mut().find(|message| message.uuid == uuid) else {
+            return;
+        };
+        if message.withdrawing.is_some() {
+            return;
+        }
+        message.withdrawing = Some(withdrawal);
+        let uuid = uuid.to_owned();
+        self.session
+            .update(ctx, |session, ctx| session.cancel_queued_message(uuid, ctx));
+        ctx.notify();
+    }
+
+    fn show_notice(&self, message: &str, ctx: &mut ViewContext<Self>) {
+        let window_id = ctx.window_id();
+        crate::workspace::ToastStack::handle(ctx).update(ctx, |toasts, ctx| {
+            toasts.add_ephemeral_toast(
+                crate::view_components::DismissibleToast::default(message.to_owned()),
+                window_id,
+                ctx,
+            );
+        });
+    }
+
+    fn on_queued_message_cancelled(
+        &mut self,
+        uuid: &str,
+        cancelled: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(position) = self.queued.iter().position(|message| message.uuid == uuid) else {
+            return;
+        };
+        if !cancelled {
+            self.queued[position].withdrawing = None;
+            self.sync_queue(&[], ctx);
+            self.show_notice(QUEUED_ALREADY_SENT, ctx);
+            ctx.notify();
+            return;
+        }
+        let message = self.queued.remove(position);
+        if message.withdrawing == Some(Withdrawal::Edit) {
+            let current = self.buffer_text(ctx);
+            let text = if current.trim().is_empty() {
+                message.text
+            } else {
+                format!("{}\n\n{current}", message.text)
+            };
+            self.set_text(&text, ctx);
+            for attachment in message.images {
+                if self.images.len() < MAX_CHIPS {
+                    self.images.push(attachment);
+                }
+            }
+            if self.artifact_kind.is_none() {
+                self.artifact_kind = message.artifact_kind;
+            }
+            self.focus(ctx);
         }
         self.update_placeholder(ctx);
         ctx.notify();
@@ -2149,9 +2296,8 @@ impl TypedActionView for ComposerView {
                 self.update_placeholder(ctx);
             }
             ComposerAction::ResetEffort => {
-                self.session.update(ctx, |session, ctx| {
-                    session.set_effort("auto".to_owned(), ctx)
-                });
+                self.session
+                    .update(ctx, |session, ctx| session.reset_effort(ctx));
                 self.close_popovers(ctx);
             }
             ComposerAction::ClosePopovers => self.close_popovers(ctx),
@@ -2184,8 +2330,50 @@ impl TypedActionView for ComposerView {
                 self.session
                     .update(ctx, |session, ctx| session.restart(ctx));
             }
+            ComposerAction::SendQueuedNow(uuid) => {
+                let Some(message) = self
+                    .queued
+                    .iter_mut()
+                    .find(|message| message.uuid == *uuid && !message.sending_now)
+                else {
+                    return;
+                };
+                message.sending_now = true;
+                let uuid = uuid.clone();
+                self.session.update(ctx, |session, ctx| {
+                    session.send_queued_message_now(uuid, ctx)
+                });
+                ctx.notify();
+            }
+            ComposerAction::EditQueued(uuid) => self.withdraw_queued(uuid, Withdrawal::Edit, ctx),
+            ComposerAction::DeleteQueued(uuid) => {
+                self.withdraw_queued(uuid, Withdrawal::Delete, ctx)
+            }
         }
     }
+}
+
+/// Whether conversation changes touch anything the composer shows; streamed text doesn't.
+fn affects_composer(changes: &[ConversationChange]) -> bool {
+    changes.is_empty()
+        || changes.iter().any(|change| match change {
+            ConversationChange::Status
+            | ConversationChange::PendingRequests
+            | ConversationChange::Session
+            | ConversationChange::Commands
+            | ConversationChange::Models
+            | ConversationChange::ContextUsage
+            | ConversationChange::Todos => true,
+            ConversationChange::ItemInserted { .. }
+            | ConversationChange::ItemUpdated { .. }
+            | ConversationChange::ItemRemoved { .. }
+            | ConversationChange::Account
+            | ConversationChange::McpServers
+            | ConversationChange::RateLimits
+            | ConversationChange::Cost
+            | ConversationChange::Tasks
+            | ConversationChange::RemoteControl => false,
+        })
 }
 
 /// Whether the process ended with an error, and why.

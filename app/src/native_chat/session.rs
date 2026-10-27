@@ -28,12 +28,11 @@ const MCP_POLL_INTERVAL: Duration = Duration::from_secs(3);
 /// MCP servers usually connect within a few seconds; stop polling after this many tries.
 const MCP_POLL_ATTEMPTS: usize = 10;
 const TITLE_MAX_CHARS: usize = 60;
-/// What Claude is told about the artifacts tools, on top of their own descriptions.
-const ARTIFACTS_PROMPT: &str = "You are running inside Picolas Code, a desktop app with a native \
-chat UI. When the user asks for something they'd want to view, present or share — a document, \
-report, slide deck, dashboard, chart, design mock or animation — build it as a single \
-self-contained HTML page with the `create_artifact` tool (update it with `update_artifact`); the \
-app shows it in its Artefatos gallery and renders it interactively.";
+/// Appended to Claude Code's system prompt. Kept neutral so Claude behaves as it does in a
+/// terminal; the artifacts tools describe themselves. It must not be empty: without an appended
+/// prompt, a headless CLI introduces itself as a generic "Claude agent" instead of Claude Code.
+const APPEND_SYSTEM_PROMPT: &str =
+    "You are running inside Picolas Code, a desktop app with a native chat UI for Claude Code.";
 
 /// Where the native chat keeps its artifacts.
 pub fn artifacts_root() -> PathBuf {
@@ -45,6 +44,23 @@ fn claude_home() -> Option<PathBuf> {
     static HOME: OnceLock<Option<PathBuf>> = OnceLock::new();
     HOME.get_or_init(|| dirs::home_dir().map(|home| home.join(".claude")))
         .clone()
+}
+
+/// The top-level `effortLevel` in Claude Code's settings for `cwd`: local, then project, then user
+/// settings, the way the CLI layers them.
+fn configured_effort(cwd: &Path) -> Option<String> {
+    let project = cwd.join(".claude");
+    [
+        Some(project.join("settings.local.json")),
+        Some(project.join("settings.json")),
+        claude_home().map(|home| home.join("settings.json")),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|path| {
+        let settings: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+        settings.get("effortLevel")?.as_str().map(str::to_owned)
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +86,12 @@ pub enum ClaudeChatSessionEvent {
     FileSuggestions {
         query: String,
         paths: Vec<String>,
+    },
+    /// The CLI answered taking the queued message `uuid` back; `cancelled` is false when Claude
+    /// had already taken it in.
+    QueuedMessageCancelled {
+        uuid: String,
+        cancelled: bool,
     },
     /// A request the UI made failed, with a message to show.
     Error(String),
@@ -240,7 +262,7 @@ impl ClaudeChatSession {
         self.request(
             ControlRequestBody::Initialize {
                 sdk_mcp_servers: vec![artifacts::SERVER_NAME.to_owned()],
-                append_system_prompt: Some(ARTIFACTS_PROMPT.to_owned()),
+                append_system_prompt: Some(APPEND_SYSTEM_PROMPT.to_owned()),
             },
             ctx,
         );
@@ -411,8 +433,14 @@ impl ClaudeChatSession {
             }
             message => {
                 let finished_turn = matches!(message, StdoutMessage::Result(_));
+                let queued = self.conversation.queued_messages().len();
                 let changes = self.conversation.apply(message, SystemTime::now());
-                self.apply_changes(changes, ctx);
+                if changes.is_empty() && self.conversation.queued_messages().len() != queued {
+                    // The queue isn't a change of its own; an empty batch still has views re-read it.
+                    ctx.emit(ClaudeChatSessionEvent::Changed(changes));
+                } else {
+                    self.apply_changes(changes, ctx);
+                }
                 if finished_turn {
                     self.on_turn_finished(ctx);
                 }
@@ -521,6 +549,20 @@ impl ClaudeChatSession {
                     self.poll_mcp_status(MCP_POLL_ATTEMPTS * 4, ctx);
                 }
             }
+            Ok(ReplyPayload::CancelAsyncMessage(response)) => {
+                if let ControlRequestBody::CancelAsyncMessage { message_uuid } = &reply.request {
+                    if response.cancelled {
+                        let changes = self
+                            .conversation
+                            .withdraw_user_message(message_uuid, SystemTime::now());
+                        self.apply_changes(changes, ctx);
+                    }
+                    ctx.emit(ClaudeChatSessionEvent::QueuedMessageCancelled {
+                        uuid: message_uuid.clone(),
+                        cancelled: response.cancelled,
+                    });
+                }
+            }
             Ok(ReplyPayload::FileSuggestions(response)) => {
                 if let ControlRequestBody::FileSuggestions { query } = &reply.request {
                     ctx.emit(ClaudeChatSessionEvent::FileSuggestions {
@@ -539,6 +581,12 @@ impl ClaudeChatSession {
             }
             Err(error) => {
                 log::warn!("Native chat: {} failed: {error}", reply.request.subtype());
+                if let ControlRequestBody::CancelAsyncMessage { message_uuid } = &reply.request {
+                    ctx.emit(ClaudeChatSessionEvent::QueuedMessageCancelled {
+                        uuid: message_uuid.clone(),
+                        cancelled: false,
+                    });
+                }
                 if !matches!(
                     reply.request,
                     ControlRequestBody::GetUsage { .. }
@@ -552,13 +600,13 @@ impl ClaudeChatSession {
 
     // --- actions ----------------------------------------------------------------------------
 
-    /// Sends a message (or a slash command typed as text) to Claude.
+    /// Sends a message (or a slash command typed as text) to Claude. Returns its uuid.
     pub fn send_message(
         &mut self,
         text: String,
         images: Vec<OutgoingImage>,
         ctx: &mut ModelContext<Self>,
-    ) {
+    ) -> String {
         if self.process.is_none() && matches!(self.state, ProcessState::Exited { .. }) {
             self.restart(ctx);
         }
@@ -580,6 +628,27 @@ impl ClaudeChatSession {
             self.has_sent = true;
             ctx.emit(ClaudeChatSessionEvent::SessionIdAssigned);
         }
+        uuid
+    }
+
+    /// Asks the CLI to drop the queued message `uuid`; see
+    /// [`ClaudeChatSessionEvent::QueuedMessageCancelled`].
+    pub fn cancel_queued_message(&mut self, uuid: String, ctx: &mut ModelContext<Self>) {
+        self.request(
+            ControlRequestBody::CancelAsyncMessage { message_uuid: uuid },
+            ctx,
+        );
+    }
+
+    /// Has Claude take the queued message `uuid` in now, making way for it in the running turn.
+    pub fn send_queued_message_now(&mut self, uuid: String, ctx: &mut ModelContext<Self>) {
+        self.request(
+            ControlRequestBody::SendNow {
+                message_uuid: uuid,
+                send_now: true,
+            },
+            ctx,
+        );
     }
 
     /// Runs a slash command on the user's behalf without showing it in the conversation.
@@ -712,6 +781,15 @@ impl ClaudeChatSession {
         self.send_hidden_command(format!("/effort {effort}"), ctx);
     }
 
+    /// Goes back to the effort configured in Claude Code's settings. `/effort auto` would drop to
+    /// the API default instead, below what the user configured.
+    pub fn reset_effort(&mut self, ctx: &mut ModelContext<Self>) {
+        match configured_effort(&self.cwd) {
+            Some(effort) => self.set_effort(effort, ctx),
+            None => self.effort_override = None,
+        }
+    }
+
     /// The effort the user picked in this session, which the CLI doesn't always report back.
     pub fn effort(&self) -> Option<&str> {
         self.effort_override
@@ -815,7 +893,7 @@ impl ClaudeChatSession {
         text: String,
         images: Vec<OutgoingImage>,
         ctx: &mut ModelContext<Self>,
-    ) {
+    ) -> String {
         if self.process.is_none() && matches!(self.state, ProcessState::Exited { .. }) {
             self.restart(ctx);
         }
@@ -838,6 +916,7 @@ impl ClaudeChatSession {
             self.has_sent = true;
             ctx.emit(ClaudeChatSessionEvent::SessionIdAssigned);
         }
+        uuid
     }
 }
 

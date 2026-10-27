@@ -276,6 +276,7 @@ fn affects_panel(event: &ClaudeChatSessionEvent) -> bool {
         | ClaudeChatSessionEvent::SessionIdAssigned => true,
         ClaudeChatSessionEvent::TitleChanged
         | ClaudeChatSessionEvent::FileSuggestions { .. }
+        | ClaudeChatSessionEvent::QueuedMessageCancelled { .. }
         | ClaudeChatSessionEvent::Error(_) => false,
     }
 }

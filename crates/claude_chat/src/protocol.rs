@@ -1019,7 +1019,8 @@ pub struct CommandLifecycle {
     /// The uuid of the user message this is about.
     #[serde(deserialize_with = "nullable")]
     pub command_uuid: String,
-    /// `queued`, `started`, `completed` or `cancelled`.
+    /// `queued`, `started` (Claude took it in, maybe into the running turn), then `completed`,
+    /// `cancelled`, `discarded` or `refused`.
     #[serde(deserialize_with = "nullable")]
     pub state: String,
 }
@@ -1517,6 +1518,13 @@ impl FileSuggestionsResponse {
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default)]
+pub struct CancelAsyncMessageResponse {
+    /// False when the message wasn't queued anymore: Claude already took it in.
+    pub cancelled: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
 pub struct InterruptResponse {
     #[serde(deserialize_with = "nullable")]
     pub still_queued: Vec<String>,
@@ -1633,6 +1641,16 @@ pub enum ControlRequestBody {
     FileSuggestions {
         query: String,
     },
+    /// Takes a message the user sent while Claude was busy back out of the CLI's queue.
+    CancelAsyncMessage {
+        message_uuid: String,
+    },
+    /// Has Claude take the queued message in now instead of after the running turn.
+    #[serde(rename = "interrupt")]
+    SendNow {
+        message_uuid: String,
+        send_now: bool,
+    },
 }
 
 impl ControlRequestBody {
@@ -1654,6 +1672,8 @@ impl ControlRequestBody {
             ControlRequestBody::RemoteControl { .. } => "remote_control",
             ControlRequestBody::RewindFiles { .. } => "rewind_files",
             ControlRequestBody::FileSuggestions { .. } => "file_suggestions",
+            ControlRequestBody::CancelAsyncMessage { .. } => "cancel_async_message",
+            ControlRequestBody::SendNow { .. } => "interrupt",
         }
     }
 }
