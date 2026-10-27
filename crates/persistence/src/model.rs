@@ -10,9 +10,9 @@ use warp_multi_agent_api::{self as api};
 
 use super::schema::{
     active_mcp_servers, agent_conversations, agent_tasks, ai_document_panes, ai_memory_panes,
-    ambient_agent_panes, app, blocks, cloud_objects_refreshes, code_pane_tabs, code_panes,
-    code_review_panes, commands, current_user_information, env_var_collection_panes, folders,
-    generic_string_objects, ignored_suggestions, mcp_environment_variables,
+    ambient_agent_panes, app, blocks, claude_chat_panes, cloud_objects_refreshes, code_pane_tabs,
+    code_panes, code_review_panes, commands, current_user_information, env_var_collection_panes,
+    folders, generic_string_objects, ignored_suggestions, mcp_environment_variables,
     mcp_server_installations, mcp_server_panes, notebook_panes, notebooks, object_actions,
     object_metadata, object_permissions, pane_branches, pane_leaves, pane_nodes, panels,
     project_rules, projects, server_experiments, settings_panes, tab_groups, tabs, team_members,
@@ -594,6 +594,9 @@ pub const AI_DOCUMENT_PANE_KIND: &str = "ai_document";
 /// The [`pane_leaves::kind`] value for ambient agent (cloud mode) panes.
 pub const AMBIENT_AGENT_PANE_KIND: &str = "ambient_agent";
 
+/// The [`pane_leaves::kind`] value for native Claude chat panes.
+pub const CLAUDE_CHAT_PANE_KIND: &str = "claude_chat";
+
 #[derive(Insertable)]
 #[diesel(table_name = terminal_panes)]
 pub struct NewTerminalPane {
@@ -694,6 +697,24 @@ pub struct NewAmbientAgentPane {
     pub id: i32,
     pub uuid: Vec<u8>,
     pub task_id: Option<String>,
+}
+
+#[derive(Identifiable, Queryable, Selectable)]
+#[diesel(table_name = claude_chat_panes)]
+#[diesel(primary_key(id))]
+pub struct ClaudeChatPane {
+    pub id: i32,
+    pub kind: String,
+    pub session_id: Option<String>,
+    pub cwd: String,
+}
+
+#[derive(Insertable)]
+#[diesel(table_name = claude_chat_panes)]
+pub struct NewClaudeChatPane {
+    pub id: i32,
+    pub session_id: Option<String>,
+    pub cwd: String,
 }
 
 #[derive(Insertable)]

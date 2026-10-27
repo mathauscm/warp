@@ -825,3 +825,35 @@ fn stowed_panes_keep_their_place_but_are_not_visible() {
     assert_eq!(tree.visible_pane_ids(), vec![panes[0], panes[1]]);
     assert!(tree.stowed_pane_ids().is_empty());
 }
+
+#[test]
+fn a_pane_stacked_under_an_editor_is_docked_below_it() {
+    let editor = PaneId::dummy_pane_id();
+    let terminal = PaneId::dummy_pane_id();
+    let side = PaneId::dummy_pane_id();
+    let mut tree = PaneData::new(editor);
+    tree.split(editor, terminal, Direction::Down);
+    tree.split(editor, side, Direction::Right);
+
+    let docked = tree.panes_docked_below(|pane_id| pane_id == editor);
+    assert_eq!(docked, HashSet::from([terminal]));
+
+    tree.stow_pane(terminal);
+    assert!(
+        tree.panes_docked_below(|pane_id| pane_id == editor)
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_pane_beside_an_editor_is_not_docked() {
+    let editor = PaneId::dummy_pane_id();
+    let terminal = PaneId::dummy_pane_id();
+    let mut tree = PaneData::new(editor);
+    tree.split(editor, terminal, Direction::Right);
+
+    assert!(
+        tree.panes_docked_below(|pane_id| pane_id == editor)
+            .is_empty()
+    );
+}

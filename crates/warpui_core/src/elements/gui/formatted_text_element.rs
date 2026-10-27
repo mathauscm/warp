@@ -30,7 +30,8 @@ use crate::text::{
     count_chars_up_to_byte,
 };
 use crate::text_layout::{
-    ClipConfig, DEFAULT_TOP_BOTTOM_RATIO, StyleAndFont, TextAlignment, TextFrame, TextStyle,
+    ClipConfig, DEFAULT_TOP_BOTTOM_RATIO, StyleAndFont, TextAlignment, TextBorder, TextFrame,
+    TextStyle,
 };
 use crate::{
     AfterLayoutContext, AppContext, Element, Event, EventContext, LayoutContext, PaintContext,
@@ -158,6 +159,7 @@ pub struct FormattedTextElement {
     alignment: TextAlignment,
     inline_code_font_color: Option<ColorU>,
     inline_code_bg_color: Option<ColorU>,
+    inline_code_border: Option<TextBorder>,
     hyperlink_support: HyperlinkSupport,
     saved_glyph_positions: Vec<SavedGlyphPositionIds>,
     is_selectable: bool,
@@ -195,6 +197,7 @@ impl FormattedTextElement {
             text_frame_mouse_handlers: vec![],
             inline_code_font_color: None,
             inline_code_bg_color: None,
+            inline_code_border: None,
             alignment: Default::default(),
             hyperlink_support,
             saved_glyph_positions: vec![],
@@ -505,6 +508,13 @@ impl FormattedTextElement {
     ) -> Self {
         self.inline_code_font_color = inline_code_font_color;
         self.inline_code_bg_color = inline_code_bg_color;
+        self
+    }
+
+    /// Draws inline code's background as a rounded box of this shape rather than a full-height
+    /// band.
+    pub fn with_inline_code_border(mut self, border: TextBorder) -> Self {
+        self.inline_code_border = Some(border);
         self
     }
 
@@ -1864,6 +1874,9 @@ impl Element for FormattedTextElement {
                                 && text_style.background_color.is_none()
                             {
                                 text_style.background_color = Some(bg_color);
+                                if text_style.border.is_none() {
+                                    text_style.border = self.inline_code_border;
+                                }
                             }
                         }
 

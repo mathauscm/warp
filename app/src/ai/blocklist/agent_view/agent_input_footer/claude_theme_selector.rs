@@ -24,12 +24,7 @@ use crate::view_components::action_button::{ActionButton, ButtonSize, TooltipAli
 const LABEL: &str = "Tema";
 const TOOLTIP: &str = "Tema do Claude Code";
 const CHECK_ICON_SIZE: f32 = 14.;
-const THEMES: [ClaudeTheme; 4] = [
-    ClaudeTheme::ClaudeDark,
-    ClaudeTheme::ClaudeLight,
-    ClaudeTheme::System,
-    ClaudeTheme::Warp,
-];
+const THEMES: [ClaudeTheme; 4] = ClaudeTheme::ALL;
 
 /// Footer button of Claude Code panes that picks the panes' colors.
 pub struct ClaudeThemeSelector {

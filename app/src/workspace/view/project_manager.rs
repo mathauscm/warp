@@ -30,7 +30,6 @@ use warpui::ui_components::text_input::TextInput;
 use warpui::{AppContext, Entity, SingletonEntity, TypedActionView, View, ViewContext, ViewHandle};
 
 use crate::appearance::Appearance;
-use crate::claude_threads::NEW_THREAD_COMMAND;
 use crate::editor::{EditorView, Event as EditorEvent, SingleLineEditorOptions, TextOptions};
 use crate::project_manager::{self, NO_TAG_LABEL, Project, ViewPrefs};
 use crate::terminal::CLIAgent;
@@ -380,9 +379,11 @@ impl TypedActionView for ProjectManagerView {
             }
             ProjectManagerAction::OpenClaude(index) => {
                 if let Some(project) = self.projects.get(*index) {
-                    ctx.dispatch_typed_action_deferred(WorkspaceAction::RunCommandInNewTab {
-                        directory: project.root(),
-                        command: NEW_THREAD_COMMAND.to_owned(),
+                    ctx.dispatch_typed_action_deferred(WorkspaceAction::OpenClaudeChat {
+                        cwd: project.root(),
+                        session_id: None,
+                        draft: None,
+                        artifact_kind: None,
                         group: Some(project.name.clone()),
                     });
                 }

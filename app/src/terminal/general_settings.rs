@@ -176,5 +176,51 @@ define_settings_group!(GeneralSettings, settings: [
         sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
         surface: settings::SettingSurfaces::GUI,
         private: true,
+    },    startup_screen: StartupScreenSetting {
+        type: StartupScreen,
+        default: StartupScreen::default(),
+        supported_platforms: SupportedPlatforms::DESKTOP,
+        sync_to_cloud: SyncToCloud::Never,
+        surface: settings::SettingSurfaces::GUI,
+        private: false,
+        toml_path: "general.startup_screen",
+        description: "What a new window shows: a terminal, or a Claude chat with the threads list.",
     },
 ]);
+
+/// What a new window (not a restored one) opens with.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(
+    description = "What a new window opens with.",
+    rename_all = "snake_case"
+)]
+pub enum StartupScreen {
+    /// A terminal tab.
+    #[default]
+    Terminal,
+    /// A native Claude chat in the home folder, with the threads list open.
+    Threads,
+}
+
+impl StartupScreen {
+    /// In the order the pickers list them.
+    pub const ALL: [Self; 2] = [Self::Terminal, Self::Threads];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Terminal => "Terminal",
+            Self::Threads => "Threads",
+        }
+    }
+}

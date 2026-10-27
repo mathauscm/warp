@@ -1,4 +1,5 @@
 mod queries;
+mod snippet;
 use std::cell::{Ref, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -11,6 +12,7 @@ use queries::highlight_query::HighlightQuery;
 pub use queries::highlight_query::{ColorMap, TextSlice};
 use queries::indent_query::{IndentDelta, indentation_delta};
 use rangemap::{RangeMap, RangeSet};
+pub use snippet::highlight_snippet;
 use string_offset::{ByteOffset, CharOffset};
 use warp_editor::content::buffer::{Buffer, BufferSnapshot};
 use warp_editor::content::edit::PreciseDelta;

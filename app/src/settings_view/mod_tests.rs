@@ -1160,3 +1160,13 @@ fn category_header_with_trailing_element_and_no_subtitle_does_not_panic_flex_lay
         });
     });
 }
+
+#[test]
+fn only_warps_own_agent_pages_are_hidden() {
+    assert!(SettingsSection::WarpAgent.is_hidden());
+    assert!(SettingsSection::AgentMCPServers.is_hidden());
+    assert!(SettingsSection::WarpCloudAgentAPIKeys.is_hidden());
+    assert!(!SettingsSection::Appearance.is_hidden());
+    assert!(!SettingsSection::Features.is_hidden());
+    assert!(!SettingsSection::EditorAndCodeReview.is_hidden());
+}

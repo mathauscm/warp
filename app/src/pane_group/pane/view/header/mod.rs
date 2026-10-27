@@ -201,6 +201,7 @@ impl<P: BackingView> PaneHeader<P> {
             |_me, _, event, ctx| match event {
                 PaneGroupFocusEvent::InSplitPaneChanged
                 | PaneGroupFocusEvent::FocusedPaneMaximizedChanged
+                | PaneGroupFocusEvent::DockedPanesChanged
                 | PaneGroupFocusEvent::FocusChanged { .. } => ctx.notify(),
                 PaneGroupFocusEvent::ActiveSessionChanged { .. } => {}
             },

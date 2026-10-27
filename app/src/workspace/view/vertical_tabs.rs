@@ -4501,6 +4501,8 @@ impl PaneGroup {
             IPaneType::CustomRouterEditor
             | IPaneType::GetStarted
             | IPaneType::NetworkLog
+            | IPaneType::ClaudeChat
+            | IPaneType::Artifacts
             | IPaneType::DeferredPlaceholder => TypedPane::Other,
             #[cfg(test)]
             IPaneType::Dummy => TypedPane::Other,

@@ -3,6 +3,8 @@
 //! works when dragging a group that holds a single tab, and dropping a Claude
 //! thread from the Threads panel opens it in a new split there.
 
+use std::path::Path;
+
 use pathfinder_color::ColorU;
 use pathfinder_geometry::rect::RectF;
 use pathfinder_geometry::vector::{Vector2F, vec2f};
@@ -13,8 +15,9 @@ use warpui::elements::{
 use warpui::{AppContext, EntityId, SingletonEntity, ViewContext, ViewHandle};
 
 use super::Workspace;
+use crate::app_state::ClaudeChatPaneSnapshot;
 use crate::appearance::Appearance;
-use crate::pane_group::{Direction, PaneGroup, PaneId};
+use crate::pane_group::{AnyPaneContent, ClaudeChatPane, Direction, PaneGroup, PaneId};
 use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
 use crate::workspace::WorkspaceRegistry;
 use crate::workspace::tab_group::TabGroupId;
@@ -147,14 +150,13 @@ impl Workspace {
         }
     }
 
-    /// Ends a thread drag over a pane of the active tab. A thread already
-    /// running in this window moves its pane next to the target; otherwise
-    /// the target is split on the highlighted side and `command` (which
-    /// resumes the thread) runs there.
+    /// Ends a thread drag over a pane of the active tab. A thread already open in this window
+    /// (a terminal running it, or its native chat) moves its pane next to the target; otherwise a
+    /// native chat on it opens there, split on the highlighted side.
     pub(super) fn drop_thread(
         &mut self,
         session_id: &str,
-        command: Option<&str>,
+        cwd: &Path,
         ctx: &mut ViewContext<Self>,
     ) {
         let Some(target) = self.thread_split_target.take() else {
@@ -165,15 +167,24 @@ impl Workspace {
             .map(|(terminal_view_id, _)| terminal_view_id);
         if let Some(terminal_view_id) = running_in {
             self.move_terminal_pane_to(terminal_view_id, target, ctx);
-        } else if let Some(command) = command {
-            let terminal = self.active_tab_pane_group().update(ctx, |group, ctx| {
-                group.split_terminal_pane_from(target.pane_id, target.direction, ctx)
-            });
-            if let Some(terminal) = terminal {
-                terminal.update(ctx, |terminal, ctx| {
-                    terminal.set_hidden_pending_command(command, ctx);
-                });
+        } else if let Some(locator) = self.find_claude_chat_pane(session_id, ctx) {
+            if let Some(source_group) = self
+                .tabs
+                .iter()
+                .find(|tab| tab.pane_group.id() == locator.pane_group_id)
+                .map(|tab| tab.pane_group.clone())
+            {
+                self.move_pane_to(source_group, locator.pane_id, target, ctx);
             }
+        } else {
+            let pane = ClaudeChatPane::new(
+                ClaudeChatPaneSnapshot::resume(cwd.to_path_buf(), session_id.to_owned()),
+                ctx,
+            );
+            self.active_tab_pane_group().update(ctx, |group, ctx| {
+                let pane: Box<dyn AnyPaneContent> = Box::new(pane);
+                group.add_pane_sibling(target.pane_id, target.direction, pane, true, ctx);
+            });
         }
         ctx.dispatch_global_action("workspace:save_app", ());
         ctx.notify();
@@ -229,6 +240,18 @@ impl Workspace {
         }) else {
             return;
         };
+        self.move_pane_to(source_group, pane_id, target, ctx);
+    }
+
+    /// Moves `pane_id` from `source_group` next to the target pane of the active tab. A tab left
+    /// empty closes.
+    fn move_pane_to(
+        &mut self,
+        source_group: ViewHandle<PaneGroup>,
+        pane_id: PaneId,
+        target: PaneDropTarget,
+        ctx: &mut ViewContext<Self>,
+    ) {
         if pane_id == target.pane_id {
             return;
         }

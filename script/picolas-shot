@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+#
+# Screenshot of the dev app's window, for checking UI changes without a person at the screen:
+# builds the debug app, launches it with the given environment, waits, captures only its window
+# (even behind other windows) and quits it. Runs are serialized with a lock, since only one dev
+# app can run at a time.
+#
+# Usage:
+#   PICOLAS_OPEN_CHAT=<folder>[#<session id>] ./script/picolas-shot <out.png> [seconds to wait]
+#
+# Other variables: PICOLAS_CHAT_DRAFT, PICOLAS_CHAT_SEND, PICOLAS_CHAT_MODEL (see
+# app/src/native_chat/mod.rs).
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")"/.. && pwd)"
+cd "$REPO_ROOT"
+
+OUT="${1:?usage: picolas-shot <out.png> [seconds]}"
+WAIT="${2:-20}"
+LOCK_DIR="${TMPDIR:-/tmp}/picolas-shot.lock"
+
+until mkdir "$LOCK_DIR" 2>/dev/null; do
+  # A lock older than 15 minutes belongs to a run that died.
+  if [[ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin +15 2>/dev/null)" ]]; then
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+  fi
+  sleep 2
+done
+trap './script/picolas-dev --stop; rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
+
+./script/picolas-dev
+sleep "$WAIT"
+WINDOW_ID="$(swift script/picolas/window-id.swift "$(cat target/picolas-dev.pid)")"
+if [[ -z "$WINDOW_ID" ]]; then
+  echo "The dev app has no window" >&2
+  exit 1
+fi
+screencapture -x -o -l"$WINDOW_ID" "$OUT"
+echo "Saved $OUT"

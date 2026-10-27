@@ -862,6 +862,22 @@ pub enum WorkspaceAction {
         /// name yet (e.g. the project folder of a Claude thread).
         group: Option<String>,
     },
+    /// Open a native Claude chat in a new tab, or focus the tab already showing the conversation.
+    OpenClaudeChat {
+        cwd: PathBuf,
+        /// The conversation to resume; `None` starts a new one.
+        session_id: Option<String>,
+        /// Text to start the composer with.
+        draft: Option<String>,
+        /// The kind of artifact (`ArtifactKind::as_str`) the first message asks for.
+        artifact_kind: Option<String>,
+        /// Tab group to put the new tab in, like the thread's project.
+        group: Option<String>,
+    },
+    /// Open the gallery of local artifacts, or an artifact in it.
+    OpenArtifacts {
+        artifact_id: Option<String>,
+    },
     /// Show the Threads panel (Claude Code conversations by project) in the
     /// vertical tabs sidebar, or hide it when it's already showing.
     ToggleClaudeThreadsPanel,
@@ -889,10 +905,10 @@ pub enum WorkspaceAction {
     },
     /// A dragged Claude thread was dropped: over a pane of the active tab it
     /// moves there as a split. A thread already open in a tab moves its pane;
-    /// otherwise a new split runs `command`, which resumes it.
+    /// otherwise a native chat on it opens in a new split.
     DropClaudeThread {
         session_id: String,
-        command: Option<String>,
+        cwd: PathBuf,
     },
     /// Closes the pane running a Claude thread that is being deleted, in whichever window holds it.
     CloseClaudeThreadPane {
@@ -1168,6 +1184,8 @@ impl WorkspaceAction {
             | OpenDirectoryInNewTab { .. }
             | OpenClaudeSession
             | RunCommandInNewTab { .. }
+            | OpenClaudeChat { .. }
+            | OpenArtifacts { .. }
             | ToggleClaudeThreadsPanel
             | ToggleTerminalPanel
             | ToggleProjectManagerPanel

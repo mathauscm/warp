@@ -664,6 +664,12 @@ impl Window {
         })
     }
 
+    /// Returns the window's content view, which can host native child views drawn above the
+    /// rendered scene. Its coordinate space is not flipped (origin at the bottom-left).
+    pub fn content_view(&self) -> Option<Retained<NSView>> {
+        self.0.window().contentView()
+    }
+
     /// Returns the key window, if any.
     pub fn key_window() -> Option<Retained<NSWindow>> {
         // SAFETY: this runs on the main thread.

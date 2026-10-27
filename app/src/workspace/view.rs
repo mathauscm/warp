@@ -236,9 +236,9 @@ use crate::ai_assistant::execution_context::execution_context_for_session;
 use crate::ai_assistant::panel::{AIAssistantPanelEvent, AIAssistantPanelView};
 use crate::ai_assistant::{AI_ASSISTANT_FEATURE_NAME, AI_ASSISTANT_LOGO_COLOR, AskAIType};
 use crate::app_state::{
-    LeafContents, LeafSnapshot, LeftPanelDisplayedTab, LeftPanelSnapshot, NotebookPaneSnapshot,
-    PaneNodeSnapshot, PaneUuid, RightPanelSnapshot, SettingsPaneSnapshot, TabGroupSnapshot,
-    TabSnapshot, TerminalPaneSnapshot, WindowSnapshot, WorkflowPaneSnapshot,
+    ClaudeChatPaneSnapshot, LeafContents, LeafSnapshot, LeftPanelDisplayedTab, LeftPanelSnapshot,
+    NotebookPaneSnapshot, PaneNodeSnapshot, PaneUuid, RightPanelSnapshot, SettingsPaneSnapshot,
+    TabGroupSnapshot, TabSnapshot, TerminalPaneSnapshot, WindowSnapshot, WorkflowPaneSnapshot,
 };
 use crate::appearance::{Appearance, AppearanceManager};
 use crate::auth::AuthStateProvider;
@@ -307,8 +307,9 @@ use crate::palette::PaletteMode;
 use crate::pane_group::FilePane;
 use crate::pane_group::pane::ActionOrigin;
 use crate::pane_group::{
-    self, AIFactPane, AnyPaneContent, ChildAgentOrigin, CodeDiffPane, CodePane, CodeReviewPanelArg,
-    CustomRouterEditorPane, Direction as PaneGroupDirection, Direction, EnvironmentManagementPane,
+    self, AIFactPane, AnyPaneContent, ArtifactsPane, ChildAgentOrigin, ClaudeChatPane,
+    CodeDiffPane, CodePane, CodeReviewPanelArg, CustomRouterEditorPane,
+    Direction as PaneGroupDirection, Direction, EnvironmentManagementPane,
     ExecutionProfileEditorPane, NetworkLogPane, NewTerminalOptions, PaneGroup, PaneId, PanesLayout,
     TabBarHoverIndex, TerminalPaneId,
 };
@@ -402,7 +403,7 @@ use crate::terminal::cli_agent_sessions::{CLIAgentSessionsModel, CLIAgentSession
 use crate::terminal::enable_auto_reload_modal::{
     EnableAutoReloadModal, EnableAutoReloadModalEvent,
 };
-use crate::terminal::general_settings::GeneralSettings;
+use crate::terminal::general_settings::{GeneralSettings, StartupScreen};
 #[cfg(not(target_family = "wasm"))]
 use crate::terminal::input::slash_commands::fork_button_action;
 use crate::terminal::input::{EXTERNAL_ALT_C_BINDING_CONTEXT, Input, MenuPositioning};
@@ -3690,6 +3691,16 @@ impl Workspace {
             registry.register(window_id, weak_handle);
         });
 
+        if let Some(action) = crate::native_chat::take_dev_open_chat_action() {
+            ctx.dispatch_typed_action_deferred(action);
+        }
+        if let Some(action) = crate::native_chat::take_dev_open_artifacts_action() {
+            ctx.dispatch_typed_action_deferred(action);
+        }
+        if let Some(action) = crate::native_chat::take_dev_open_settings_action() {
+            ctx.dispatch_typed_action_deferred(action);
+        }
+
         ws
     }
 
@@ -4508,8 +4519,15 @@ impl Workspace {
         let show_warp_home = !ContextFlag::CreateNewSession.is_enabled();
         let mut placeholder_pane = None;
         let open_warp_drive = if !show_warp_home {
+            let home_dir = dirs::home_dir().filter(|_| {
+                shell.is_none()
+                    && *GeneralSettings::as_ref(ctx).startup_screen == StartupScreen::Threads
+            });
             if self.should_trigger_get_started_onboarding(ctx) {
                 self.trigger_get_started_onboarding(ctx);
+            } else if let Some(home_dir) = home_dir {
+                self.open_claude_chat(home_dir, None, None, None, ctx);
+                ctx.dispatch_typed_action_deferred(WorkspaceAction::ToggleClaudeThreadsPanel);
             } else {
                 self.add_new_session_tab_with_default_mode(
                     NewSessionSource::Window,
@@ -9029,31 +9047,17 @@ impl Workspace {
         });
     }
 
-    /// Starts Claude Code in the active terminal when it's idle at a prompt,
-    /// otherwise in a new terminal tab opened in the same directory.
+    /// Starts a native Claude chat in the active session's folder, or the home folder.
     fn open_claude_session(&mut self, ctx: &mut ViewContext<Self>) {
-        const CLAUDE_COMMAND: &str = "claude";
-
-        if let Some(terminal) = self.active_session_view(ctx) {
-            let idle_input = {
-                let terminal = terminal.as_ref(ctx);
-                (!terminal.is_long_running()
-                    && !terminal.has_pending_command_or_awaiting_completion(ctx))
-                .then(|| terminal.input().clone())
-            };
-            if let Some(input) = idle_input {
-                input.update(ctx, |input, ctx| {
-                    input.try_execute_command(CLAUDE_COMMAND, ctx);
-                });
-                return;
-            }
-        }
-
-        let directory = self
+        let cwd = self
             .active_tab_pane_group()
             .as_ref(ctx)
-            .active_session_path(ctx);
-        self.run_command_in_new_tab(directory, CLAUDE_COMMAND, false, ctx);
+            .active_session_path(ctx)
+            .or_else(dirs::home_dir);
+        let Some(cwd) = cwd else {
+            return;
+        };
+        self.open_claude_chat(cwd, None, None, None, ctx);
     }
 
     /// Opens a new terminal tab in `directory` (the default one when `None`)
@@ -13442,6 +13446,84 @@ impl Workspace {
             }
             self.expand_tab_group(group_id, ctx);
         }
+    }
+
+    /// Opens a native Claude chat in a new tab, or focuses the one already showing the conversation.
+    fn open_claude_chat(
+        &mut self,
+        cwd: PathBuf,
+        session_id: Option<String>,
+        draft: Option<String>,
+        artifact_kind: Option<String>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if let Some(locator) = session_id
+            .as_deref()
+            .and_then(|session_id| self.find_claude_chat_pane(session_id, ctx))
+        {
+            self.focus_pane(locator, ctx);
+            return;
+        }
+        let panes_layout = PanesLayout::Snapshot(Box::new(PaneNodeSnapshot::Leaf(LeafSnapshot {
+            is_focused: true,
+            custom_vertical_tabs_title: None,
+            contents: LeafContents::ClaudeChat(ClaudeChatPaneSnapshot {
+                session_id,
+                cwd,
+                draft,
+                artifact_kind,
+            }),
+        })));
+        self.add_tab_with_pane_layout(panes_layout, Arc::new(HashMap::new()), None, ctx);
+    }
+
+    /// The pane showing the native chat of `session_id`, in any tab of this window.
+    pub(super) fn find_claude_chat_pane(
+        &self,
+        session_id: &str,
+        ctx: &AppContext,
+    ) -> Option<PaneViewLocator> {
+        self.tabs.iter().find_map(|tab| {
+            let pane_group = tab.pane_group.as_ref(ctx);
+            pane_group.pane_ids().find_map(|pane_id| {
+                let pane = pane_group.downcast_pane_by_id::<ClaudeChatPane>(pane_id)?;
+                let view = pane.backing_view(ctx);
+                (view.as_ref(ctx).session().as_ref(ctx).session_id() == session_id).then_some(
+                    PaneViewLocator {
+                        pane_group_id: tab.pane_group.id(),
+                        pane_id,
+                    },
+                )
+            })
+        })
+    }
+
+    /// Opens the artifacts gallery in a new tab.
+    /// Focuses the artifacts tab, opening `artifact_id` in it, or opens one.
+    fn open_artifacts(&mut self, artifact_id: Option<String>, ctx: &mut ViewContext<Self>) {
+        let existing = self.tabs.iter().find_map(|tab| {
+            let pane_group = tab.pane_group.as_ref(ctx);
+            pane_group.pane_ids().find_map(|pane_id| {
+                let pane = pane_group.downcast_pane_by_id::<ArtifactsPane>(pane_id)?;
+                Some((
+                    PaneViewLocator {
+                        pane_group_id: tab.pane_group.id(),
+                        pane_id,
+                    },
+                    pane.backing_view(ctx),
+                ))
+            })
+        });
+        if let Some((locator, view)) = existing {
+            self.focus_pane(locator, ctx);
+            if let Some(artifact_id) = artifact_id {
+                view.update(ctx, |view, ctx| view.open(artifact_id, ctx));
+            }
+            return;
+        }
+        let pane = ArtifactsPane::new(artifact_id, ctx);
+        let new_idx = self.tab_count();
+        self.add_tab_from_existing_pane(Box::new(pane), new_idx, None, ctx);
     }
 
     pub fn add_tab_for_cloud_notebook(
@@ -21066,7 +21148,7 @@ impl Workspace {
                     icons::Icon::ClaudeLogo,
                     &self.mouse_states.claude_button,
                     WorkspaceAction::OpenClaudeSession,
-                    "Abrir Claude Code".to_string(),
+                    "Novo chat com Claude".to_string(),
                     keybinding_name_to_display_string(OPEN_CLAUDE_SESSION_BINDING_NAME, ctx),
                     false,
                     false,
@@ -24946,6 +25028,25 @@ impl TypedActionView for Workspace {
                     self.move_active_tab_to_named_group(name, ctx);
                 }
             }
+            OpenClaudeChat {
+                cwd,
+                session_id,
+                draft,
+                artifact_kind,
+                group,
+            } => {
+                self.open_claude_chat(
+                    cwd.clone(),
+                    session_id.clone(),
+                    draft.clone(),
+                    artifact_kind.clone(),
+                    ctx,
+                );
+                if let Some(name) = group {
+                    self.move_active_tab_to_named_group(name, ctx);
+                }
+            }
+            OpenArtifacts { artifact_id } => self.open_artifacts(artifact_id.clone(), ctx),
             ToggleClaudeThreadsPanel => {
                 self.toggle_vertical_tabs_content(VerticalTabsContent::Threads, ctx);
             }
@@ -24963,12 +25064,13 @@ impl TypedActionView for Workspace {
                 Self::open_project_in_new_window(path.clone(), ctx);
             }
             DragClaudeThread { position } => {
+                ctx.set_cursor_shape(Cursor::ClosedHand);
                 self.update_thread_split_target(position.center(), ctx);
             }
-            DropClaudeThread {
-                session_id,
-                command,
-            } => self.drop_thread(session_id, command.as_deref(), ctx),
+            DropClaudeThread { session_id, cwd } => {
+                ctx.reset_cursor();
+                self.drop_thread(session_id, cwd, ctx);
+            }
             CloseClaudeThreadPane { terminal_view_id } => {
                 self.close_thread_pane(*terminal_view_id, ctx);
             }

@@ -58,12 +58,13 @@ use crate::prompt::editor_modal::OpenSource as PromptEditorOpenSource;
 use crate::server::telemetry::{InputUXChangeOrigin, TelemetryEvent};
 use crate::settings::app_icon::{AppIcon, AppIconSettings, ShowDockIconState};
 use crate::settings::{
-    AIFontName, AISettings, AppEditorSettings, CodeSettings, CursorBlink, CursorBlinkEnabled,
+    AIFontName, AISettings, AppEditorSettings, ClaudeChatAccent, ClaudeChatAccentSetting,
+    ClaudeTheme, ClaudeThemeSetting, CodeSettings, CursorBlink, CursorBlinkEnabled,
     CursorDisplayType, DEFAULT_MONOSPACE_FONT_NAME, EnforceMinimumContrast, FocusPaneOnHover,
     FontSettings, FontSettingsChangedEvent, GPUSettings, InputBoxType, InputModeSettings,
     InputModeState, InputSettings, InputSettingsChangedEvent, MonospaceFontName, PaneSettings,
-    ShouldDimInactivePanes, ThemeSettings, UseSystemTheme, UseThinStrokes, active_theme_kind,
-    respect_system_theme,
+    ShouldDimInactivePanes, ThemeSettings, UseSystemTheme, UseThinStrokes, VoiceInputEnabled,
+    active_theme_kind, respect_system_theme,
 };
 use crate::terminal::block_list_viewport::InputMode;
 use crate::terminal::blockgrid_element::BlockGridElement;
@@ -244,6 +245,32 @@ pub fn init_actions_from_parent_view<T: Action + Clone>(
         )),
         context.to_owned(),
     )]);
+
+    app.register_fixed_bindings(
+        ClaudeTheme::ALL
+            .into_iter()
+            .map(|theme| {
+                FixedBinding::empty(
+                    format!("Tema do Claude: {}", theme.label()),
+                    builder(SettingsAction::AppearancePageToggle(
+                        AppearancePageAction::SetClaudeTheme(theme),
+                    )),
+                    context.to_owned(),
+                )
+                .with_group(bindings::BindingGroup::Settings.as_str())
+            })
+            .chain(ClaudeChatAccent::ALL.into_iter().map(|accent| {
+                FixedBinding::empty(
+                    format!("Cor de destaque do chat: {}", accent.label()),
+                    builder(SettingsAction::AppearancePageToggle(
+                        AppearancePageAction::SetClaudeChatAccent(accent),
+                    )),
+                    context.to_owned(),
+                )
+                .with_group(bindings::BindingGroup::Settings.as_str())
+            }))
+            .collect::<Vec<_>>(),
+    );
 
     // Add command palette entry for toggling between Warp and Classic input modes
     app.register_fixed_bindings(vec![
@@ -497,6 +524,9 @@ pub enum AppearancePageAction {
     ToggleUseLatestUserPromptAsConversationTitleInTabNames,
     ToggleLigatureRendering,
     SetWindowBackdrop(WindowBackdrop),
+    SetClaudeTheme(ClaudeTheme),
+    SetClaudeChatAccent(ClaudeChatAccent),
+    ToggleVoiceInput,
     ToggleLeftPanelVisibility,
     ToggleToolsPanelProjectExplorer,
     ToggleToolsPanelGlobalSearch,
@@ -541,6 +571,8 @@ pub struct AppearanceSettingsPageView {
     enforce_min_contrast_dropdown: ViewHandle<Dropdown<AppearancePageAction>>,
     input_mode_dropdown: ViewHandle<Dropdown<AppearancePageAction>>,
     window_backdrop_dropdown: ViewHandle<Dropdown<AppearancePageAction>>,
+    claude_theme_dropdown: ViewHandle<Dropdown<AppearancePageAction>>,
+    claude_chat_accent_dropdown: ViewHandle<Dropdown<AppearancePageAction>>,
     input_type_radio_state: RadioButtonStateHandle,
     app_icon_dropdown: ViewHandle<Dropdown<AppearancePageAction>>,
     workspace_decorations_dropdown: ViewHandle<Dropdown<AppearancePageAction>>,
@@ -627,6 +659,30 @@ impl TypedActionView for AppearanceSettingsPageView {
             ToggleAllAvailableFonts => self.toggle_all_available_fonts(ctx),
             ToggleDimInactivePanes => self.toggle_dim_inactive_panes(ctx),
             SetWindowBackdrop(backdrop) => self.set_window_backdrop(*backdrop, ctx),
+            SetClaudeTheme(theme) => {
+                ThemeSettings::handle(ctx).update(ctx, |settings, ctx| {
+                    report_if_error!(settings.claude_theme.set_value(*theme, ctx));
+                });
+            }
+            SetClaudeChatAccent(accent) => {
+                ThemeSettings::handle(ctx).update(ctx, |settings, ctx| {
+                    report_if_error!(settings.claude_chat_accent.set_value(*accent, ctx));
+                });
+            }
+            ToggleVoiceInput => {
+                AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                    report_if_error!(
+                        settings
+                            .voice_input_enabled_internal
+                            .toggle_and_save_value(ctx)
+                    );
+                    // Dictation runs on Warp AI, whose own switch lives on the hidden Agents page.
+                    if *settings.voice_input_enabled_internal && !*settings.is_any_ai_enabled {
+                        report_if_error!(settings.is_any_ai_enabled.set_value(true, ctx));
+                    }
+                });
+                ctx.notify();
+            }
             ToggleLeftPanelVisibility => self.toggle_left_panel_visibility(ctx),
             ToggleToolsPanelProjectExplorer => {
                 CodeSettings::handle(ctx).update(ctx, |settings, ctx| {
@@ -878,6 +934,12 @@ impl AppearanceSettingsPageView {
         ctx.subscribe_to_model(&TerminalSettings::handle(ctx), |_, _, _, ctx| {
             ctx.notify();
         });
+
+        // The Claude theme can also change from the chip of Claude Code panes.
+        ctx.subscribe_to_model(&ThemeSettings::handle(ctx), |me, _, _, ctx| {
+            me.sync_claude_dropdowns(ctx);
+        });
+        ctx.subscribe_to_model(&AISettings::handle(ctx), |_, _, _, ctx| ctx.notify());
 
         ctx.subscribe_to_model(
             &FontSettings::handle(ctx),
@@ -1326,6 +1388,8 @@ impl AppearanceSettingsPageView {
             thin_strokes_dropdown,
             input_mode_dropdown,
             window_backdrop_dropdown: Self::build_window_backdrop_dropdown(ctx),
+            claude_theme_dropdown: Self::build_claude_theme_dropdown(ctx),
+            claude_chat_accent_dropdown: Self::build_claude_chat_accent_dropdown(ctx),
             input_type_radio_state,
             app_icon_dropdown,
             enforce_min_contrast_dropdown,
@@ -1360,6 +1424,20 @@ impl AppearanceSettingsPageView {
                 Box::new(ThemeSelectWidget::default()),
             ],
         )];
+
+        let mut claude_chat_widgets: Vec<Box<dyn SettingsWidget<View = Self>>> = vec![
+            Box::new(ClaudeThemeWidget),
+            Box::new(ClaudeChatAccentWidget),
+        ];
+        // The Warp Agent page, where voice input normally lives, is hidden in Picolas Code.
+        if cfg!(feature = "voice_input")
+            && AISettings::as_ref(ctx)
+                .voice_input_enabled_internal
+                .is_supported_on_current_platform()
+        {
+            claude_chat_widgets.push(Box::new(ClaudeChatVoiceInputWidget::default()));
+        }
+        categories.push(Category::new("Chat do Claude", claude_chat_widgets));
 
         if AppIconSettings::as_ref(ctx).is_supported_on_current_platform() {
             categories.push(Category::new(
@@ -2571,6 +2649,73 @@ impl AppearanceSettingsPageView {
         );
     }
 
+    fn build_claude_theme_dropdown(
+        ctx: &mut ViewContext<Self>,
+    ) -> ViewHandle<Dropdown<AppearancePageAction>> {
+        ctx.add_typed_action_view(|ctx| {
+            let mut dropdown = Dropdown::new(ctx);
+            dropdown.set_items(
+                ClaudeTheme::ALL
+                    .into_iter()
+                    .map(|theme| {
+                        DropdownItem::new(
+                            theme.label(),
+                            AppearancePageAction::SetClaudeTheme(theme),
+                        )
+                    })
+                    .collect(),
+                ctx,
+            );
+            dropdown.set_selected_by_action(
+                AppearancePageAction::SetClaudeTheme(*ThemeSettings::as_ref(ctx).claude_theme),
+                ctx,
+            );
+            dropdown
+        })
+    }
+
+    fn build_claude_chat_accent_dropdown(
+        ctx: &mut ViewContext<Self>,
+    ) -> ViewHandle<Dropdown<AppearancePageAction>> {
+        ctx.add_typed_action_view(|ctx| {
+            let mut dropdown = Dropdown::new(ctx);
+            dropdown.set_items(
+                ClaudeChatAccent::ALL
+                    .into_iter()
+                    .map(|accent| {
+                        DropdownItem::new(
+                            accent.label(),
+                            AppearancePageAction::SetClaudeChatAccent(accent),
+                        )
+                    })
+                    .collect(),
+                ctx,
+            );
+            dropdown.set_selected_by_action(
+                AppearancePageAction::SetClaudeChatAccent(
+                    *ThemeSettings::as_ref(ctx).claude_chat_accent,
+                ),
+                ctx,
+            );
+            dropdown
+        })
+    }
+
+    fn sync_claude_dropdowns(&mut self, ctx: &mut ViewContext<Self>) {
+        let settings = ThemeSettings::as_ref(ctx);
+        let theme = *settings.claude_theme;
+        let accent = *settings.claude_chat_accent;
+        self.claude_theme_dropdown.update(ctx, |dropdown, ctx| {
+            dropdown.set_selected_by_action(AppearancePageAction::SetClaudeTheme(theme), ctx);
+        });
+        self.claude_chat_accent_dropdown
+            .update(ctx, |dropdown, ctx| {
+                dropdown
+                    .set_selected_by_action(AppearancePageAction::SetClaudeChatAccent(accent), ctx);
+            });
+        ctx.notify();
+    }
+
     fn build_window_backdrop_dropdown(
         ctx: &mut ViewContext<Self>,
     ) -> ViewHandle<Dropdown<AppearancePageAction>> {
@@ -3029,6 +3174,118 @@ impl SettingsWidget for ThemeSelectWidget {
                     .finish(),
             )
             .finish()
+    }
+}
+
+struct ClaudeThemeWidget;
+
+impl SettingsWidget for ClaudeThemeWidget {
+    type View = AppearanceSettingsPageView;
+
+    fn search_terms(&self) -> &str {
+        "claude chat tema theme cores colors escuro claro dark light sistema system warp"
+    }
+
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        render_dropdown_item(
+            appearance,
+            "Tema do Claude",
+            Some("Cores do chat e dos painéis do Claude Code. Por padrão seguem o tema do Warp."),
+            None,
+            LocalOnlyIconState::for_setting(
+                ClaudeThemeSetting::storage_key(),
+                ClaudeThemeSetting::sync_to_cloud(),
+                &mut view.local_only_icon_tooltip_states.borrow_mut(),
+                app,
+            ),
+            None,
+            &view.claude_theme_dropdown,
+        )
+    }
+}
+
+struct ClaudeChatAccentWidget;
+
+impl SettingsWidget for ClaudeChatAccentWidget {
+    type View = AppearanceSettingsPageView;
+
+    fn search_terms(&self) -> &str {
+        "claude chat cor de destaque accent color azul roxo verde laranja rosa blue purple green \
+         orange pink"
+    }
+
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        render_dropdown_item(
+            appearance,
+            "Cor de destaque do chat",
+            None,
+            None,
+            LocalOnlyIconState::for_setting(
+                ClaudeChatAccentSetting::storage_key(),
+                ClaudeChatAccentSetting::sync_to_cloud(),
+                &mut view.local_only_icon_tooltip_states.borrow_mut(),
+                app,
+            ),
+            None,
+            &view.claude_chat_accent_dropdown,
+        )
+    }
+}
+
+#[derive(Default)]
+struct ClaudeChatVoiceInputWidget {
+    switch_state: SwitchStateHandle,
+}
+
+impl SettingsWidget for ClaudeChatVoiceInputWidget {
+    type View = AppearanceSettingsPageView;
+
+    fn search_terms(&self) -> &str {
+        "claude chat entrada por voz voice input microfone microphone ditado dictation fala speech"
+    }
+
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        render_body_item::<AppearancePageAction>(
+            "Entrada por voz".into(),
+            None,
+            LocalOnlyIconState::for_setting(
+                VoiceInputEnabled::storage_key(),
+                VoiceInputEnabled::sync_to_cloud(),
+                &mut view.local_only_icon_tooltip_states.borrow_mut(),
+                app,
+            ),
+            ToggleState::Enabled,
+            appearance,
+            appearance
+                .ui_builder()
+                .switch(self.switch_state.clone())
+                .check(*AISettings::as_ref(app).voice_input_enabled_internal)
+                .build()
+                .on_click(|ctx, _, _| {
+                    ctx.dispatch_typed_action(AppearancePageAction::ToggleVoiceInput);
+                })
+                .finish(),
+            Some(
+                "Botão de microfone do chat. A transcrição usa o servidor do Warp: exige login no \
+                 Warp e a IA do Warp ligada."
+                    .into(),
+            ),
+        )
     }
 }
 

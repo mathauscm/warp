@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use warpui::{AppContext, Entity, ModelContext, ModelHandle};
 
 use super::pane::{PaneId, TerminalPaneId};
@@ -12,6 +14,8 @@ pub struct PaneGroupFocusState {
     active_session_id: Option<TerminalPaneId>,
     in_split_pane: bool,
     is_focused_pane_maximized: bool,
+    /// Panes docked under an editor, which drop their header for a plain divider line.
+    docked_below_editor: HashSet<PaneId>,
 }
 
 #[derive(Debug, Clone)]
@@ -26,6 +30,7 @@ pub enum PaneGroupFocusEvent {
     },
     InSplitPaneChanged,
     FocusedPaneMaximizedChanged,
+    DockedPanesChanged,
 }
 
 impl Entity for PaneGroupFocusState {
@@ -43,6 +48,7 @@ impl PaneGroupFocusState {
             active_session_id,
             in_split_pane,
             is_focused_pane_maximized: false,
+            docked_below_editor: HashSet::new(),
         }
     }
 
@@ -127,6 +133,21 @@ impl PaneGroupFocusState {
         }
     }
 
+    pub fn is_docked_below_editor(&self, pane_id: PaneId) -> bool {
+        self.docked_below_editor.contains(&pane_id)
+    }
+
+    pub(super) fn set_docked_below_editor(
+        &mut self,
+        docked: HashSet<PaneId>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if self.docked_below_editor != docked {
+            self.docked_below_editor = docked;
+            ctx.emit(PaneGroupFocusEvent::DockedPanesChanged);
+        }
+    }
+
     /// Sets whether the focused pane is maximized.
     pub(super) fn set_focused_pane_maximized(
         &mut self,
@@ -187,6 +208,13 @@ impl PaneFocusHandle {
         self.split_pane_state(app).is_in_split_pane()
     }
 
+    /// True if this pane sits under an editor, like a terminal docked below code.
+    pub fn is_docked_below_editor(&self, app: &AppContext) -> bool {
+        self.focus_state
+            .as_ref(app)
+            .is_docked_below_editor(self.pane_id)
+    }
+
     /// True if this pane is focused.
     pub fn is_focused(&self, app: &AppContext) -> bool {
         self.split_pane_state(app).is_focused()
@@ -233,6 +261,7 @@ impl PaneFocusHandle {
             },
             PaneGroupFocusEvent::InSplitPaneChanged => true,
             PaneGroupFocusEvent::FocusedPaneMaximizedChanged => true,
+            PaneGroupFocusEvent::DockedPanesChanged => true,
         }
     }
 }

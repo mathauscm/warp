@@ -81,6 +81,8 @@ clap.workspace = true
 cloud_object_client.workspace = true
 cloud_object_models.workspace = true
 cloud_objects.workspace = true
+claude_chat.workspace = true
+picolas_webview.workspace = true
 command = { workspace = true }
 command-corrections.workspace = true
 computer_use.workspace = true
