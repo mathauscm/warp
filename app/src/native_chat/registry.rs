@@ -4,7 +4,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use claude_chat::reducer::ConversationStatus;
-use warpui::{AppContext, Entity, ModelContext, ModelHandle, SingletonEntity, WeakModelHandle};
+use warpui::{
+    AppContext, Entity, EntityId, ModelContext, ModelHandle, SingletonEntity, WeakModelHandle,
+};
 
 use super::session::ClaudeChatSession;
 
@@ -16,6 +18,52 @@ pub enum NativeChatStatus {
     AwaitingUser,
 }
 
+impl NativeChatStatus {
+    pub fn of(status: &ConversationStatus) -> Self {
+        match status {
+            ConversationStatus::Working { .. } => Self::Working,
+            ConversationStatus::AwaitingUser => Self::AwaitingUser,
+            ConversationStatus::Starting
+            | ConversationStatus::Idle
+            | ConversationStatus::Exited => Self::Idle,
+        }
+    }
+}
+
+/// How much a chat pane holds, which decides whether it can be swapped for another conversation
+/// or closed without asking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatActivity {
+    /// Never sent a message and has nothing typed: closing it loses nothing.
+    Unused,
+    /// A conversation saved to its transcript, waiting for the next message.
+    Idle,
+    /// Text or images typed in the composer that weren't sent.
+    Drafting,
+    /// Claude is working or waiting for the user's answer.
+    Busy,
+}
+
+impl ChatActivity {
+    pub fn new(has_transcript: bool, has_draft: bool, status: NativeChatStatus) -> Self {
+        match status {
+            NativeChatStatus::Working | NativeChatStatus::AwaitingUser => Self::Busy,
+            NativeChatStatus::Idle if has_draft => Self::Drafting,
+            NativeChatStatus::Idle if has_transcript => Self::Idle,
+            NativeChatStatus::Idle => Self::Unused,
+        }
+    }
+
+    /// Whether the pane can show another conversation instead without losing anything: the
+    /// conversation shown is saved and nothing is running or typed.
+    pub fn can_be_replaced(self) -> bool {
+        match self {
+            Self::Unused | Self::Idle => true,
+            Self::Drafting | Self::Busy => false,
+        }
+    }
+}
+
 /// An open native chat, as the Threads panel lists it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpenChat {
@@ -25,10 +73,15 @@ pub struct OpenChat {
     pub has_transcript: bool,
 }
 
+struct RegisteredSession {
+    id: EntityId,
+    session: WeakModelHandle<ClaudeChatSession>,
+}
+
 #[derive(Default)]
 pub struct NativeChatRegistry {
-    /// Weak, so a chat drops out once its pane is closed.
-    sessions: HashMap<String, WeakModelHandle<ClaudeChatSession>>,
+    /// Chats shown in a pane. Weak, so a chat dropped without unregistering still drops out.
+    sessions: HashMap<String, RegisteredSession>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,9 +96,31 @@ impl NativeChatRegistry {
         session: &ModelHandle<ClaudeChatSession>,
         ctx: &mut ModelContext<Self>,
     ) {
-        self.sessions
-            .insert(session_id.to_owned(), session.downgrade());
+        self.sessions.insert(
+            session_id.to_owned(),
+            RegisteredSession {
+                id: session.id(),
+                session: session.downgrade(),
+            },
+        );
         ctx.emit(NativeChatRegistryEvent::Changed);
+    }
+
+    /// Drops the chat once its pane is closed (even while it waits to be reopened with undo).
+    pub fn unregister(
+        &mut self,
+        session_id: &str,
+        session: &ModelHandle<ClaudeChatSession>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if self
+            .sessions
+            .get(session_id)
+            .is_some_and(|registered| registered.id == session.id())
+        {
+            self.sessions.remove(session_id);
+            ctx.emit(NativeChatRegistryEvent::Changed);
+        }
     }
 
     /// Tells observers that a chat's status changed.
@@ -53,12 +128,20 @@ impl NativeChatRegistry {
         ctx.emit(NativeChatRegistryEvent::Changed);
     }
 
+    fn session(
+        &self,
+        session_id: &str,
+        app: &AppContext,
+    ) -> Option<ModelHandle<ClaudeChatSession>> {
+        self.sessions.get(session_id)?.session.upgrade(app)
+    }
+
     /// Every open chat: its conversation, folder, title and whether it has a transcript yet.
     pub fn open_chats(&self, app: &AppContext) -> Vec<OpenChat> {
         self.sessions
             .iter()
-            .filter_map(|(session_id, session)| {
-                let session = session.upgrade(app)?;
+            .filter_map(|(session_id, registered)| {
+                let session = registered.session.upgrade(app)?;
                 let session = session.as_ref(app);
                 Some(OpenChat {
                     session_id: session_id.clone(),
@@ -78,16 +161,18 @@ impl NativeChatRegistry {
             .map(|chat| chat.session_id)
     }
 
+    /// Whether `session_id` is open in a chat that never sent a message.
+    pub fn is_unsent(&self, session_id: &str, app: &AppContext) -> bool {
+        self.session(session_id, app)
+            .is_some_and(|session| !session.as_ref(app).has_transcript())
+    }
+
     /// What the open chat showing `session_id` is doing, if one is open.
     pub fn status(&self, session_id: &str, app: &AppContext) -> Option<NativeChatStatus> {
-        let session = self.sessions.get(session_id)?.upgrade(app)?;
-        Some(match session.as_ref(app).conversation().status() {
-            ConversationStatus::Working { .. } => NativeChatStatus::Working,
-            ConversationStatus::AwaitingUser => NativeChatStatus::AwaitingUser,
-            ConversationStatus::Starting
-            | ConversationStatus::Idle
-            | ConversationStatus::Exited => NativeChatStatus::Idle,
-        })
+        let session = self.session(session_id, app)?;
+        Some(NativeChatStatus::of(
+            &session.as_ref(app).conversation().status(),
+        ))
     }
 }
 
@@ -96,3 +181,7 @@ impl Entity for NativeChatRegistry {
 }
 
 impl SingletonEntity for NativeChatRegistry {}
+
+#[cfg(test)]
+#[path = "registry_tests.rs"]
+mod tests;

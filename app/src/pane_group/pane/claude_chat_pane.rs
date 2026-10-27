@@ -54,6 +54,7 @@ impl PaneContent for ClaudeChatPane {
 
         let backing_view = self.backing_view(ctx);
         let pane_id = self.id();
+        backing_view.update(ctx, |view, ctx| view.set_attached(true, ctx));
 
         ctx.subscribe_to_view(&backing_view, move |pane_group, _, event, ctx| {
             let ClaudeChatViewEvent::Pane(pane_event) = event;
@@ -67,13 +68,19 @@ impl PaneContent for ClaudeChatPane {
     fn detach(
         &self,
         _group: &PaneGroup,
-        _detach_type: DetachType,
+        detach_type: DetachType,
         ctx: &mut ViewContext<PaneGroup>,
     ) {
         // Always unsubscribe from views.
         let backing_view = self.backing_view(ctx);
         ctx.unsubscribe_to_view(&backing_view);
         ctx.unsubscribe_to_view(&self.view);
+        match detach_type {
+            DetachType::Closed | DetachType::HiddenForClose => {
+                backing_view.update(ctx, |view, ctx| view.set_attached(false, ctx));
+            }
+            DetachType::Moved => {}
+        }
     }
 
     fn snapshot(&self, app: &AppContext) -> LeafContents {

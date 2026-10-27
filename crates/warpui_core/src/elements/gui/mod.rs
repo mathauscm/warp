@@ -218,6 +218,16 @@ pub struct SelectionFragment {
     pub origin: Point,
 }
 
+/// A point in the content of an element that scrolls its own content, which stays on the same
+/// content as it scrolls.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ContentAnchor {
+    /// The item of the content the point is in.
+    pub item: usize,
+    /// The point's position relative to the item's top-left corner.
+    pub offset: Vector2F,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Point {
     xy: Vector2F,
@@ -788,4 +798,16 @@ pub trait SelectableElement {
     /// to be a click performed on the element's selection. Should return an empty vector for
     /// elements that don't define any selection-specific click behaviors.
     fn calculate_clickable_bounds(&self, _current_selection: Option<Selection>) -> Vec<RectF>;
+
+    /// Anchors an absolute point to the content under it, for elements that scroll their own
+    /// content, so a selection stays on its text as the content scrolls. `None` keeps the point
+    /// fixed relative to the [`SelectableArea`].
+    fn content_anchor(&self, _absolute_point: Vector2F) -> Option<ContentAnchor> {
+        None
+    }
+
+    /// The current absolute position of an anchor from [`Self::content_anchor`].
+    fn content_anchor_position(&self, _anchor: ContentAnchor) -> Option<Vector2F> {
+        None
+    }
 }

@@ -3,9 +3,8 @@
 //! `crate::claude_threads`). It takes the place of the tab list while the header "Threads" button
 //! is active.
 //!
-//! Clicking a thread focuses the tab already running it, or resumes it with
-//! `claude --resume` in a new tab; the `+` of a project starts a new thread in
-//! its folder.
+//! Clicking a thread focuses the pane already showing it, or opens it in the native chat (see
+//! `super::chat_tabs` for which tab); the `+` of a project starts a new thread in its folder.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -38,6 +37,9 @@ use warpui::{
     ViewContext, ViewHandle, WindowId,
 };
 
+use super::project_manager::{
+    add_folder_menu_items, add_menu_positioning, create_project_folder, new_project_folder_picker,
+};
 use crate::appearance::Appearance;
 use crate::claude_threads::{
     self, ClaudeThread, ThreadGroups, ThreadProject, ThreadsConfig, TranscriptCache,
@@ -94,6 +96,7 @@ const ARTIFACTS_ICON: &str = "bundled/svg/picolas-artifact-other.svg";
 const SEARCH_ICON: &str = "bundled/svg/picolas-search.svg";
 const SIDEBAR_ICON: &str = "bundled/svg/picolas-sidebar.svg";
 const PIN_ICON: &str = "bundled/svg/picolas-pin.svg";
+const ADD_PROJECT_BUTTON_POSITION_ID: &str = "claude_threads_add_project_button";
 
 const PROJECT_FONT_SIZE: f32 = 13.5;
 const TITLE_FONT_SIZE: f32 = 13.5;
@@ -128,7 +131,12 @@ pub enum ClaudeThreadsAction {
         position: RectF,
     },
     DropProject,
+    /// Shows or hides the `+` menu of the projects: an existing folder or a new one.
+    ToggleAddProjectMenu,
     AddProject,
+    /// Names a new folder in the save panel, creates it, adds it as a project and starts a chat
+    /// in it.
+    CreateProjectFolder,
     RemoveProject(PathBuf),
     ToggleProjectCollapsed(PathBuf),
     ToggleSection(ThreadSection),
@@ -196,6 +204,8 @@ pub struct ClaudeThreadsView {
     thread_menu: ViewHandle<Menu<ClaudeThreadsAction>>,
     /// The thread whose "⋯" menu is open.
     menu_open_for: Option<String>,
+    /// Whether `thread_menu` shows the `+` menu of the projects instead.
+    is_add_project_menu_open: bool,
     /// Set while the menu swaps to its projects page, so the close that follows selecting
     /// "Mover para projeto" leaves it open.
     keep_menu_open: bool,
@@ -262,6 +272,7 @@ impl ClaudeThreadsView {
                     return;
                 }
                 me.menu_open_for = None;
+                me.is_add_project_menu_open = false;
                 ctx.notify();
             }
             MenuEvent::ItemSelected | MenuEvent::ItemHovered => {}
@@ -288,6 +299,7 @@ impl ClaudeThreadsView {
             deleting: HashSet::new(),
             thread_menu,
             menu_open_for: None,
+            is_add_project_menu_open: false,
             keep_menu_open: false,
             scroll_state: ClippedScrollStateHandle::default(),
             mouse_states: RefCell::new(HashMap::new()),
@@ -318,6 +330,9 @@ impl ClaudeThreadsView {
         self.is_visible = visible;
         if visible {
             self.schedule_scan(Duration::ZERO, ctx);
+            if take_dev_open_add_menu() {
+                self.toggle_add_project_menu(ctx);
+            }
         }
     }
 
@@ -357,6 +372,43 @@ impl ClaudeThreadsView {
                 }
             },
             FilePickerConfiguration::new().folders_only(),
+        );
+    }
+
+    fn toggle_add_project_menu(&mut self, ctx: &mut ViewContext<Self>) {
+        self.is_add_project_menu_open = !self.is_add_project_menu_open;
+        if self.is_add_project_menu_open {
+            self.menu_open_for = None;
+            self.keep_menu_open = false;
+            let items = add_folder_menu_items(
+                ClaudeThreadsAction::AddProject,
+                ClaudeThreadsAction::CreateProjectFolder,
+            );
+            self.thread_menu
+                .update(ctx, |menu, ctx| menu.set_items(items, ctx));
+        }
+        ctx.notify();
+    }
+
+    /// Creates a folder named in the save panel, adds it as a project and starts a chat in it.
+    fn create_project_folder(&mut self, ctx: &mut ViewContext<Self>) {
+        let window_id = ctx.window_id();
+        ctx.open_save_file_picker(
+            move |path, me, ctx| {
+                let Some(path) = path.and_then(|path| create_project_folder(&path, window_id, ctx))
+                else {
+                    return;
+                };
+                me.add_project(path.clone(), ctx);
+                ctx.dispatch_typed_action_deferred(WorkspaceAction::OpenClaudeChat {
+                    group: Some(project_group_name(&path)),
+                    cwd: path,
+                    session_id: None,
+                    draft: None,
+                    artifact_kind: None,
+                });
+            },
+            new_project_folder_picker(),
         );
     }
 
@@ -447,8 +499,6 @@ impl ClaudeThreadsView {
         }
     }
 
-    /// Focuses the tab already running the thread, otherwise resumes it in a
-    /// new tab opened in the thread's folder.
     /// Focuses the terminal already running the thread, or opens it in the native chat.
     fn open_thread(&mut self, session_id: &str, cwd: &Path, ctx: &mut ViewContext<Self>) {
         if self.focus_running_thread(session_id, ctx) {
@@ -500,7 +550,7 @@ impl ClaudeThreadsView {
         true
     }
 
-    /// Closes the tab running the thread, if any, then moves its transcript to the Trash.
+    /// Closes the pane running the thread, if any, then moves its transcript to the Trash.
     fn delete_thread(&mut self, session_id: &str, ctx: &mut ViewContext<Self>) {
         self.pending_delete = None;
         self.config.forget_thread(session_id);
@@ -513,6 +563,14 @@ impl ClaudeThreadsView {
                 terminal_view_id,
             });
         }
+        let is_open_in_chat = NativeChatRegistry::as_ref(ctx)
+            .status(session_id, ctx)
+            .is_some();
+        if is_open_in_chat {
+            ctx.dispatch_typed_action_deferred(WorkspaceAction::CloseClaudeChat {
+                session_id: session_id.to_owned(),
+            });
+        }
         // A thread that hasn't written a transcript yet goes away with its tab.
         let Some(thread) = self
             .find_thread(session_id)
@@ -522,7 +580,7 @@ impl ClaudeThreadsView {
             ctx.notify();
             return;
         };
-        let delay = if running_in.is_some() {
+        let delay = if running_in.is_some() || is_open_in_chat {
             SESSION_EXIT_GRACE
         } else {
             Duration::ZERO
@@ -544,6 +602,13 @@ impl ClaudeThreadsView {
             },
         );
         ctx.notify();
+    }
+
+    /// Whether the thread is a native chat that never sent a message, which deleting loses
+    /// nothing of.
+    fn is_unsent_chat(&self, session_id: &str, app: &AppContext) -> bool {
+        self.find_thread(session_id).is_none()
+            && NativeChatRegistry::as_ref(app).is_unsent(session_id, app)
     }
 
     fn find_thread(&self, session_id: &str) -> Option<&ClaudeThread> {
@@ -639,6 +704,7 @@ impl ClaudeThreadsView {
             .update(ctx, |menu, ctx| menu.set_items(items, ctx));
         self.pending_delete = None;
         self.keep_menu_open = false;
+        self.is_add_project_menu_open = false;
         self.menu_open_for = Some(session_id.to_owned());
         ctx.notify();
     }
@@ -650,12 +716,17 @@ impl ClaudeThreadsView {
     ) -> Vec<MenuItem<ClaudeThreadsAction>> {
         let id = session_id.to_owned();
         let thread = self.find_thread(session_id);
-        let mut items = vec![
-            MenuItemFields::new("Abrir no terminal")
-                .with_icon(WarpIcon::Terminal)
-                .with_on_select_action(ClaudeThreadsAction::OpenThreadInTerminal(id.clone()))
-                .into_item(),
-        ];
+        let is_unsent = self.is_unsent_chat(session_id, app);
+        let mut items = Vec::new();
+        // An unsent chat has no conversation for Claude Code to resume.
+        if !is_unsent {
+            items.push(
+                MenuItemFields::new("Abrir no terminal")
+                    .with_icon(WarpIcon::Terminal)
+                    .with_on_select_action(ClaudeThreadsAction::OpenThreadInTerminal(id.clone()))
+                    .into_item(),
+            );
+        }
         // Threads that haven't written a transcript yet have nothing to store a name in.
         if thread.is_some_and(|thread| !thread.transcript.as_os_str().is_empty()) {
             items.push(
@@ -693,7 +764,7 @@ impl ClaudeThreadsView {
         items.push(MenuItem::Separator);
         let red = Appearance::as_ref(app).theme().ansi_fg_red();
         items.push(
-            MenuItemFields::new("Excluir")
+            MenuItemFields::new(if is_unsent { "Descartar" } else { "Excluir" })
                 .with_icon(WarpIcon::Trash)
                 .with_override_text_color(red)
                 .with_override_icon_color(WarpThemeFill::Solid(red))
@@ -795,6 +866,17 @@ fn project_block_position_id(path: &Path) -> String {
     format!("claude_threads_project_block:{}", path.display())
 }
 
+/// Whether `PICOLAS_SIDEBAR=menu` asks for the projects' `+` menu, the first time the panel shows.
+/// Debug builds only.
+fn take_dev_open_add_menu() -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static TAKEN: AtomicBool = AtomicBool::new(false);
+    cfg!(debug_assertions)
+        && std::env::var("PICOLAS_SIDEBAR").is_ok_and(|value| value == "menu")
+        && !TAKEN.swap(true, Ordering::Relaxed)
+}
+
 /// Save-position id of a thread's "⋯" button, which its menu hangs from.
 fn thread_menu_button_position_id(session_id: &str) -> String {
     format!("claude_threads_menu_button:{session_id}")
@@ -815,7 +897,9 @@ impl TypedActionView for ClaudeThreadsView {
 
     fn handle_action(&mut self, action: &Self::Action, ctx: &mut ViewContext<Self>) {
         match action {
+            ClaudeThreadsAction::ToggleAddProjectMenu => self.toggle_add_project_menu(ctx),
             ClaudeThreadsAction::AddProject => self.pick_project_folder(ctx),
+            ClaudeThreadsAction::CreateProjectFolder => self.create_project_folder(ctx),
             ClaudeThreadsAction::RemoveProject(path) => self.remove_project(path, ctx),
             ClaudeThreadsAction::ToggleProjectCollapsed(path) => {
                 self.toggle_project_collapsed(path, ctx);
@@ -880,8 +964,12 @@ impl TypedActionView for ClaudeThreadsView {
                 self.start_rename(session_id, ctx);
             }
             ClaudeThreadsAction::AskDeleteThread(session_id) => {
-                self.pending_delete = Some(session_id.clone());
-                ctx.notify();
+                if self.is_unsent_chat(session_id, ctx) {
+                    self.delete_thread(session_id, ctx);
+                } else {
+                    self.pending_delete = Some(session_id.clone());
+                    ctx.notify();
+                }
             }
             ClaudeThreadsAction::ConfirmDeleteThread(session_id) => {
                 self.delete_thread(session_id, ctx);
@@ -1063,7 +1151,12 @@ impl View for ClaudeThreadsView {
             .with_child(Shrinkable::new(1., scrollable).finish())
             .finish();
         let mut stack = Stack::new().with_child(panel);
-        if let Some(session_id) = &self.menu_open_for {
+        if self.is_add_project_menu_open {
+            stack.add_positioned_overlay_child(
+                ChildView::new(&self.thread_menu).finish(),
+                add_menu_positioning(ADD_PROJECT_BUTTON_POSITION_ID),
+            );
+        } else if let Some(session_id) = &self.menu_open_for {
             stack.add_positioned_overlay_child(
                 ChildView::new(&self.thread_menu).finish(),
                 OffsetPositioning::offset_from_save_position_element(
@@ -1196,15 +1289,21 @@ impl ClaudeThreadsView {
             WarpIcon::ChevronDown
         };
         let add_button = (section == ThreadSection::Projects).then(|| {
-            render_icon_button(
-                WarpIcon::Plus,
-                "Adicionar pasta",
-                self.mouse_state("header:add".to_owned()),
-                ClaudeThreadsAction::AddProject,
-                palette,
-                appearance,
+            SavePosition::new(
+                render_icon_button(
+                    WarpIcon::Plus,
+                    "Adicionar pasta",
+                    self.mouse_state("header:add".to_owned()),
+                    ClaudeThreadsAction::ToggleAddProjectMenu,
+                    palette,
+                    appearance,
+                ),
+                ADD_PROJECT_BUTTON_POSITION_ID,
             )
+            .finish()
         });
+        // The menu hangs from the button, which has to stay while the pointer moves to the menu.
+        let is_add_menu_open = self.is_add_project_menu_open;
         let header = Hoverable::new(
             self.mouse_state(format!("section:{section:?}")),
             move |hover_state| {
@@ -1232,7 +1331,7 @@ impl ClaudeThreadsView {
                     .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
                     .with_cross_axis_alignment(CrossAxisAlignment::Center)
                     .with_child(label);
-                let trailing = add_button.filter(|_| hover_state.is_hovered());
+                let trailing = add_button.filter(|_| hover_state.is_hovered() || is_add_menu_open);
                 row.add_child(
                     ConstrainedBox::new(trailing.unwrap_or_else(|| Empty::new().finish()))
                         .with_height(META_HEIGHT)

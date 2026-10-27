@@ -32,7 +32,7 @@ use self::side_panel::SidePanelView;
 use self::transcript::{TranscriptEvent, TranscriptView};
 use super::ClaudeChatPaneSnapshot;
 use super::design::{ChatDesign, ChatDesignEvent, Palette, Sizes};
-use super::registry::NativeChatRegistry;
+use super::registry::{ChatActivity, NativeChatRegistry, NativeChatStatus};
 use super::session::{ClaudeChatSession, ClaudeChatSessionEvent};
 use crate::appearance::Appearance;
 use crate::pane_group::focus_state::PaneFocusHandle;
@@ -95,6 +95,9 @@ pub struct ClaudeChatView {
     root_position_id: String,
     pane_configuration: ModelHandle<PaneConfiguration>,
     focus_handle: Option<PaneFocusHandle>,
+    /// Whether the chat is shown in a pane; closed panes kept for undo aren't, and leave the
+    /// registry.
+    is_attached: bool,
 }
 
 impl ClaudeChatView {
@@ -165,6 +168,7 @@ impl ClaudeChatView {
             root_position_id: format!("native_chat_root:{}", ctx.view_id()),
             pane_configuration,
             focus_handle: None,
+            is_attached: true,
         }
     }
 
@@ -183,6 +187,33 @@ impl ClaudeChatView {
 
     pub fn session(&self) -> &ModelHandle<ClaudeChatSession> {
         &self.session
+    }
+
+    pub fn activity(&self, app: &AppContext) -> ChatActivity {
+        let session = self.session.as_ref(app);
+        ChatActivity::new(
+            session.has_transcript(),
+            self.composer.as_ref(app).has_draft(),
+            NativeChatStatus::of(&session.conversation().status()),
+        )
+    }
+
+    /// Called as the pane is shown in or taken out of a tab, to list the chat in the registry only
+    /// while it's on screen.
+    pub fn set_attached(&mut self, is_attached: bool, ctx: &mut ViewContext<Self>) {
+        if self.is_attached == is_attached {
+            return;
+        }
+        self.is_attached = is_attached;
+        if is_attached {
+            register_session(&self.session, ctx);
+        } else {
+            let session = self.session.clone();
+            let session_id = session.as_ref(ctx).session_id().to_owned();
+            NativeChatRegistry::handle(ctx).update(ctx, |registry, ctx| {
+                registry.unregister(&session_id, &session, ctx)
+            });
+        }
     }
 
     pub fn pane_configuration(&self) -> ModelHandle<PaneConfiguration> {
@@ -211,7 +242,9 @@ impl ClaudeChatView {
                 ctx.notify();
             }
             ClaudeChatSessionEvent::SessionIdAssigned => {
-                register_session(&self.session, ctx);
+                if self.is_attached {
+                    register_session(&self.session, ctx);
+                }
                 ctx.dispatch_global_action("workspace:save_app", ());
                 ctx.notify();
             }
@@ -267,6 +300,10 @@ impl ClaudeChatView {
                 let title = title.clone();
                 self.session
                     .update(ctx, |session, ctx| session.rename(title, ctx));
+            }
+            ComposerEvent::CopyWithoutSelection => {
+                self.transcript
+                    .update(ctx, |transcript, ctx| transcript.copy_selection(ctx));
             }
         }
     }

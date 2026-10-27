@@ -99,6 +99,8 @@ pub enum ComposerEvent {
     NewChat,
     /// Renames the conversation to this title.
     Rename(String),
+    /// ⌘C with nothing selected in the composer, which copies what's selected in the transcript.
+    CopyWithoutSelection,
 }
 
 /// What the effort slider and the permission card's buttons do, among others.
@@ -503,6 +505,14 @@ impl ComposerView {
         ctx.focus(&self.editor);
     }
 
+    /// Whether anything was typed or attached that wasn't sent yet.
+    pub fn has_draft(&self) -> bool {
+        !self.is_editor_empty
+            || !self.mentions.is_empty()
+            || !self.images.is_empty()
+            || !self.queued.is_empty()
+    }
+
     /// Quotes `text` in the next message, shown as a chip until then.
     pub fn add_mention(&mut self, text: String, ctx: &mut ViewContext<Self>) {
         if text.trim().is_empty() || self.mentions.len() >= MAX_CHIPS {
@@ -583,6 +593,7 @@ impl ComposerView {
                 ctx.notify();
             }
             EditorEvent::Paste => self.on_paste(ctx),
+            EditorEvent::Copy => ctx.emit(ComposerEvent::CopyWithoutSelection),
             EditorEvent::VoiceStateUpdated {
                 is_listening,
                 is_transcribing,

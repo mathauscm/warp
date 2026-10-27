@@ -2,14 +2,18 @@ use claude_chat::presentation::{Row, WorkGroup};
 use claude_chat::timeline::{
     AssistantText, TimelineItem, TodoStatus, ToolCall, ToolResult, ToolStatus, UserMessage,
 };
+use pathfinder_geometry::vector::vec2f;
 use serde_json::json;
+use warpui::elements::ChildAnchor;
 
 use super::details::{
     DiffLineKind, clean_result_text, compacted_label, diff_texts, first_lines, first_sentence,
     format_tokens, strip_ansi, todo_lines, tool_diff,
 };
 use super::markdown::{Block, column_weights, language_label, split_blocks};
-use super::{first_changed_row, row_key, row_last_item};
+use super::{
+    MENTION_HEIGHT, MENTION_OFFSET, first_changed_row, mention_placement, row_key, row_last_item,
+};
 
 fn tool(name: &str, input: serde_json::Value) -> ToolCall {
     ToolCall {
@@ -296,4 +300,40 @@ fn code_blocks_get_syntax_colors_for_known_languages() {
     let highlights = highlight_snippet("rs", "fn main() {}", color_map);
     assert!(highlights.contains(&(0..2, keyword)), "{highlights:?}");
     assert!(highlight_snippet("texto", "fn main() {}", color_map).is_empty());
+}
+
+const LINE_HEIGHT: f32 = 20.;
+const VISIBLE_HEIGHT: f32 = 400.;
+
+#[test]
+fn mention_pill_goes_under_the_last_line_of_a_forward_selection() {
+    let (offset, anchor) = mention_placement(vec2f(300., 100.), false, LINE_HEIGHT, VISIBLE_HEIGHT);
+    assert_eq!(
+        offset,
+        vec2f(300., 100. + LINE_HEIGHT / 2. + MENTION_OFFSET)
+    );
+    assert!(matches!(anchor, ChildAnchor::TopRight));
+}
+
+#[test]
+fn mention_pill_goes_above_the_first_line_of_a_backward_selection() {
+    let (offset, anchor) = mention_placement(vec2f(300., 100.), true, LINE_HEIGHT, VISIBLE_HEIGHT);
+    assert_eq!(
+        offset,
+        vec2f(300., 100. - LINE_HEIGHT / 2. - MENTION_OFFSET)
+    );
+    assert!(matches!(anchor, ChildAnchor::BottomLeft));
+}
+
+#[test]
+fn mention_pill_goes_along_the_line_without_room_above_or_below() {
+    let bottom = VISIBLE_HEIGHT - MENTION_HEIGHT / 2.;
+    let (offset, anchor) =
+        mention_placement(vec2f(300., bottom), false, LINE_HEIGHT, VISIBLE_HEIGHT);
+    assert_eq!(offset, vec2f(300. + MENTION_OFFSET, bottom));
+    assert!(matches!(anchor, ChildAnchor::MiddleLeft));
+
+    let (offset, anchor) = mention_placement(vec2f(300., 10.), true, LINE_HEIGHT, VISIBLE_HEIGHT);
+    assert_eq!(offset, vec2f(300. - MENTION_OFFSET, 10.));
+    assert!(matches!(anchor, ChildAnchor::MiddleRight));
 }

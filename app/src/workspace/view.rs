@@ -1,6 +1,7 @@
 pub(crate) mod agent_cli_launch_modal;
 pub(crate) mod auto_handoff_sleep_modal;
 mod build_plan_migration_modal;
+mod chat_tabs;
 pub(crate) mod chatgpt_plan_modal;
 mod claude_threads;
 pub(crate) mod cloud_agent_capacity_modal;
@@ -307,11 +308,10 @@ use crate::palette::PaletteMode;
 use crate::pane_group::FilePane;
 use crate::pane_group::pane::ActionOrigin;
 use crate::pane_group::{
-    self, AIFactPane, AnyPaneContent, ArtifactsPane, ChildAgentOrigin, ClaudeChatPane,
-    CodeDiffPane, CodePane, CodeReviewPanelArg, CustomRouterEditorPane,
-    Direction as PaneGroupDirection, Direction, EnvironmentManagementPane,
-    ExecutionProfileEditorPane, NetworkLogPane, NewTerminalOptions, PaneGroup, PaneId, PanesLayout,
-    TabBarHoverIndex, TerminalPaneId,
+    self, AIFactPane, AnyPaneContent, ArtifactsPane, ChildAgentOrigin, CodeDiffPane, CodePane,
+    CodeReviewPanelArg, CustomRouterEditorPane, Direction as PaneGroupDirection, Direction,
+    EnvironmentManagementPane, ExecutionProfileEditorPane, NetworkLogPane, NewTerminalOptions,
+    PaneGroup, PaneId, PanesLayout, TabBarHoverIndex, TerminalPaneId,
 };
 use crate::persistence::ModelEvent;
 use crate::projects::ProjectManagementModel;
@@ -566,6 +566,9 @@ use crate::{
 pub const WORKSPACE_PADDING: f32 = 0.0;
 #[cfg(not(target_family = "wasm"))]
 pub const WORKSPACE_PADDING: f32 = 1.0;
+
+/// How long the debug-only `PICOLAS_*` hooks wait for the first window's restored tabs.
+const DEV_HOOK_DELAY: Duration = Duration::from_secs(3);
 
 /// The minimum font size at which terminal text will be rendered.
 const MIN_FONT_SIZE: f32 = 5.0;
@@ -3701,6 +3704,38 @@ impl Workspace {
         if let Some(action) = crate::native_chat::take_dev_open_chat_action() {
             ctx.dispatch_typed_action_deferred(action);
         }
+        // Run once the restored tabs have settled, so they don't take the place of the opened chats.
+        let more_chats = crate::native_chat::take_dev_open_more_chats_actions();
+        if !more_chats.is_empty() {
+            ctx.spawn(
+                warpui::r#async::Timer::after(DEV_HOOK_DELAY),
+                move |_, _, ctx| {
+                    for action in more_chats {
+                        ctx.dispatch_typed_action_deferred(action);
+                    }
+                },
+            );
+        }
+        // `PICOLAS_SIDEBAR=threads` shows the Threads panel once the first window settles, `=menu`
+        // also opens its projects' `+` menu and `=tabs` shows the tab list. Debug builds only.
+        if cfg!(debug_assertions)
+            && let Ok(sidebar) = std::env::var("PICOLAS_SIDEBAR")
+        {
+            ctx.spawn(
+                warpui::r#async::Timer::after(2 * DEV_HOOK_DELAY),
+                move |me, _, ctx| {
+                    let content = if sidebar == "tabs" {
+                        VerticalTabsContent::Tabs
+                    } else {
+                        VerticalTabsContent::Threads
+                    };
+                    if !me.vertical_tabs_panel_open {
+                        me.toggle_vertical_tabs_panel(ctx);
+                    }
+                    me.set_vertical_tabs_content(content, ctx);
+                },
+            );
+        }
         if let Some(action) = crate::native_chat::take_dev_open_artifacts_action() {
             ctx.dispatch_typed_action_deferred(action);
         }
@@ -4536,7 +4571,7 @@ impl Workspace {
             if self.should_trigger_get_started_onboarding(ctx) {
                 self.trigger_get_started_onboarding(ctx);
             } else if let Some(home_dir) = home_dir {
-                self.open_claude_chat(home_dir, None, None, None, ctx);
+                self.open_claude_chat(ClaudeChatPaneSnapshot::new(home_dir), None, ctx);
                 ctx.dispatch_typed_action_deferred(WorkspaceAction::ToggleClaudeThreadsPanel);
             } else {
                 self.add_new_session_tab_with_default_mode(
@@ -5714,6 +5749,7 @@ impl Workspace {
             self.tab_mru_order.retain(|id| *id != pane_group_id);
             self.tab_mru_order.insert(0, pane_group_id);
         }
+        self.schedule_unused_chat_cleanup(ctx);
         if self.vertical_tabs_panel_open
             && FeatureFlag::VerticalTabs.is_enabled()
             && *TabSettings::as_ref(ctx).use_vertical_tabs
@@ -9067,7 +9103,7 @@ impl Workspace {
         let Some(cwd) = cwd else {
             return;
         };
-        self.open_claude_chat(cwd, None, None, None, ctx);
+        self.open_claude_chat(ClaudeChatPaneSnapshot::new(cwd), None, ctx);
     }
 
     /// Opens a new terminal tab in `directory` (the default one when `None`)
@@ -9824,11 +9860,16 @@ impl Workspace {
             .is_some_and(|tab| tab.group_id == Some(group_id));
         if !already_in_group {
             let target_index = self.index_after_group(group_id).unwrap_or(self.tabs.len());
+            let mut previous_group = None;
             if let Some(tab) = self.tabs.get_mut(tab_index) {
-                tab.group_id = Some(group_id);
+                previous_group = tab.group_id.replace(group_id);
                 tab.pinned = false;
             }
             self.move_tab_to_index(tab_index, target_index, ctx);
+            // A reused chat tab can leave the group of its previous project empty.
+            if let Some(previous_group) = previous_group {
+                self.prune_empty_tab_group(previous_group, ctx);
+            }
         }
         self.expand_tab_group(group_id, ctx);
         ctx.dispatch_global_action("workspace:save_app", ());
@@ -13458,56 +13499,6 @@ impl Workspace {
         }
     }
 
-    /// Opens a native Claude chat in a new tab, or focuses the one already showing the conversation.
-    fn open_claude_chat(
-        &mut self,
-        cwd: PathBuf,
-        session_id: Option<String>,
-        draft: Option<String>,
-        artifact_kind: Option<String>,
-        ctx: &mut ViewContext<Self>,
-    ) {
-        if let Some(locator) = session_id
-            .as_deref()
-            .and_then(|session_id| self.find_claude_chat_pane(session_id, ctx))
-        {
-            self.focus_pane(locator, ctx);
-            return;
-        }
-        let panes_layout = PanesLayout::Snapshot(Box::new(PaneNodeSnapshot::Leaf(LeafSnapshot {
-            is_focused: true,
-            custom_vertical_tabs_title: None,
-            contents: LeafContents::ClaudeChat(ClaudeChatPaneSnapshot {
-                session_id,
-                cwd,
-                draft,
-                artifact_kind,
-            }),
-        })));
-        self.add_tab_with_pane_layout(panes_layout, Arc::new(HashMap::new()), None, ctx);
-    }
-
-    /// The pane showing the native chat of `session_id`, in any tab of this window.
-    pub(super) fn find_claude_chat_pane(
-        &self,
-        session_id: &str,
-        ctx: &AppContext,
-    ) -> Option<PaneViewLocator> {
-        self.tabs.iter().find_map(|tab| {
-            let pane_group = tab.pane_group.as_ref(ctx);
-            pane_group.pane_ids().find_map(|pane_id| {
-                let pane = pane_group.downcast_pane_by_id::<ClaudeChatPane>(pane_id)?;
-                let view = pane.backing_view(ctx);
-                (view.as_ref(ctx).session().as_ref(ctx).session_id() == session_id).then_some(
-                    PaneViewLocator {
-                        pane_group_id: tab.pane_group.id(),
-                        pane_id,
-                    },
-                )
-            })
-        })
-    }
-
     /// Opens the artifacts gallery in a new tab.
     /// Focuses the artifacts tab, opening `artifact_id` in it, or opens one.
     fn open_artifacts(&mut self, artifact_id: Option<String>, ctx: &mut ViewContext<Self>) {
@@ -15816,10 +15807,13 @@ impl Workspace {
             .file_notebook_paths(ctx)
             .filter_map(|(id, path)| path.map(|p| (id, p)))
             .collect();
+        let chat_paths: Vec<(EntityId, LocalOrRemotePath)> =
+            pane_group.as_ref(ctx).claude_chat_paths(ctx).collect();
         let local_paths: Vec<(EntityId, LocalOrRemotePath)> = code_paths
             .into_iter()
             .chain(notebook_paths)
             .chain(code_diff_paths)
+            .chain(chat_paths)
             .collect();
 
         // Get the focused terminal ID to prioritize it in the repo_to_terminal map
@@ -21267,6 +21261,7 @@ impl Workspace {
                     || id.is_file_pane()
                     || id.is_code_pane()
                     || id.is_code_diff_pane()
+                    || id.is_claude_chat_pane()
             })
     }
 
@@ -25046,16 +25041,17 @@ impl TypedActionView for Workspace {
                 group,
             } => {
                 self.open_claude_chat(
-                    cwd.clone(),
-                    session_id.clone(),
-                    draft.clone(),
-                    artifact_kind.clone(),
+                    ClaudeChatPaneSnapshot {
+                        session_id: session_id.clone(),
+                        cwd: cwd.clone(),
+                        draft: draft.clone(),
+                        artifact_kind: artifact_kind.clone(),
+                    },
+                    group.as_deref(),
                     ctx,
                 );
-                if let Some(name) = group {
-                    self.move_active_tab_to_named_group(name, ctx);
-                }
             }
+            CloseClaudeChat { session_id } => self.close_claude_chat(session_id, ctx),
             OpenArtifacts { artifact_id } => self.open_artifacts(artifact_id.clone(), ctx),
             ToggleClaudeThreadsPanel => {
                 self.toggle_vertical_tabs_content(VerticalTabsContent::Threads, ctx);

@@ -24,6 +24,16 @@ pub struct ClaudeChatPaneSnapshot {
 }
 
 impl ClaudeChatPaneSnapshot {
+    /// A new chat in `cwd`.
+    pub fn new(cwd: PathBuf) -> Self {
+        Self {
+            session_id: None,
+            cwd,
+            draft: None,
+            artifact_kind: None,
+        }
+    }
+
     /// A chat on the saved conversation `session_id`.
     pub fn resume(cwd: PathBuf, session_id: String) -> Self {
         Self {
@@ -63,6 +73,37 @@ pub fn take_dev_open_chat_action() -> Option<crate::workspace::WorkspaceAction> 
         artifact_kind: std::env::var("PICOLAS_CHAT_ARTIFACT_KIND").ok(),
         group: None,
     })
+}
+
+/// `PICOLAS_OPEN_MORE_CHATS=<folder>[#<session id>];...` opens those chats one after another, the
+/// way the Threads panel would, once the first window's restored tabs settle. Debug builds only.
+pub fn take_dev_open_more_chats_actions() -> Vec<crate::workspace::WorkspaceAction> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static TAKEN: AtomicBool = AtomicBool::new(false);
+    if !cfg!(debug_assertions) || TAKEN.swap(true, Ordering::Relaxed) {
+        return Vec::new();
+    }
+    let Ok(specs) = std::env::var("PICOLAS_OPEN_MORE_CHATS") else {
+        return Vec::new();
+    };
+    specs
+        .split(';')
+        .filter(|spec| !spec.is_empty())
+        .map(|spec| {
+            let (cwd, session_id) = match spec.split_once('#') {
+                Some((cwd, session_id)) => (cwd, Some(session_id.to_owned())),
+                None => (spec, None),
+            };
+            crate::workspace::WorkspaceAction::OpenClaudeChat {
+                cwd: PathBuf::from(cwd),
+                session_id,
+                draft: None,
+                artifact_kind: None,
+                group: None,
+            }
+        })
+        .collect()
 }
 
 /// `PICOLAS_OPEN_SETTINGS=<page slug>` (like `Appearance` or `Features`) opens Settings on that

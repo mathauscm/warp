@@ -2,6 +2,7 @@
 //! and only lays out the elements that are visible in the viewport.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ops::{AddAssign, Range};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -15,8 +16,8 @@ use sum_tree::SumTree;
 
 use super::new_scrollable::{NewScrollableElement, ScrollableAxis};
 use super::{
-    AppContext, Axis, Element, ScrollData, ScrollableElement, SelectableElement, Selection,
-    SelectionFragment, SizeConstraint, SmartSelectFn,
+    AppContext, Axis, ContentAnchor, Element, ScrollData, ScrollableElement, SelectableElement,
+    Selection, SelectionFragment, SizeConstraint, SmartSelectFn, order_and_concatenate_fragments,
 };
 use crate::ClipBounds;
 use crate::text::word_boundaries::WordBoundariesPolicy;
@@ -114,6 +115,16 @@ impl<T> ListState<T> {
         self.0.borrow().scroll_top.list_item_index.0 == index
     }
 
+    /// The item at an absolute point, on or off screen, going by where the list was last painted.
+    pub fn item_at(&self, absolute_point: Vector2F) -> Option<usize> {
+        self.0.borrow().item_at(absolute_point)
+    }
+
+    /// Scrolls by `delta` pixels, towards the end of the list when positive.
+    pub fn scroll_by(&self, delta: Pixels) {
+        self.0.borrow_mut().scroll_by(delta);
+    }
+
     pub fn get_scroll_index(&self) -> usize {
         self.0.borrow().scroll_top.list_item_index.0
     }
@@ -180,6 +191,8 @@ type ListItemRenderFn = dyn Fn(usize, ScrollOffset, &AppContext) -> Box<dyn Elem
 pub struct List<T: 'static = ()> {
     list_state: ListState<T>,
     children: Vec<Box<dyn Element>>,
+    /// The index of the item in `children[0]`.
+    first_child_index: usize,
     size: Vector2F,
     origin: Option<super::Point>,
 }
@@ -189,8 +202,56 @@ impl<T: 'static> List<T> {
         Self {
             list_state,
             children: Vec::new(),
+            first_child_index: 0,
             size: Vector2F::zero(),
             origin: None,
+        }
+    }
+
+    /// The laid-out element of the item at `index`, if it's in the viewport.
+    fn child_at(&self, index: usize) -> Option<&dyn SelectableElement> {
+        self.children
+            .get(index.checked_sub(self.first_child_index)?)?
+            .as_selectable_element()
+    }
+
+    /// Notes the text of the items on screen while there's a selection, so a selection that
+    /// scrolled partly off screen can still be read.
+    fn cache_selection_text(&self, child_bounds: &[RectF], selection: Option<Selection>) {
+        let mut list_state = self.list_state.0.borrow_mut();
+        let Some(selection) = selection.filter(|selection| selection.start != selection.end) else {
+            list_state.selection_text.clear();
+            return;
+        };
+        let endpoint_items =
+            [selection.start, selection.end].map(|point| list_state.item_at(point));
+        for (position, bounds) in child_bounds.iter().enumerate() {
+            let index = self.first_child_index + position;
+            let Some(child) = self.child_at(index) else {
+                continue;
+            };
+            list_state
+                .selection_text
+                .whole
+                .entry(index)
+                .or_insert_with(|| {
+                    // Points just outside the item, so text elements select all of it.
+                    child
+                        .get_selection(
+                            bounds.origin() - vec2f(0., 1.),
+                            bounds.lower_right() + vec2f(0., 1.),
+                            IsRect::False,
+                        )
+                        .map(order_and_concatenate_fragments)
+                        .unwrap_or_default()
+                });
+            if endpoint_items.contains(&Some(index)) {
+                let selected = child
+                    .get_selection(selection.start, selection.end, selection.is_rect)
+                    .map(order_and_concatenate_fragments)
+                    .unwrap_or_default();
+                list_state.selection_text.selected.insert(index, selected);
+            }
         }
     }
 
@@ -298,24 +359,38 @@ impl<T: 'static> SelectableElement for List<T> {
         selection_end: Vector2F,
         is_rect: IsRect,
     ) -> Option<Vec<SelectionFragment>> {
-        let mut fragments: Vec<SelectionFragment> = Vec::new();
-        for child in &self.children {
-            let Some(child_fragments) = child
-                .as_selectable_element()
-                .and_then(|child| child.get_selection(selection_start, selection_end, is_rect))
-            else {
-                continue;
-            };
-            // The items are stacked vertically, like the lines of a vertical Flex.
-            if let Some(last) = fragments.last() {
-                fragments.push(SelectionFragment {
-                    text: "\n".to_owned(),
-                    origin: last.origin,
-                });
-            }
-            fragments.extend(child_fragments);
+        let list_state = self.list_state.0.borrow();
+        let (Some(start_item), Some(end_item)) = (
+            list_state.item_at(selection_start),
+            list_state.item_at(selection_end),
+        ) else {
+            return None;
+        };
+        let (first, last) = (start_item.min(end_item), start_item.max(end_item));
+        let cache = &list_state.selection_text;
+        // The items are stacked vertically, like the lines of a vertical Flex. Items scrolled off
+        // screen aren't laid out, so their text comes from when they were last on screen.
+        let text = (first..=last)
+            .filter_map(|index| match self.child_at(index) {
+                Some(child) => child
+                    .get_selection(selection_start, selection_end, is_rect)
+                    .map(order_and_concatenate_fragments),
+                None if index != first && index != last => cache.whole.get(&index).cloned(),
+                None => cache
+                    .selected
+                    .get(&index)
+                    .or_else(|| cache.whole.get(&index))
+                    .cloned(),
+            })
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>();
+        if text.is_empty() {
+            return None;
         }
-        (!fragments.is_empty()).then_some(fragments)
+        Some(vec![SelectionFragment {
+            text: text.join("\n"),
+            origin: self.origin?,
+        }])
     }
 
     fn expand_selection(
@@ -325,6 +400,9 @@ impl<T: 'static> SelectableElement for List<T> {
         unit: SelectionType,
         word_boundaries_policy: &WordBoundariesPolicy,
     ) -> Option<Vector2F> {
+        // A point off screen has no laid-out item to expand within.
+        let index = self.list_state.0.borrow().item_at(point)?;
+        self.child_at(index)?;
         let mut expanded = None;
         for child in &self.children {
             let Some(selection) = child.as_selectable_element().and_then(|child| {
@@ -345,11 +423,26 @@ impl<T: 'static> SelectableElement for List<T> {
         absolute_point: Vector2F,
         absolute_point_other: Vector2F,
     ) -> Option<bool> {
-        self.children.iter().find_map(|child| {
-            child
-                .as_selectable_element()?
-                .is_point_semantically_before(absolute_point, absolute_point_other)
-        })
+        let (index, other_index) = {
+            let list_state = self.list_state.0.borrow();
+            (
+                list_state.item_at(absolute_point)?,
+                list_state.item_at(absolute_point_other)?,
+            )
+        };
+        if index != other_index {
+            return Some(index < other_index);
+        }
+        self.child_at(index)
+            .and_then(|child| {
+                child.is_point_semantically_before(absolute_point, absolute_point_other)
+            })
+            .or_else(|| {
+                Some(
+                    (absolute_point.y(), absolute_point.x())
+                        < (absolute_point_other.y(), absolute_point_other.x()),
+                )
+            })
     }
 
     fn smart_select(
@@ -370,6 +463,27 @@ impl<T: 'static> SelectableElement for List<T> {
             .filter_map(|child| child.as_selectable_element())
             .flat_map(|child| child.calculate_clickable_bounds(current_selection))
             .collect()
+    }
+
+    fn content_anchor(&self, absolute_point: Vector2F) -> Option<ContentAnchor> {
+        let list_state = self.list_state.0.borrow();
+        let origin = list_state.origin?;
+        let content_y = list_state.content_y(absolute_point)?;
+        let item = list_state.item_at_content_y(content_y)?;
+        Some(ContentAnchor {
+            item,
+            offset: vec2f(
+                absolute_point.x() - origin.x(),
+                (content_y - list_state.item_top(item)).as_f32(),
+            ),
+        })
+    }
+
+    fn content_anchor_position(&self, anchor: ContentAnchor) -> Option<Vector2F> {
+        let list_state = self.list_state.0.borrow();
+        let origin = list_state.origin?;
+        let item_top = list_state.item_top(anchor.item) - list_state.scroll_top_pixels();
+        Some(origin + vec2f(0., item_top.as_f32()) + anchor.offset)
     }
 }
 
@@ -446,13 +560,15 @@ impl<T: 'static> Element for List<T> {
 
         list_state.viewport_height = viewport_height.into_pixels();
 
-        (_, self.children) = self.render_visible_items(child_constraint, &mut list_state, ctx, app);
+        let mut rendered_range;
+        (rendered_range, self.children) =
+            self.render_visible_items(child_constraint, &mut list_state, ctx, app);
 
         // Ensure the scroll top never exceeds the maximum scroll position.
         let max_scroll_top = list_state.max_scroll_offset(viewport_height.into_pixels());
         if list_state.scroll_top > max_scroll_top {
             list_state.scroll_top = max_scroll_top;
-            (_, self.children) =
+            (rendered_range, self.children) =
                 self.render_visible_items(child_constraint, &mut list_state, ctx, app);
         }
 
@@ -465,10 +581,11 @@ impl<T: 'static> Element for List<T> {
                 (scroll_preservation.adjustment_fn)(scroll_item_index, scroll_ctx, app)
         {
             list_state.scroll_top.offset_from_start = new_scroll_offset;
-            (_, self.children) =
+            (rendered_range, self.children) =
                 self.render_visible_items(child_constraint, &mut list_state, ctx, app);
         }
 
+        self.first_child_index = rendered_range.start;
         self.size = size;
         size
     }
@@ -486,19 +603,24 @@ impl<T: 'static> Element for List<T> {
             self.size().expect("size should be set at paint time"),
         )));
 
-        let list_state = self.list_state.0.borrow();
+        let mut origin = {
+            let mut list_state = self.list_state.0.borrow_mut();
+            list_state.origin = Some(origin);
+            // Offset the origin by the scroll top offset since the child may be only partially in
+            // the viewport.
+            origin - vec2f(0., list_state.scroll_top.offset_from_start.as_f32())
+        };
 
-        let mut origin = origin;
-        // Offset the origin by the scroll top offset since the child may be only partially in the viewport.
-        origin.set_y(origin.y() - list_state.scroll_top.offset_from_start.as_f32());
-
+        let mut child_bounds = Vec::with_capacity(self.children.len());
         for child in &mut self.children {
             child.paint(origin, ctx, app);
-            let child_height = child.size().expect("Child should exist at paint time").y();
-            origin.set_y(origin.y() + child_height);
+            let child_size = child.size().expect("Child should exist at paint time");
+            child_bounds.push(RectF::new(origin, child_size));
+            origin.set_y(origin.y() + child_size.y());
         }
 
         ctx.scene.stop_layer();
+        self.cache_selection_text(&child_bounds, ctx.current_selection);
     }
 
     fn size(&self) -> Option<Vector2F> {
@@ -648,6 +770,31 @@ struct ListStateInner<T> {
     /// user scrolls. Created by [`ListState::new_with_scroll_preservation`].
     /// Cleared automatically if the receiver is dropped (channel closed).
     scroll_tx: Option<async_channel::Sender<ScrollOffset>>,
+    /// Where the list was last painted, in window coordinates.
+    origin: Option<Vector2F>,
+    selection_text: SelectionTextCache,
+}
+
+/// The text of items seen on screen while there's a selection, by item index.
+#[derive(Default)]
+struct SelectionTextCache {
+    /// All of an item's text.
+    whole: HashMap<usize, String>,
+    /// The selected part of an item that holds an end of the selection.
+    selected: HashMap<usize, String>,
+}
+
+impl SelectionTextCache {
+    fn clear(&mut self) {
+        self.whole.clear();
+        self.selected.clear();
+    }
+
+    /// Forgets the items from `index` on, whose content or position changed.
+    fn forget_from(&mut self, index: usize) {
+        self.whole.retain(|item, _| *item < index);
+        self.selected.retain(|item, _| *item < index);
+    }
 }
 
 impl ListStateInner<()> {
@@ -661,6 +808,8 @@ impl ListStateInner<()> {
             scroll_preservation: None,
             current_scroll_context: None,
             scroll_tx: None,
+            origin: None,
+            selection_text: SelectionTextCache::default(),
         }
     }
 }
@@ -682,6 +831,8 @@ impl<T> ListStateInner<T> {
             }),
             current_scroll_context: None,
             scroll_tx: Some(scroll_tx),
+            origin: None,
+            selection_text: SelectionTextCache::default(),
         }
     }
 }
@@ -782,6 +933,7 @@ impl<T> ListStateInner<T> {
 
         self.content = new_tree;
         self.last_measured_index = self.last_measured_index.min(last_measured);
+        self.selection_text.forget_from(index);
     }
 
     fn remove(&mut self, index: usize) {
@@ -800,6 +952,50 @@ impl<T> ListStateInner<T> {
         if self.scroll_top.list_item_index.0 > index {
             self.scroll_top.list_item_index.0 -= 1;
         }
+        self.selection_text.forget_from(index);
+    }
+
+    fn scroll_by(&mut self, delta: Pixels) {
+        let max_scroll_top = (self.approximate_height() - self.viewport_height).max(Pixels::zero());
+        let scroll_top = (self.scroll_top_pixels() + delta)
+            .max(Pixels::zero())
+            .min(max_scroll_top);
+        self.scroll_top = self.absolute_pixels_to_scroll_offset(scroll_top);
+        self.broadcast_scroll_event();
+    }
+
+    /// How far below the top of the content an absolute point is, going by where the list was
+    /// last painted.
+    fn content_y(&self, absolute_point: Vector2F) -> Option<Pixels> {
+        let origin = self.origin?;
+        Some((absolute_point.y() - origin.y()).into_pixels() + self.scroll_top_pixels())
+    }
+
+    /// The item at `content_y`; the last item when it's past the end.
+    fn item_at_content_y(&self, content_y: Pixels) -> Option<usize> {
+        let count = self.content.summary().count;
+        if count == 0 {
+            return None;
+        }
+        let mut cursor = self.content.cursor::<Height, Count>();
+        cursor.seek(
+            &Height(content_y.max(Pixels::zero()).into()),
+            sum_tree::SeekBias::Right,
+        );
+        Some(cursor.start().0.min(count - 1))
+    }
+
+    /// The item at an absolute point, on or off screen.
+    fn item_at(&self, absolute_point: Vector2F) -> Option<usize> {
+        self.item_at_content_y(self.content_y(absolute_point)?)
+    }
+
+    /// How far below the top of the content an item starts. Items not yet measured count as
+    /// empty, which keeps the ones below the viewport below it.
+    fn item_top(&self, index: usize) -> Pixels {
+        let mut cursor = self.content.cursor::<Count, Height>();
+        cursor.seek(&Count(index), sum_tree::SeekBias::Right);
+        cursor.start().0.0
     }
 
     /// Number of pixels scrolled from the top.
