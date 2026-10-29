@@ -84,6 +84,19 @@ pub fn initialize_settings_for_tests_with_mode(
 
     FontSettings::register(app);
     GeneralSettings::register(app);
+    // Tests expect a new window to open a terminal; Picolas defaults to the Threads screen.
+    app.update(|ctx| {
+        use settings::Setting as _;
+        use warpui::SingletonEntity as _;
+
+        use crate::terminal::general_settings::StartupScreen;
+        GeneralSettings::handle(ctx).update(ctx, |settings, ctx| {
+            settings
+                .startup_screen
+                .set_value(StartupScreen::Terminal, ctx)
+                .expect("tests can set the startup screen");
+        });
+    });
     GPUSettings::register(app);
     InputModeSettings::register(app);
     InputSettings::register(app);
