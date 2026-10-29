@@ -167,6 +167,32 @@ pub fn init_actions_from_parent_view<T: Action + Clone>(
                 .is_supported_on_current_platform(),
         ),
         ToggleSettingActionPair::new(
+            "quit when all windows are closed",
+            builder(SettingsAction::FeaturesPageToggle(
+                FeaturesPageAction::ToggleQuitOnLastWindowClosed,
+            )),
+            context,
+            flags::QUIT_ON_LAST_WINDOW_CLOSED_CONTEXT_FLAG,
+        )
+        .is_supported_on_current_platform(
+            GeneralSettings::as_ref(app)
+                .quit_on_last_window_closed
+                .is_supported_on_current_platform(),
+        ),
+        ToggleSettingActionPair::new(
+            "start Picolas Code at login",
+            builder(SettingsAction::FeaturesPageToggle(
+                FeaturesPageAction::ToggleLoginItem,
+            )),
+            context,
+            flags::LOGIN_ITEM_CONTEXT_FLAG,
+        )
+        .is_supported_on_current_platform(
+            GeneralSettings::as_ref(app)
+                .add_app_as_login_item
+                .is_supported_on_current_platform(),
+        ),
+        ToggleSettingActionPair::new(
             "restore windows, tabs, and panes on startup",
             builder(SettingsAction::FeaturesPageToggle(
                 FeaturesPageAction::ToggleRestoreSession,
@@ -4885,7 +4911,7 @@ impl SettingsWidget for LoginItemWidget {
     type View = FeaturesPageView;
 
     fn search_terms(&self) -> &str {
-        "login item startup start mac windows app restart automatic"
+        "login item startup start mac windows app restart automatic abrir iniciar sessão login"
     }
 
     fn render(
@@ -4897,9 +4923,9 @@ impl SettingsWidget for LoginItemWidget {
         let general_settings = GeneralSettings::as_ref(app);
         let ui_builder = appearance.ui_builder();
         #[cfg(target_os = "macos")]
-        let label = "Start Warp at login (requires macOS 13+)";
+        let label = "Abrir o Picolas Code ao iniciar sessão (macOS 13+)";
         #[cfg(not(target_os = "macos"))]
-        let label = "Start Warp at login";
+        let label = "Abrir o Picolas Code ao iniciar sessão";
         render_body_item::<FeaturesPageAction>(
             label.into(),
             None,
@@ -4936,7 +4962,7 @@ impl SettingsWidget for QuitWhenAllWindowsClosedWidget {
     type View = FeaturesPageView;
 
     fn search_terms(&self) -> &str {
-        "quit all windows closed"
+        "quit all windows closed fechar encerrar janelas segundo plano background"
     }
 
     fn render(
@@ -4948,7 +4974,7 @@ impl SettingsWidget for QuitWhenAllWindowsClosedWidget {
         let general_settings = GeneralSettings::as_ref(app);
         let ui_builder = appearance.ui_builder();
         render_body_item::<FeaturesPageAction>(
-            "Quit when all windows are closed".into(),
+            "Encerrar o app ao fechar todas as janelas".into(),
             None,
             LocalOnlyIconState::for_setting(
                 QuitOnLastWindowClosed::storage_key(),

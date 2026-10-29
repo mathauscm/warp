@@ -10,6 +10,7 @@ use indexmap::IndexMap;
 use itertools::Itertools;
 #[cfg(feature = "local_fs")]
 use num_traits::SaturatingSub;
+use pathfinder_color::ColorU;
 use pathfinder_geometry::rect::RectF;
 use pathfinder_geometry::vector::{Vector2F, vec2f};
 use rand::Rng;
@@ -113,6 +114,7 @@ use crate::code_review::telemetry_event::{
 use crate::coding_panel_enablement_state::CodingPanelEnablementState;
 use crate::editor::InteractionState;
 use crate::menu::{Event as MenuEvent, Menu, MenuItem, MenuItemFields};
+use crate::native_chat::design::ChatDesign;
 use crate::pane_group::PaneId;
 use crate::pane_group::focus_state::{PaneFocusHandle, PaneGroupFocusEvent};
 use crate::pane_group::pane::{BackingView, PaneEvent, view};
@@ -250,6 +252,7 @@ const FILE_SIDEBAR_MAX_WIDTH: f32 = 800.;
 /// This is a best guess effort at getting the height of the file header.
 /// If the file header is changed, we should update this value.
 const FILE_HEADER_HEIGHT: f32 = 41.;
+const FILE_STATS_SPACING: f32 = 6.;
 /// The gap between editors in the viewported list.
 const EDITOR_GAP: f32 = 12.;
 const FILE_SIDEBAR_PANE_WIDTH_PERCENTAGE: f32 = 0.25;
@@ -4448,21 +4451,20 @@ impl CodeReviewView {
             return counts_row.finish();
         }
 
-        // Add separator
         counts_row.add_child(
             Container::new(
-                Text::new(
-                    " • ",
-                    appearance.ui_font_family(),
-                    appearance.ui_font_size(),
+                ConstrainedBox::new(
+                    Rect::new()
+                        .with_background_color(internal_colors::neutral_4(theme))
+                        .finish(),
                 )
-                .with_style(Properties::default().weight(Weight::Bold))
-                .with_color(
-                    warp_core::ui::theme::Fill::Solid(internal_colors::neutral_6(theme)).into(),
-                )
+                .with_width(1.)
+                .with_height(appearance.ui_font_size())
                 .finish(),
             )
-            .with_margin_right(4.)
+            // The file count already keeps 4px to its right.
+            .with_margin_left(2.)
+            .with_margin_right(6.)
             .finish(),
         );
 
@@ -4991,7 +4993,7 @@ impl CodeReviewView {
             .on_left_mouse_down(|_, _, _| DispatchEventResult::StopPropagation)
             .finish(),
         );
-        left_section.add_child(self.render_file_stats(&file.file_diff, appearance));
+        left_section.add_child(self.render_file_stats(&file.file_diff, appearance, app));
 
         let mut right_row = Flex::row()
             .with_main_axis_alignment(MainAxisAlignment::End)
@@ -5114,74 +5116,50 @@ impl CodeReviewView {
             .finish()
     }
 
-    /// Renders file-specific statistics
-    fn render_file_stats(&self, file: &FileDiff, appearance: &Appearance) -> Box<dyn Element> {
-        let mut row = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
-
-        let no_line_changes_present = file.additions() == 0 && file.deletions() == 0;
-        if file.is_binary || no_line_changes_present {
-            row.add_child(
-                Container::new(
-                    Text::new("0", appearance.ui_font_family(), appearance.ui_font_size())
-                        .with_color(
-                            appearance
-                                .theme()
-                                .disabled_text_color(appearance.theme().background())
-                                .into(),
-                        )
-                        .finish(),
-                )
-                .finish(),
-            )
+    /// The file header's `+12 −3` pill, in the chat's diff colors; only the counts that aren't
+    /// zero show.
+    fn render_file_stats(
+        &self,
+        file: &FileDiff,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let palette = ChatDesign::as_ref(app).palette(app);
+        let font_family = appearance.ui_font_family();
+        let font_size = appearance.ui_font_size() - 1.;
+        let count = |text: String, color: ColorU| {
+            Text::new_inline(text, font_family, font_size)
+                .with_style(Properties::default().weight(Weight::Medium))
+                .with_color(color)
+                .finish()
+        };
+        let mut row = Flex::row()
+            .with_main_axis_size(MainAxisSize::Min)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(FILE_STATS_SPACING);
+        let (additions, deletions) = (file.additions(), file.deletions());
+        if file.is_binary || (additions == 0 && deletions == 0) {
+            row.add_child(count(
+                "0".to_owned(),
+                theme.disabled_text_color(theme.background()).into(),
+            ));
         } else {
-            row.add_children([
-                Container::new(
-                    Text::new(
-                        format!("+{}", file.additions()),
-                        appearance.ui_font_family(),
-                        appearance.ui_font_size(),
-                    )
-                    .with_color(add_color(appearance))
-                    .finish(),
-                )
-                .with_margin_right(4.)
-                .finish(),
-                Container::new(
-                    Text::new("•", appearance.ui_font_family(), appearance.ui_font_size())
-                        .with_style(Properties::default().weight(Weight::Bold))
-                        .with_color(
-                            warp_core::ui::theme::Fill::Solid(internal_colors::neutral_6(
-                                appearance.theme(),
-                            ))
-                            .into(),
-                        )
-                        .finish(),
-                )
-                .with_margin_right(4.)
-                .finish(),
-                Container::new(
-                    Text::new(
-                        format!("-{}", file.deletions()),
-                        appearance.ui_font_family(),
-                        appearance.ui_font_size(),
-                    )
-                    .with_color(remove_color(appearance))
-                    .finish(),
-                )
-                .with_margin_left(4.)
-                .finish(),
-            ]);
+            if additions > 0 {
+                row.add_child(count(format!("+{additions}"), palette.diff_added.0));
+            }
+            if deletions > 0 {
+                row.add_child(count(
+                    format!("\u{2212}{deletions}"),
+                    palette.diff_removed.0,
+                ));
+            }
         }
         Container::new(row.finish())
-            .with_background(appearance.theme().background())
-            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(2.)))
+            .with_background(internal_colors::fg_overlay_1(theme))
+            .with_corner_radius(CornerRadius::with_all(Radius::Percentage(50.)))
             .with_horizontal_padding(8.)
-            .with_vertical_padding(4.)
-            .with_border(
-                Border::all(1.).with_border_fill(warp_core::ui::theme::Fill::Solid(
-                    internal_colors::neutral_4(appearance.theme()),
-                )),
-            )
+            .with_vertical_padding(2.)
             .finish()
     }
 

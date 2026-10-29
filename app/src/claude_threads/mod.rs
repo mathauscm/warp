@@ -15,6 +15,21 @@
 //! "9a1e…" = "/Users/me/projects/kinbox"
 //! ```
 //!
+//! Workspaces group several folders, so a chat started in one has Claude work across all of them
+//! (see [`ThreadWorkspace`]). Archived threads leave every other section for "Arquivadas":
+//!
+//! ```toml
+//! archived = ["77b2…"]
+//!
+//! [[workspace]]
+//! id   = "c41d…"
+//! name = "Kinbox"
+//! dirs = ["/Users/me/projects/kinbox-web", "/Users/me/projects/kinbox-api"]
+//!
+//! [workspace_threads]
+//! "5f0c…" = "c41d…"
+//! ```
+//!
 //! Threads are read straight from Claude Code's transcripts at
 //! `~/.claude/projects/<slug>/<session id>.jsonl`, where the slug is the folder
 //! the conversation started in with every non-alphanumeric character replaced
@@ -62,29 +77,159 @@ impl ThreadProject {
     }
 }
 
+/// A named set of folders, like the front and back end of one product, that a chat works across:
+/// Claude runs in the first folder and gets access to the others.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreadWorkspace {
+    pub id: String,
+    pub name: String,
+    /// The first one is where Claude runs; the others are added with `--add-dir`.
+    #[serde(default)]
+    pub dirs: Vec<PathBuf>,
+    #[serde(default)]
+    pub collapsed: bool,
+}
+
+impl ThreadWorkspace {
+    pub fn new(name: String) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            name,
+            dirs: Vec::new(),
+            collapsed: false,
+        }
+    }
+
+    pub fn primary_dir(&self) -> Option<&Path> {
+        self.dirs.first().map(PathBuf::as_path)
+    }
+
+    /// Adds the folders not in the workspace yet, keeping their order. Returns whether any was.
+    pub fn add_dirs(&mut self, dirs: impl IntoIterator<Item = PathBuf>) -> bool {
+        let before = self.dirs.len();
+        for dir in dirs {
+            if !self.dirs.contains(&dir) {
+                self.dirs.push(dir);
+            }
+        }
+        self.dirs.len() != before
+    }
+
+    /// The chat settings of a chat in this workspace that runs in `cwd`: every other folder of the
+    /// workspace is added to it.
+    pub fn chat_workspace(&self, cwd: &Path) -> crate::native_chat::ChatWorkspace {
+        crate::native_chat::ChatWorkspace {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            extra_dirs: self
+                .dirs
+                .iter()
+                .filter(|dir| dir.as_path() != cwd)
+                .cloned()
+                .collect(),
+        }
+    }
+}
+
+/// The version written by this build; older files have none and load the same way.
+const CONFIG_VERSION: u32 = 2;
+
 /// What the Threads panel keeps between launches.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThreadsConfig {
+    #[serde(default)]
+    pub version: u32,
     /// Session ids of the threads listed under "Fixados", most recently pinned first.
     #[serde(default)]
     pub pinned: Vec<String>,
+    /// Session ids of the threads listed only under "Arquivadas", most recently archived first.
+    #[serde(default)]
+    pub archived: Vec<String>,
     #[serde(default)]
     pub pinned_collapsed: bool,
     #[serde(default)]
     pub projects_collapsed: bool,
     #[serde(default)]
+    pub workspaces_collapsed: bool,
+    #[serde(default)]
     pub recent_collapsed: bool,
+    /// "Arquivadas" starts collapsed.
+    #[serde(default)]
+    pub archived_expanded: bool,
     #[serde(default, rename = "project")]
     pub projects: Vec<ThreadProject>,
+    #[serde(default, rename = "workspace")]
+    pub workspaces: Vec<ThreadWorkspace>,
     /// Project each moved thread is listed under instead of the one holding its folder, by session
     /// id. The thread still resumes in its own folder.
     #[serde(default)]
     pub moved: BTreeMap<String, PathBuf>,
+    /// Workspace id of each thread started in a workspace, by session id.
+    #[serde(default)]
+    pub workspace_threads: BTreeMap<String, String>,
 }
 
 impl ThreadsConfig {
     pub fn is_pinned(&self, session_id: &str) -> bool {
         self.pinned.iter().any(|id| id == session_id)
+    }
+
+    pub fn is_archived(&self, session_id: &str) -> bool {
+        self.archived.iter().any(|id| id == session_id)
+    }
+
+    /// Archives the thread, which also unpins it, or brings it back.
+    pub fn toggle_archived(&mut self, session_id: &str) {
+        if self.is_archived(session_id) {
+            self.archived.retain(|id| id != session_id);
+        } else {
+            self.pinned.retain(|id| id != session_id);
+            self.archived.insert(0, session_id.to_owned());
+        }
+    }
+
+    /// Pins the thread, which also unarchives it, or unpins it.
+    pub fn toggle_pinned(&mut self, session_id: &str) {
+        if self.is_pinned(session_id) {
+            self.pinned.retain(|id| id != session_id);
+        } else {
+            self.archived.retain(|id| id != session_id);
+            self.pinned.insert(0, session_id.to_owned());
+        }
+    }
+
+    pub fn workspace(&self, id: &str) -> Option<&ThreadWorkspace> {
+        self.workspaces.iter().find(|workspace| workspace.id == id)
+    }
+
+    pub fn workspace_mut(&mut self, id: &str) -> Option<&mut ThreadWorkspace> {
+        self.workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == id)
+    }
+
+    /// The listed workspace a thread was started in.
+    pub fn workspace_of(&self, session_id: &str) -> Option<&ThreadWorkspace> {
+        self.workspace(self.workspace_threads.get(session_id)?)
+    }
+
+    /// Lists the thread under the workspace. Returns whether that changed anything.
+    pub fn assign_to_workspace(&mut self, session_id: &str, workspace_id: &str) -> bool {
+        if self.workspace(workspace_id).is_none()
+            || self.workspace_threads.get(session_id).map(String::as_str) == Some(workspace_id)
+        {
+            return false;
+        }
+        self.workspace_threads
+            .insert(session_id.to_owned(), workspace_id.to_owned());
+        true
+    }
+
+    /// Drops the workspace; its threads go back to their projects or "Recentes".
+    pub fn remove_workspace(&mut self, id: &str) {
+        self.workspaces.retain(|workspace| workspace.id != id);
+        self.workspace_threads
+            .retain(|_, workspace_id| workspace_id != id);
     }
 
     /// The listed project a thread belongs to: the one it was moved to, else the one that most
@@ -107,7 +252,9 @@ impl ThreadsConfig {
     /// Drops what the config remembers about a deleted thread.
     pub fn forget_thread(&mut self, session_id: &str) {
         self.pinned.retain(|id| id != session_id);
+        self.archived.retain(|id| id != session_id);
         self.moved.remove(session_id);
+        self.workspace_threads.remove(session_id);
     }
 }
 
@@ -130,7 +277,11 @@ pub fn load_config() -> ThreadsConfig {
 }
 
 pub fn save_config(config: &ThreadsConfig) -> std::io::Result<()> {
-    let contents = toml::to_string_pretty(config).map_err(std::io::Error::other)?;
+    let config = ThreadsConfig {
+        version: CONFIG_VERSION,
+        ..config.clone()
+    };
+    let contents = toml::to_string_pretty(&config).map_err(std::io::Error::other)?;
     let path = config_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -222,18 +373,30 @@ pub fn scan_in(root: &Path, cache: &mut TranscriptCache) -> Vec<ClaudeThread> {
 pub struct ThreadGroups {
     /// In the order of `ThreadsConfig::pinned`.
     pub pinned: Vec<ClaudeThread>,
-    /// The threads of each listed project that aren't pinned.
+    /// The threads of each listed workspace that aren't pinned, by workspace id.
+    pub by_workspace: HashMap<String, Vec<ClaudeThread>>,
+    /// The threads of each listed project that aren't pinned nor in a workspace.
     pub by_project: HashMap<PathBuf, Vec<ClaudeThread>>,
-    /// Threads outside every project and not pinned.
+    /// Threads outside every project and workspace, and not pinned.
     pub recent: Vec<ClaudeThread>,
+    /// Archived threads, listed nowhere else.
+    pub archived: Vec<ClaudeThread>,
 }
 
 /// Sorts `threads` (newest first) into sections, keeping their order within each.
 pub fn group_threads(threads: Vec<ClaudeThread>, config: &ThreadsConfig) -> ThreadGroups {
     let mut groups = ThreadGroups::default();
     for thread in threads {
-        if config.is_pinned(&thread.session_id) {
+        if config.is_archived(&thread.session_id) {
+            groups.archived.push(thread);
+        } else if config.is_pinned(&thread.session_id) {
             groups.pinned.push(thread);
+        } else if let Some(workspace) = config.workspace_of(&thread.session_id) {
+            groups
+                .by_workspace
+                .entry(workspace.id.clone())
+                .or_default()
+                .push(thread);
         } else if let Some(project) = config.project_of(&thread) {
             groups
                 .by_project
@@ -570,6 +733,46 @@ fn clean_title(text: &str) -> String {
     let mut title: String = single_line.chars().take(TITLE_MAX_CHARS - 1).collect();
     title.push('…');
     title
+}
+
+/// The branch checked out in the git repository holding `dir`, or the short commit id when HEAD is
+/// detached. Reads `HEAD` directly (linked worktrees included) instead of running git.
+pub fn git_branch(dir: &Path) -> Option<String> {
+    let dot_git = dir
+        .ancestors()
+        .map(|ancestor| ancestor.join(".git"))
+        .find(|dot_git| dot_git.exists())?;
+    let git_dir = if dot_git.is_file() {
+        let contents = std::fs::read_to_string(&dot_git).ok()?;
+        let target = PathBuf::from(
+            contents
+                .lines()
+                .find_map(|line| line.strip_prefix("gitdir:"))?
+                .trim(),
+        );
+        if target.is_absolute() {
+            target
+        } else {
+            dot_git.parent()?.join(target)
+        }
+    } else {
+        dot_git
+    };
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = head.trim();
+    match head.strip_prefix("ref:") {
+        Some(reference) => {
+            let reference = reference.trim();
+            Some(
+                reference
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(reference)
+                    .to_owned(),
+            )
+        }
+        None if head.is_empty() => None,
+        None => Some(head.chars().take(7).collect()),
+    }
 }
 
 /// How long ago `updated_at` was, as shown next to a thread ("5 min", "ontem").

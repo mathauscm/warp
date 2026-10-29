@@ -1,10 +1,11 @@
 //! Threads panel of the vertical tabs sidebar: Claude Code conversations sorted into pinned
-//! threads, project folders and the recent threads outside every project (see
-//! `crate::claude_threads`). It takes the place of the tab list while the header "Threads" button
+//! threads, project folders, workspaces, the recent threads outside every project and the archived
+//! ones (see `crate::claude_threads`). It takes the place of the tab list while the header "Threads" button
 //! is active.
 //!
 //! Clicking a thread focuses the pane already showing it, or opens it in the native chat (see
-//! `super::chat_tabs` for which tab); the `+` of a project starts a new thread in its folder.
+//! `super::chat_tabs` for which tab); the `+` of a project starts a new thread in its folder, and
+//! the `+` of a workspace one that works across all its folders.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -42,7 +43,8 @@ use super::project_manager::{
 };
 use crate::appearance::Appearance;
 use crate::claude_threads::{
-    self, ClaudeThread, ThreadGroups, ThreadProject, ThreadsConfig, TranscriptCache,
+    self, ClaudeThread, ThreadGroups, ThreadProject, ThreadWorkspace, ThreadsConfig,
+    TranscriptCache,
 };
 use crate::editor::{EditorView, Event as EditorEvent, SingleLineEditorOptions, TextOptions};
 use crate::menu::{Event as MenuEvent, Menu, MenuItem, MenuItemFields};
@@ -95,7 +97,9 @@ const NEW_CHAT_ICON: &str = "bundled/svg/picolas-new-chat.svg";
 const ARTIFACTS_ICON: &str = "bundled/svg/picolas-artifact-other.svg";
 const SEARCH_ICON: &str = "bundled/svg/picolas-search.svg";
 const SIDEBAR_ICON: &str = "bundled/svg/picolas-sidebar.svg";
-const PIN_ICON: &str = "bundled/svg/picolas-pin.svg";
+const WORKSPACE_ICON: &str = "bundled/svg/picolas-workspace.svg";
+const ARCHIVE_ICON: &str = "bundled/svg/picolas-archive.svg";
+const DIR_ICON_SIZE: f32 = 13.;
 const ADD_PROJECT_BUTTON_POSITION_ID: &str = "claude_threads_add_project_button";
 
 const PROJECT_FONT_SIZE: f32 = 13.5;
@@ -110,7 +114,9 @@ const META_HEIGHT: f32 = ACTION_ICON_SIZE + 2. * ACTION_BUTTON_PADDING;
 pub enum ThreadSection {
     Pinned,
     Projects,
+    Workspaces,
     Recent,
+    Archived,
 }
 
 impl ThreadSection {
@@ -118,9 +124,29 @@ impl ThreadSection {
         match self {
             Self::Pinned => "Fixados",
             Self::Projects => "Projetos",
+            Self::Workspaces => "Workspaces",
             Self::Recent => "Recentes",
+            Self::Archived => "Arquivadas",
         }
     }
+}
+
+/// A list of threads cut at `RECENT_THREAD_LIMIT` until "Mostrar mais" is clicked.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ThreadList {
+    Project(PathBuf),
+    /// By workspace id.
+    Workspace(String),
+    Recent,
+    Archived,
+}
+
+/// What the workspace name editor names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorkspaceNaming {
+    New,
+    /// By workspace id.
+    Rename(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -140,8 +166,8 @@ pub enum ClaudeThreadsAction {
     RemoveProject(PathBuf),
     ToggleProjectCollapsed(PathBuf),
     ToggleSection(ThreadSection),
-    /// Shows every thread of a project, or of "Recentes" when `None`.
-    ToggleShowAllThreads(Option<PathBuf>),
+    /// Shows every thread of the list, or only the latest again.
+    ToggleShowAllThreads(ThreadList),
     NewThread(PathBuf),
     /// Starts a thread in the home folder.
     NewChat,
@@ -153,8 +179,6 @@ pub enum ClaudeThreadsAction {
         session_id: String,
         cwd: PathBuf,
     },
-    /// Resumes the thread in a terminal running Claude Code, instead of the native chat.
-    OpenThreadInTerminal(String),
     ToggleThreadMenu(String),
     /// Swaps the open "⋯" menu between its actions and the projects the thread can move to.
     ShowThreadMenuPage {
@@ -174,12 +198,40 @@ pub enum ClaudeThreadsAction {
     AskDeleteThread(String),
     ConfirmDeleteThread(String),
     CancelDeleteThread,
+    /// Archives the thread, or brings it back from "Arquivadas".
+    ToggleArchiveThread(String),
+    /// Shows the name editor of a new workspace, whose folders are picked next.
+    NewWorkspace,
+    StartRenameWorkspace(String),
+    ToggleWorkspaceCollapsed(String),
+    /// Starts a thread across the workspace's folders, or picks its first folders when it has
+    /// none.
+    NewWorkspaceThread(String),
+    ToggleWorkspaceMenu(String),
+    ShowWorkspaceMenuPage {
+        workspace_id: String,
+        page: WorkspaceMenuPage,
+    },
+    /// Picks folders (several at once) to add to the workspace.
+    AddWorkspaceDirs(String),
+    RemoveWorkspaceDir {
+        workspace_id: String,
+        dir: PathBuf,
+    },
+    /// Drops the workspace from the panel; its threads go back to their projects or "Recentes".
+    DeleteWorkspace(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadMenuPage {
     Actions,
     Move,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceMenuPage {
+    Actions,
+    RemoveDir,
 }
 
 pub struct ClaudeThreadsView {
@@ -194,9 +246,8 @@ pub struct ClaudeThreadsView {
     /// Bumped on every scheduled scan; results of older scans are dropped.
     scan_epoch: usize,
     is_visible: bool,
-    /// Projects showing every thread instead of the latest `RECENT_THREAD_LIMIT`.
-    show_all_threads: HashSet<PathBuf>,
-    show_all_recent: bool,
+    /// Lists showing every thread instead of the latest `RECENT_THREAD_LIMIT`.
+    show_all_threads: HashSet<ThreadList>,
     /// The thread whose row is asking "Excluir?".
     pending_delete: Option<String>,
     /// Threads on their way to the Trash, hidden from the list meanwhile.
@@ -204,6 +255,8 @@ pub struct ClaudeThreadsView {
     thread_menu: ViewHandle<Menu<ClaudeThreadsAction>>,
     /// The thread whose "⋯" menu is open.
     menu_open_for: Option<String>,
+    /// The workspace whose "⋯" menu is open, by id.
+    workspace_menu_open_for: Option<String>,
     /// Whether `thread_menu` shows the `+` menu of the projects instead.
     is_add_project_menu_open: bool,
     /// Set while the menu swaps to its projects page, so the close that follows selecting
@@ -221,6 +274,10 @@ pub struct ClaudeThreadsView {
     rename_editor: ViewHandle<EditorView>,
     /// The thread whose title is being edited.
     renaming: Option<String>,
+    workspace_name_editor: ViewHandle<EditorView>,
+    naming_workspace: Option<WorkspaceNaming>,
+    /// The branch checked out in each workspace folder that is a git repository.
+    git_branches: HashMap<PathBuf, String>,
     /// Lowercased; while set, only the threads whose title or branch contain it are listed, with
     /// every section and project expanded.
     search_query: String,
@@ -260,6 +317,21 @@ impl ClaudeThreadsView {
             EditorEvent::Escape | EditorEvent::Blurred => me.cancel_rename(ctx),
             _ => {}
         });
+        let workspace_name_editor = ctx.add_typed_action_view(|ctx| {
+            let appearance = Appearance::as_ref(ctx);
+            let options = SingleLineEditorOptions {
+                text: TextOptions::ui_text(Some(PROJECT_FONT_SIZE), appearance),
+                ..Default::default()
+            };
+            let mut editor = EditorView::single_line(options, ctx);
+            editor.set_placeholder_text("Nome do workspace", ctx);
+            editor
+        });
+        ctx.subscribe_to_view(&workspace_name_editor, |me, _, event, ctx| match event {
+            EditorEvent::Enter => me.finish_naming_workspace(ctx),
+            EditorEvent::Escape | EditorEvent::Blurred => me.cancel_naming_workspace(ctx),
+            _ => {}
+        });
         let thread_menu = ctx.add_typed_action_view(|_| {
             Menu::new()
                 .prevent_interaction_with_other_elements()
@@ -272,13 +344,15 @@ impl ClaudeThreadsView {
                     return;
                 }
                 me.menu_open_for = None;
+                me.workspace_menu_open_for = None;
                 me.is_add_project_menu_open = false;
                 ctx.notify();
             }
             MenuEvent::ItemSelected | MenuEvent::ItemHovered => {}
         });
         // Status dots follow the Claude sessions running in the tabs.
-        ctx.subscribe_to_model(&NativeChatRegistry::handle(ctx), |_, _, _, ctx| {
+        ctx.subscribe_to_model(&NativeChatRegistry::handle(ctx), |me, _, _, ctx| {
+            me.record_workspace_threads(ctx);
             ctx.notify()
         });
         ctx.subscribe_to_model(&CLIAgentSessionsModel::handle(ctx), |me, _, _, ctx| {
@@ -286,19 +360,21 @@ impl ClaudeThreadsView {
                 ctx.notify();
             }
         });
+        let mut config = claude_threads::load_config();
+        seed_dev_config(&mut config);
         Self {
-            config: claude_threads::load_config(),
+            config,
             threads: Vec::new(),
             has_scanned: false,
             transcript_cache: Arc::new(Mutex::new(TranscriptCache::new())),
             scan_epoch: 0,
             is_visible: false,
             show_all_threads: HashSet::new(),
-            show_all_recent: false,
             pending_delete: None,
             deleting: HashSet::new(),
             thread_menu,
             menu_open_for: None,
+            workspace_menu_open_for: None,
             is_add_project_menu_open: false,
             keep_menu_open: false,
             scroll_state: ClippedScrollStateHandle::default(),
@@ -308,6 +384,9 @@ impl ClaudeThreadsView {
             search_editor,
             rename_editor,
             renaming: None,
+            workspace_name_editor,
+            naming_workspace: None,
+            git_branches: HashMap::new(),
             search_query: String::new(),
             is_search_open: false,
             font_family: crate::appearance::system_ui_font_family(ctx),
@@ -340,17 +419,22 @@ impl ClaudeThreadsView {
         self.scan_epoch += 1;
         let epoch = self.scan_epoch;
         let cache = self.transcript_cache.clone();
+        let branch_dirs = self.expanded_workspace_dirs();
         ctx.spawn(
             async move {
                 Timer::after(delay).await;
-                let mut cache = cache.lock().unwrap_or_else(PoisonError::into_inner);
-                claude_threads::scan(&mut cache)
+                let threads = {
+                    let mut cache = cache.lock().unwrap_or_else(PoisonError::into_inner);
+                    claude_threads::scan(&mut cache)
+                };
+                (threads, read_git_branches(branch_dirs))
             },
-            move |me, threads, ctx| {
+            move |me, (threads, branches), ctx| {
                 if me.scan_epoch != epoch {
                     return;
                 }
                 me.threads = threads;
+                me.apply_git_branches(branches);
                 me.has_scanned = true;
                 ctx.notify();
                 if me.is_visible {
@@ -379,6 +463,7 @@ impl ClaudeThreadsView {
         self.is_add_project_menu_open = !self.is_add_project_menu_open;
         if self.is_add_project_menu_open {
             self.menu_open_for = None;
+            self.workspace_menu_open_for = None;
             self.keep_menu_open = false;
             let items = add_folder_menu_items(
                 ClaudeThreadsAction::AddProject,
@@ -430,7 +515,8 @@ impl ClaudeThreadsView {
     fn remove_project(&mut self, path: &Path, ctx: &mut ViewContext<Self>) {
         self.config.projects.retain(|project| project.path != path);
         self.config.moved.retain(|_, project| project != path);
-        self.show_all_threads.remove(path);
+        self.show_all_threads
+            .remove(&ThreadList::Project(path.to_path_buf()));
         self.save_config();
         ctx.notify();
     }
@@ -447,7 +533,9 @@ impl ClaudeThreadsView {
         let collapsed = match section {
             ThreadSection::Pinned => &mut self.config.pinned_collapsed,
             ThreadSection::Projects => &mut self.config.projects_collapsed,
+            ThreadSection::Workspaces => &mut self.config.workspaces_collapsed,
             ThreadSection::Recent => &mut self.config.recent_collapsed,
+            ThreadSection::Archived => &mut self.config.archived_expanded,
         };
         *collapsed = !*collapsed;
         self.save_config();
@@ -459,17 +547,24 @@ impl ClaudeThreadsView {
             && match section {
                 ThreadSection::Pinned => self.config.pinned_collapsed,
                 ThreadSection::Projects => self.config.projects_collapsed,
+                ThreadSection::Workspaces => self.config.workspaces_collapsed,
                 ThreadSection::Recent => self.config.recent_collapsed,
+                ThreadSection::Archived => !self.config.archived_expanded,
             }
     }
 
     fn toggle_pin(&mut self, session_id: &str, ctx: &mut ViewContext<Self>) {
+        self.config.toggle_pinned(session_id);
         if self.config.is_pinned(session_id) {
-            self.config.pinned.retain(|id| id != session_id);
-        } else {
-            self.config.pinned.insert(0, session_id.to_owned());
             self.config.pinned_collapsed = false;
         }
+        self.save_config();
+        ctx.notify();
+    }
+
+    /// Archiving leaves the thread open in its chat, if it is.
+    fn toggle_archive(&mut self, session_id: &str, ctx: &mut ViewContext<Self>) {
+        self.config.toggle_archived(session_id);
         self.save_config();
         ctx.notify();
     }
@@ -478,6 +573,7 @@ impl ClaudeThreadsView {
         self.config
             .moved
             .insert(session_id.to_owned(), project.to_path_buf());
+        self.config.workspace_threads.remove(session_id);
         if let Some(project) = self.config.projects.iter_mut().find(|p| p.path == project) {
             project.collapsed = false;
         }
@@ -504,6 +600,15 @@ impl ClaudeThreadsView {
         if self.focus_running_thread(session_id, ctx) {
             return;
         }
+        if let Some(workspace) = self.config.workspace_of(session_id) {
+            ctx.dispatch_typed_action_deferred(WorkspaceAction::OpenClaudeWorkspaceChat {
+                cwd: cwd.to_path_buf(),
+                workspace: workspace.chat_workspace(cwd),
+                session_id: Some(session_id.to_owned()),
+                group: Some(workspace.name.clone()),
+            });
+            return;
+        }
         let group = self
             .find_thread(session_id)
             .and_then(|thread| self.config.project_of(thread))
@@ -513,25 +618,6 @@ impl ClaudeThreadsView {
             session_id: Some(session_id.to_owned()),
             draft: None,
             artifact_kind: None,
-            group,
-        });
-    }
-
-    /// Resumes the thread with Claude Code's own interface, in a terminal tab.
-    fn open_thread_in_terminal(&mut self, session_id: &str, ctx: &mut ViewContext<Self>) {
-        if self.focus_running_thread(session_id, ctx) {
-            return;
-        }
-        let Some(thread) = self.find_thread(session_id) else {
-            return;
-        };
-        let Some(command) = thread.resume_command() else {
-            return;
-        };
-        let group = self.config.project_of(thread).map(project_group_name);
-        ctx.dispatch_typed_action_deferred(WorkspaceAction::RunCommandInNewTab {
-            directory: thread.cwd.clone(),
-            command,
             group,
         });
     }
@@ -705,6 +791,7 @@ impl ClaudeThreadsView {
         self.pending_delete = None;
         self.keep_menu_open = false;
         self.is_add_project_menu_open = false;
+        self.workspace_menu_open_for = None;
         self.menu_open_for = Some(session_id.to_owned());
         ctx.notify();
     }
@@ -718,15 +805,6 @@ impl ClaudeThreadsView {
         let thread = self.find_thread(session_id);
         let is_unsent = self.is_unsent_chat(session_id, app);
         let mut items = Vec::new();
-        // An unsent chat has no conversation for Claude Code to resume.
-        if !is_unsent {
-            items.push(
-                MenuItemFields::new("Abrir no terminal")
-                    .with_icon(WarpIcon::Terminal)
-                    .with_on_select_action(ClaudeThreadsAction::OpenThreadInTerminal(id.clone()))
-                    .into_item(),
-            );
-        }
         // Threads that haven't written a transcript yet have nothing to store a name in.
         if thread.is_some_and(|thread| !thread.transcript.as_os_str().is_empty()) {
             items.push(
@@ -860,6 +938,377 @@ impl ClaudeThreadsView {
     }
 }
 
+// --- workspaces -------------------------------------------------------------------------------
+
+impl ClaudeThreadsView {
+    /// The folders of the expanded workspaces, whose branches the panel shows.
+    fn expanded_workspace_dirs(&self) -> Vec<PathBuf> {
+        self.config
+            .workspaces
+            .iter()
+            .filter(|workspace| !workspace.collapsed)
+            .flat_map(|workspace| workspace.dirs.iter().cloned())
+            .collect()
+    }
+
+    fn apply_git_branches(&mut self, branches: Vec<(PathBuf, Option<String>)>) {
+        for (dir, branch) in branches {
+            match branch {
+                Some(branch) => self.git_branches.insert(dir, branch),
+                None => self.git_branches.remove(&dir),
+            };
+        }
+    }
+
+    /// Reads the branches of `dirs` off the main thread.
+    fn refresh_git_branches(&mut self, dirs: Vec<PathBuf>, ctx: &mut ViewContext<Self>) {
+        if dirs.is_empty() {
+            return;
+        }
+        ctx.spawn(
+            async move { read_git_branches(dirs) },
+            |me, branches, ctx| {
+                me.apply_git_branches(branches);
+                ctx.notify();
+            },
+        );
+    }
+
+    /// Lists the open chats of a workspace under it once they have a conversation.
+    fn record_workspace_threads(&mut self, ctx: &mut ViewContext<Self>) {
+        let mut changed = false;
+        for chat in NativeChatRegistry::as_ref(ctx).open_chats(ctx) {
+            if let Some(workspace_id) = chat.workspace_id.as_deref()
+                && chat.has_transcript
+            {
+                changed |= self
+                    .config
+                    .assign_to_workspace(&chat.session_id, workspace_id);
+            }
+        }
+        if changed {
+            self.save_config();
+        }
+    }
+
+    /// `self.config`, plus the open chats of a workspace that haven't sent anything yet, so they
+    /// are listed under it right away.
+    fn config_with_open_workspace_chats(&self, app: &AppContext) -> ThreadsConfig {
+        let mut config = self.config.clone();
+        for chat in NativeChatRegistry::as_ref(app).open_chats(app) {
+            if let Some(workspace_id) = chat.workspace_id.as_deref() {
+                config.assign_to_workspace(&chat.session_id, workspace_id);
+            }
+        }
+        config
+    }
+
+    /// Shows the name editor for a new workspace (`None`) or for renaming one.
+    fn start_naming_workspace(&mut self, workspace_id: Option<&str>, ctx: &mut ViewContext<Self>) {
+        let (naming, name) = match workspace_id {
+            Some(id) => {
+                let Some(workspace) = self.config.workspace(id) else {
+                    return;
+                };
+                (
+                    WorkspaceNaming::Rename(id.to_owned()),
+                    workspace.name.clone(),
+                )
+            }
+            None => (WorkspaceNaming::New, String::new()),
+        };
+        self.naming_workspace = Some(naming);
+        self.config.workspaces_collapsed = false;
+        self.workspace_name_editor.update(ctx, |editor, ctx| {
+            editor.clear_buffer_and_reset_undo_stack(ctx);
+            if !name.is_empty() {
+                editor.insert_selected_text(&name, ctx);
+            }
+        });
+        ctx.focus(&self.workspace_name_editor);
+        ctx.notify();
+    }
+
+    fn finish_naming_workspace(&mut self, ctx: &mut ViewContext<Self>) {
+        let Some(naming) = self.naming_workspace.take() else {
+            return;
+        };
+        let name = self
+            .workspace_name_editor
+            .as_ref(ctx)
+            .buffer_text(ctx)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if name.is_empty() {
+            ctx.notify();
+            return;
+        }
+        match naming {
+            WorkspaceNaming::New => {
+                let workspace = ThreadWorkspace::new(name);
+                let id = workspace.id.clone();
+                self.config.workspaces.push(workspace);
+                self.save_config();
+                self.pick_workspace_dirs(&id, ctx);
+            }
+            WorkspaceNaming::Rename(id) => {
+                if let Some(workspace) = self.config.workspace_mut(&id) {
+                    workspace.name = name;
+                    self.save_config();
+                }
+            }
+        }
+        ctx.notify();
+    }
+
+    fn cancel_naming_workspace(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.naming_workspace.take().is_some() {
+            ctx.notify();
+        }
+    }
+
+    fn pick_workspace_dirs(&mut self, workspace_id: &str, ctx: &mut ViewContext<Self>) {
+        let workspace_id = workspace_id.to_owned();
+        ctx.open_file_picker(
+            move |result, ctx| {
+                let Ok(paths) = result else { return };
+                let dirs: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
+                if let Some(handle) = ctx.handle().upgrade(ctx) {
+                    handle.update(ctx, |me, ctx| {
+                        me.add_workspace_dirs(&workspace_id, dirs, ctx)
+                    });
+                }
+            },
+            FilePickerConfiguration::new()
+                .folders_only()
+                .allow_multi_select(),
+        );
+    }
+
+    fn add_workspace_dirs(
+        &mut self,
+        workspace_id: &str,
+        dirs: Vec<PathBuf>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(workspace) = self.config.workspace_mut(workspace_id) else {
+            return;
+        };
+        if !workspace.add_dirs(dirs.iter().cloned()) {
+            return;
+        }
+        workspace.collapsed = false;
+        self.config.workspaces_collapsed = false;
+        self.save_config();
+        self.refresh_git_branches(dirs, ctx);
+        ctx.notify();
+    }
+
+    fn remove_workspace_dir(
+        &mut self,
+        workspace_id: &str,
+        dir: &Path,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if let Some(workspace) = self.config.workspace_mut(workspace_id) {
+            workspace.dirs.retain(|existing| existing != dir);
+            self.save_config();
+            ctx.notify();
+        }
+    }
+
+    fn delete_workspace(&mut self, workspace_id: &str, ctx: &mut ViewContext<Self>) {
+        self.config.remove_workspace(workspace_id);
+        self.show_all_threads
+            .remove(&ThreadList::Workspace(workspace_id.to_owned()));
+        self.save_config();
+        ctx.notify();
+    }
+
+    fn toggle_workspace_collapsed(&mut self, workspace_id: &str, ctx: &mut ViewContext<Self>) {
+        let Some(workspace) = self.config.workspace_mut(workspace_id) else {
+            return;
+        };
+        workspace.collapsed = !workspace.collapsed;
+        let dirs = (!workspace.collapsed).then(|| workspace.dirs.clone());
+        self.save_config();
+        if let Some(dirs) = dirs {
+            self.refresh_git_branches(dirs, ctx);
+        }
+        ctx.notify();
+    }
+
+    fn new_workspace_thread(&mut self, workspace_id: &str, ctx: &mut ViewContext<Self>) {
+        let Some(cwd) = self
+            .config
+            .workspace(workspace_id)
+            .and_then(|workspace| workspace.primary_dir().map(Path::to_path_buf))
+        else {
+            self.pick_workspace_dirs(workspace_id, ctx);
+            return;
+        };
+        let Some(workspace) = self.config.workspace(workspace_id) else {
+            return;
+        };
+        let unused = NativeChatRegistry::as_ref(ctx).unused_chat_in_workspace(workspace_id, ctx);
+        ctx.dispatch_typed_action_deferred(WorkspaceAction::OpenClaudeWorkspaceChat {
+            workspace: workspace.chat_workspace(&cwd),
+            group: Some(workspace.name.clone()),
+            cwd,
+            session_id: unused,
+        });
+    }
+
+    fn toggle_workspace_menu(&mut self, workspace_id: &str, ctx: &mut ViewContext<Self>) {
+        if self.workspace_menu_open_for.as_deref() == Some(workspace_id) {
+            self.workspace_menu_open_for = None;
+            ctx.notify();
+            return;
+        }
+        let items = self.workspace_menu_items(workspace_id, ctx);
+        self.thread_menu
+            .update(ctx, |menu, ctx| menu.set_items(items, ctx));
+        self.keep_menu_open = false;
+        self.is_add_project_menu_open = false;
+        self.menu_open_for = None;
+        self.workspace_menu_open_for = Some(workspace_id.to_owned());
+        ctx.notify();
+    }
+
+    fn workspace_menu_items(
+        &self,
+        workspace_id: &str,
+        app: &AppContext,
+    ) -> Vec<MenuItem<ClaudeThreadsAction>> {
+        let Some(workspace) = self.config.workspace(workspace_id) else {
+            return Vec::new();
+        };
+        let id = workspace_id.to_owned();
+        let mut items = vec![
+            MenuItemFields::new("Nova thread")
+                .with_icon(WarpIcon::Plus)
+                .with_on_select_action(ClaudeThreadsAction::NewWorkspaceThread(id.clone()))
+                .into_item(),
+            MenuItemFields::new("Renomear")
+                .with_icon(WarpIcon::Pencil)
+                .with_on_select_action(ClaudeThreadsAction::StartRenameWorkspace(id.clone()))
+                .into_item(),
+            MenuItemFields::new("Adicionar pasta…")
+                .with_icon(WarpIcon::Folder)
+                .with_on_select_action(ClaudeThreadsAction::AddWorkspaceDirs(id.clone()))
+                .into_item(),
+        ];
+        if !workspace.dirs.is_empty() {
+            items.push(
+                MenuItemFields::new("Remover pasta")
+                    .with_icon(WarpIcon::X)
+                    .with_right_side_icon(WarpIcon::ChevronRight)
+                    .with_on_select_action(ClaudeThreadsAction::ShowWorkspaceMenuPage {
+                        workspace_id: id.clone(),
+                        page: WorkspaceMenuPage::RemoveDir,
+                    })
+                    .into_item(),
+            );
+        }
+        items.push(MenuItem::Separator);
+        let red = Appearance::as_ref(app).theme().ansi_fg_red();
+        items.push(
+            MenuItemFields::new("Excluir workspace")
+                .with_icon(WarpIcon::Trash)
+                .with_override_text_color(red)
+                .with_override_icon_color(WarpThemeFill::Solid(red))
+                .with_on_select_action(ClaudeThreadsAction::DeleteWorkspace(id))
+                .into_item(),
+        );
+        items
+    }
+
+    /// The second page of a workspace's "⋯" menu: back to the first page, then its folders.
+    fn workspace_remove_dir_items(&self, workspace_id: &str) -> Vec<MenuItem<ClaudeThreadsAction>> {
+        let id = workspace_id.to_owned();
+        let mut items = vec![
+            MenuItemFields::new("Remover pasta")
+                .with_icon(WarpIcon::ChevronLeft)
+                .with_on_select_action(ClaudeThreadsAction::ShowWorkspaceMenuPage {
+                    workspace_id: id.clone(),
+                    page: WorkspaceMenuPage::Actions,
+                })
+                .into_item(),
+            MenuItem::Separator,
+        ];
+        let dirs = self
+            .config
+            .workspace(workspace_id)
+            .map(|workspace| workspace.dirs.as_slice())
+            .unwrap_or_default();
+        for dir in dirs {
+            items.push(
+                MenuItemFields::new(dir_name(dir))
+                    .with_icon(WarpIcon::Folder)
+                    .with_on_select_action(ClaudeThreadsAction::RemoveWorkspaceDir {
+                        workspace_id: id.clone(),
+                        dir: dir.clone(),
+                    })
+                    .into_item(),
+            );
+        }
+        items
+    }
+}
+
+/// The branch of each of `dirs`, `None` for the ones outside a git repository.
+fn read_git_branches(dirs: Vec<PathBuf>) -> Vec<(PathBuf, Option<String>)> {
+    dirs.into_iter()
+        .map(|dir| {
+            let branch = claude_threads::git_branch(&dir);
+            (dir, branch)
+        })
+        .collect()
+}
+
+fn dir_name(dir: &Path) -> String {
+    ThreadProject::new(dir.to_path_buf()).name()
+}
+
+/// Save-position id of a workspace's "⋯" button, which its menu hangs from.
+fn workspace_menu_button_position_id(workspace_id: &str) -> String {
+    format!("claude_threads_workspace_menu_button:{workspace_id}")
+}
+
+/// For working on the panel: `PICOLAS_SEED_WORKSPACE=<name>=<folder>,<folder>...` lists that
+/// workspace and `PICOLAS_SEED_ARCHIVED=<session id>,...` archives those threads, without saving
+/// either. Debug builds only.
+fn seed_dev_config(config: &mut ThreadsConfig) {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    if let Ok(spec) = std::env::var("PICOLAS_SEED_WORKSPACE")
+        && let Some((name, dirs)) = spec.split_once('=')
+        && !config
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.name == name)
+    {
+        let mut workspace = ThreadWorkspace::new(name.to_owned());
+        workspace.id = crate::native_chat::DEV_WORKSPACE_ID.to_owned();
+        workspace.add_dirs(
+            dirs.split(',')
+                .filter(|dir| !dir.is_empty())
+                .map(PathBuf::from),
+        );
+        config.workspaces.push(workspace);
+    }
+    if let Ok(ids) = std::env::var("PICOLAS_SEED_ARCHIVED") {
+        for id in ids.split(',').filter(|id| !id.is_empty()) {
+            if !config.is_archived(id) {
+                config.toggle_archived(id);
+            }
+        }
+        config.archived_expanded = true;
+    }
+}
+
 /// Save-position id of a project's block (header and threads), used to find
 /// where a dragged project would land.
 fn project_block_position_id(path: &Path) -> String {
@@ -905,14 +1354,10 @@ impl TypedActionView for ClaudeThreadsView {
                 self.toggle_project_collapsed(path, ctx);
             }
             ClaudeThreadsAction::ToggleSection(section) => self.toggle_section(*section, ctx),
-            ClaudeThreadsAction::ToggleShowAllThreads(Some(path)) => {
-                if !self.show_all_threads.remove(path) {
-                    self.show_all_threads.insert(path.clone());
+            ClaudeThreadsAction::ToggleShowAllThreads(list) => {
+                if !self.show_all_threads.remove(list) {
+                    self.show_all_threads.insert(list.clone());
                 }
-                ctx.notify();
-            }
-            ClaudeThreadsAction::ToggleShowAllThreads(None) => {
-                self.show_all_recent = !self.show_all_recent;
                 ctx.notify();
             }
             ClaudeThreadsAction::NewThread(path) => {
@@ -929,9 +1374,6 @@ impl TypedActionView for ClaudeThreadsView {
                 ctx.dispatch_typed_action_deferred(WorkspaceAction::OpenArtifacts {
                     artifact_id: None,
                 });
-            }
-            ClaudeThreadsAction::OpenThreadInTerminal(session_id) => {
-                self.open_thread_in_terminal(session_id, ctx);
             }
             ClaudeThreadsAction::NewChat => self.new_chat(ctx),
             ClaudeThreadsAction::ToggleSearch => self.toggle_search(ctx),
@@ -987,6 +1429,41 @@ impl TypedActionView for ClaudeThreadsView {
             ClaudeThreadsAction::CancelDeleteThread => {
                 self.pending_delete = None;
                 ctx.notify();
+            }
+            ClaudeThreadsAction::ToggleArchiveThread(session_id) => {
+                self.toggle_archive(session_id, ctx);
+            }
+            ClaudeThreadsAction::NewWorkspace => self.start_naming_workspace(None, ctx),
+            ClaudeThreadsAction::StartRenameWorkspace(workspace_id) => {
+                self.start_naming_workspace(Some(workspace_id.as_str()), ctx);
+            }
+            ClaudeThreadsAction::ToggleWorkspaceCollapsed(workspace_id) => {
+                self.toggle_workspace_collapsed(workspace_id, ctx);
+            }
+            ClaudeThreadsAction::NewWorkspaceThread(workspace_id) => {
+                self.new_workspace_thread(workspace_id, ctx);
+            }
+            ClaudeThreadsAction::ToggleWorkspaceMenu(workspace_id) => {
+                self.toggle_workspace_menu(workspace_id, ctx);
+            }
+            ClaudeThreadsAction::ShowWorkspaceMenuPage { workspace_id, page } => {
+                let items = match page {
+                    WorkspaceMenuPage::Actions => self.workspace_menu_items(workspace_id, ctx),
+                    WorkspaceMenuPage::RemoveDir => self.workspace_remove_dir_items(workspace_id),
+                };
+                self.thread_menu
+                    .update(ctx, |menu, ctx| menu.set_items(items, ctx));
+                self.keep_menu_open = true;
+                ctx.notify();
+            }
+            ClaudeThreadsAction::AddWorkspaceDirs(workspace_id) => {
+                self.pick_workspace_dirs(workspace_id, ctx);
+            }
+            ClaudeThreadsAction::RemoveWorkspaceDir { workspace_id, dir } => {
+                self.remove_workspace_dir(workspace_id, dir, ctx);
+            }
+            ClaudeThreadsAction::DeleteWorkspace(workspace_id) => {
+                self.delete_workspace(workspace_id, ctx);
             }
         }
     }
@@ -1079,8 +1556,10 @@ impl View for ClaudeThreadsView {
             appearance,
             app,
         };
-        let groups =
-            claude_threads::group_threads(self.listed_threads(rows.now, app), &self.config);
+        let groups = claude_threads::group_threads(
+            self.listed_threads(rows.now, app),
+            &self.config_with_open_workspace_chats(app),
+        );
         let is_searching = !self.search_query.is_empty();
 
         let mut list = Flex::column()
@@ -1088,13 +1567,13 @@ impl View for ClaudeThreadsView {
             .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
             .with_spacing(ROW_SPACING);
         let mut is_first_section = true;
-        let mut add_section_header = |list: &mut Flex, section| {
-            list.add_child(self.render_section_header(section, is_first_section, rows));
+        let mut add_section_header = |list: &mut Flex, section, count| {
+            list.add_child(self.render_section_header(section, count, is_first_section, rows));
             is_first_section = false;
         };
 
         if !groups.pinned.is_empty() {
-            add_section_header(&mut list, ThreadSection::Pinned);
+            add_section_header(&mut list, ThreadSection::Pinned, None);
             if !self.is_section_collapsed(ThreadSection::Pinned) {
                 for thread in &groups.pinned {
                     list.add_child(self.render_thread_row(thread, 0., rows));
@@ -1107,21 +1586,46 @@ impl View for ClaudeThreadsView {
             .values()
             .any(|threads| !threads.is_empty());
         if !is_searching || has_project_matches {
-            add_section_header(&mut list, ThreadSection::Projects);
+            add_section_header(&mut list, ThreadSection::Projects, None);
             if !self.is_section_collapsed(ThreadSection::Projects) {
                 list.add_child(self.render_projects(&groups, rows));
             }
         }
 
-        if !groups.recent.is_empty() {
-            add_section_header(&mut list, ThreadSection::Recent);
-            if !self.is_section_collapsed(ThreadSection::Recent) {
-                self.add_thread_rows(&mut list, &groups.recent, None, 0., rows);
+        let has_workspace_matches = groups
+            .by_workspace
+            .values()
+            .any(|threads| !threads.is_empty());
+        if !is_searching || has_workspace_matches {
+            add_section_header(&mut list, ThreadSection::Workspaces, None);
+            if !self.is_section_collapsed(ThreadSection::Workspaces) {
+                list.add_child(self.render_workspaces(&groups, rows));
             }
         }
 
-        let has_matches =
-            !groups.pinned.is_empty() || has_project_matches || !groups.recent.is_empty();
+        if !groups.recent.is_empty() {
+            add_section_header(&mut list, ThreadSection::Recent, None);
+            if !self.is_section_collapsed(ThreadSection::Recent) {
+                self.add_thread_rows(&mut list, &groups.recent, ThreadList::Recent, 0., rows);
+            }
+        }
+
+        if !groups.archived.is_empty() {
+            add_section_header(
+                &mut list,
+                ThreadSection::Archived,
+                Some(groups.archived.len()),
+            );
+            if !self.is_section_collapsed(ThreadSection::Archived) {
+                self.add_thread_rows(&mut list, &groups.archived, ThreadList::Archived, 0., rows);
+            }
+        }
+
+        let has_matches = !groups.pinned.is_empty()
+            || has_project_matches
+            || has_workspace_matches
+            || !groups.recent.is_empty()
+            || !groups.archived.is_empty();
         if is_searching && !has_matches {
             list.add_child(render_note("Nenhuma thread encontrada", 0., rows));
         }
@@ -1155,6 +1659,17 @@ impl View for ClaudeThreadsView {
             stack.add_positioned_overlay_child(
                 ChildView::new(&self.thread_menu).finish(),
                 add_menu_positioning(ADD_PROJECT_BUTTON_POSITION_ID),
+            );
+        } else if let Some(workspace_id) = &self.workspace_menu_open_for {
+            stack.add_positioned_overlay_child(
+                ChildView::new(&self.thread_menu).finish(),
+                OffsetPositioning::offset_from_save_position_element(
+                    workspace_menu_button_position_id(workspace_id),
+                    vec2f(MENU_OFFSET, 0.),
+                    PositionedElementOffsetBounds::WindowByPosition,
+                    PositionedElementAnchor::TopRight,
+                    ChildAnchor::TopLeft,
+                ),
             );
         } else if let Some(session_id) = &self.menu_open_for {
             stack.add_positioned_overlay_child(
@@ -1269,11 +1784,13 @@ impl ClaudeThreadsView {
         .finish()
     }
 
-    /// The name of a section; clicking it collapses or expands the section, which a chevron
-    /// shows on hover. "Projetos" also gets the button that adds a project folder, on hover.
+    /// The name of a section, with `count` after it when given; clicking it collapses or expands
+    /// the section, which a chevron shows on hover. "Projetos" and "Workspaces" also get the
+    /// button that adds one, on hover.
     fn render_section_header(
         &self,
         section: ThreadSection,
+        count: Option<usize>,
         is_first: bool,
         rows: RowContext<'_>,
     ) -> Box<dyn Element> {
@@ -1288,22 +1805,37 @@ impl ClaudeThreadsView {
         } else {
             WarpIcon::ChevronDown
         };
-        let add_button = (section == ThreadSection::Projects).then(|| {
-            SavePosition::new(
-                render_icon_button(
-                    WarpIcon::Plus,
-                    "Adicionar pasta",
-                    self.mouse_state("header:add".to_owned()),
-                    ClaudeThreadsAction::ToggleAddProjectMenu,
-                    palette,
-                    appearance,
-                ),
-                ADD_PROJECT_BUTTON_POSITION_ID,
-            )
-            .finish()
-        });
+        let add_button = match section {
+            ThreadSection::Projects => Some(
+                SavePosition::new(
+                    render_icon_button(
+                        WarpIcon::Plus,
+                        "Adicionar pasta",
+                        self.mouse_state("header:add".to_owned()),
+                        ClaudeThreadsAction::ToggleAddProjectMenu,
+                        palette,
+                        appearance,
+                    ),
+                    ADD_PROJECT_BUTTON_POSITION_ID,
+                )
+                .finish(),
+            ),
+            ThreadSection::Workspaces => Some(render_icon_button(
+                WarpIcon::Plus,
+                "Novo workspace…",
+                self.mouse_state("header:add-workspace".to_owned()),
+                ClaudeThreadsAction::NewWorkspace,
+                palette,
+                appearance,
+            )),
+            ThreadSection::Pinned | ThreadSection::Recent | ThreadSection::Archived => None,
+        };
+        let label = match count {
+            Some(count) => format!("{} ({count})", section.label()),
+            None => section.label().to_owned(),
+        };
         // The menu hangs from the button, which has to stay while the pointer moves to the menu.
-        let is_add_menu_open = self.is_add_project_menu_open;
+        let is_add_menu_open = section == ThreadSection::Projects && self.is_add_project_menu_open;
         let header = Hoverable::new(
             self.mouse_state(format!("section:{section:?}")),
             move |hover_state| {
@@ -1317,7 +1849,7 @@ impl ClaudeThreadsView {
                     .with_cross_axis_alignment(CrossAxisAlignment::Center)
                     .with_spacing(4.)
                     .with_child(
-                        Text::new_inline(section.label(), fonts.family, SECTION_FONT_SIZE)
+                        Text::new_inline(label, fonts.family, SECTION_FONT_SIZE)
                             .with_style(fonts.medium)
                             .with_color(color.into())
                             .finish(),
@@ -1388,7 +1920,7 @@ impl ClaudeThreadsView {
                     self.add_thread_rows(
                         &mut block,
                         threads,
-                        Some(&project.path),
+                        ThreadList::Project(project.path.clone()),
                         THREAD_INDENT,
                         rows,
                     );
@@ -1400,6 +1932,323 @@ impl ClaudeThreadsView {
             );
         }
         list.finish()
+    }
+
+    /// Every workspace with its folders and threads; while searching, only the workspaces with
+    /// matches, expanded, without their folders.
+    fn render_workspaces(&self, groups: &ThreadGroups, rows: RowContext<'_>) -> Box<dyn Element> {
+        let is_searching = !self.search_query.is_empty();
+        let mut list = Flex::column()
+            .with_main_axis_size(MainAxisSize::Min)
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_spacing(PROJECT_SPACING);
+        if self.naming_workspace == Some(WorkspaceNaming::New) {
+            list.add_child(self.render_workspace_name_input(rows));
+        } else if self.config.workspaces.is_empty() {
+            list.add_child(render_hint(
+                "Crie um workspace com o + para conversar com várias pastas ao mesmo tempo.",
+                rows,
+            ));
+        }
+        for workspace in &self.config.workspaces {
+            let threads = groups
+                .by_workspace
+                .get(&workspace.id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            if is_searching && threads.is_empty() {
+                continue;
+            }
+            let mut block = Flex::column()
+                .with_main_axis_size(MainAxisSize::Min)
+                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                .with_spacing(ROW_SPACING)
+                .with_child(self.render_workspace_row(workspace, rows));
+            if !is_searching && !workspace.collapsed {
+                for dir in &workspace.dirs {
+                    block.add_child(self.render_workspace_dir_row(&workspace.id, dir, rows));
+                }
+                block.add_child(self.render_add_workspace_dir_row(&workspace.id, rows));
+            }
+            if is_searching || !workspace.collapsed {
+                if threads.is_empty() {
+                    if self.has_scanned && !workspace.dirs.is_empty() {
+                        block.add_child(render_note("Nenhum chat", THREAD_INDENT, rows));
+                    }
+                } else {
+                    self.add_thread_rows(
+                        &mut block,
+                        threads,
+                        ThreadList::Workspace(workspace.id.clone()),
+                        THREAD_INDENT,
+                        rows,
+                    );
+                }
+            }
+            list.add_child(block.finish());
+        }
+        list.finish()
+    }
+
+    /// The editor naming a new workspace, or renaming one, in place of its name.
+    fn render_workspace_name_input(&self, rows: RowContext<'_>) -> Box<dyn Element> {
+        let input = TextInput::new(
+            self.workspace_name_editor.clone(),
+            UiComponentStyles::default()
+                .set_background(ElementFill::None)
+                .set_border_radius(CornerRadius::with_all(Radius::Pixels(0.)))
+                .set_border_width(0.),
+        )
+        .build()
+        .finish();
+        let row = Flex::row()
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(ICON_TEXT_GAP)
+            .with_child(render_svg(
+                WORKSPACE_ICON,
+                rows.palette.main_text,
+                FOLDER_ICON_SIZE,
+            ))
+            .with_child(Shrinkable::new(1., input).finish())
+            .finish();
+        render_row_container(
+            row,
+            PROJECT_ROW_VERTICAL_PADDING,
+            Some(rows.palette.row_hover),
+        )
+    }
+
+    /// The workspace's icon, name and how many folders it has. On hover come its "⋯" menu and
+    /// the button for a new thread. Clicking the row collapses or expands it.
+    fn render_workspace_row(
+        &self,
+        workspace: &ThreadWorkspace,
+        rows: RowContext<'_>,
+    ) -> Box<dyn Element> {
+        if self.naming_workspace == Some(WorkspaceNaming::Rename(workspace.id.clone())) {
+            return self.render_workspace_name_input(rows);
+        }
+        let RowContext {
+            palette,
+            fonts,
+            appearance,
+            ..
+        } = rows;
+        let id = workspace.id.clone();
+        let name = workspace.name.clone();
+        let dir_count = match workspace.dirs.len() {
+            1 => "1 pasta".to_owned(),
+            count => format!("{count} pastas"),
+        };
+        let is_menu_open = self.workspace_menu_open_for.as_deref() == Some(id.as_str());
+        let menu_button = SavePosition::new(
+            render_icon_button(
+                WarpIcon::DotsHorizontal,
+                "Mais opções",
+                self.mouse_state(format!("workspace-menu:{id}")),
+                ClaudeThreadsAction::ToggleWorkspaceMenu(id.clone()),
+                palette,
+                appearance,
+            ),
+            &workspace_menu_button_position_id(&id),
+        )
+        .finish();
+        let new_thread_button = render_icon_button(
+            WarpIcon::Plus,
+            "Nova thread no workspace",
+            self.mouse_state(format!("workspace-new:{id}")),
+            ClaudeThreadsAction::NewWorkspaceThread(id.clone()),
+            palette,
+            appearance,
+        );
+        Hoverable::new(
+            self.mouse_state(format!("workspace:{id}")),
+            move |hover_state| {
+                let mut meta = Flex::row()
+                    .with_main_axis_size(MainAxisSize::Min)
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_spacing(2.);
+                if hover_state.is_hovered() || is_menu_open {
+                    meta.add_child(menu_button);
+                    meta.add_child(new_thread_button);
+                } else {
+                    meta.add_child(
+                        Text::new_inline(dir_count, fonts.family, META_FONT_SIZE)
+                            .with_color(palette.detail_text.into())
+                            .finish(),
+                    );
+                }
+                let meta = ConstrainedBox::new(Align::new(meta.finish()).right().finish())
+                    .with_height(META_HEIGHT)
+                    .finish();
+                let label = Flex::row()
+                    .with_main_axis_size(MainAxisSize::Max)
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_spacing(ICON_TEXT_GAP)
+                    .with_child(render_svg(
+                        WORKSPACE_ICON,
+                        palette.main_text,
+                        FOLDER_ICON_SIZE,
+                    ))
+                    .with_child(
+                        Shrinkable::new(
+                            1.,
+                            Text::new_inline(name, fonts.family, PROJECT_FONT_SIZE)
+                                .with_clip(ClipConfig::ellipsis())
+                                .with_color(palette.main_text.into())
+                                .finish(),
+                        )
+                        .finish(),
+                    )
+                    .finish();
+                let row = Flex::row()
+                    .with_main_axis_size(MainAxisSize::Max)
+                    .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_spacing(ICON_TEXT_GAP)
+                    .with_child(Shrinkable::new(1., label).finish())
+                    .with_child(meta)
+                    .finish();
+                let background =
+                    (hover_state.is_hovered() || is_menu_open).then_some(palette.row_hover);
+                render_row_container(row, PROJECT_ROW_VERTICAL_PADDING, background)
+            },
+        )
+        .with_cursor(Cursor::PointingHand)
+        .on_click(move |ctx, _, _| {
+            ctx.dispatch_typed_action(ClaudeThreadsAction::ToggleWorkspaceCollapsed(id.clone()));
+        })
+        .with_defer_events_to_children()
+        .finish()
+    }
+
+    /// A folder of a workspace with the branch checked out in it; on hover, the button that
+    /// removes it from the workspace.
+    fn render_workspace_dir_row(
+        &self,
+        workspace_id: &str,
+        dir: &Path,
+        rows: RowContext<'_>,
+    ) -> Box<dyn Element> {
+        let RowContext {
+            palette,
+            fonts,
+            appearance,
+            ..
+        } = rows;
+        let name = dir_name(dir);
+        let branch = self.git_branches.get(dir).cloned();
+        let key = format!("{workspace_id}:{}", dir.display());
+        let remove_button = render_icon_button(
+            WarpIcon::X,
+            "Remover pasta do workspace",
+            self.mouse_state(format!("workspace-dir-remove:{key}")),
+            ClaudeThreadsAction::RemoveWorkspaceDir {
+                workspace_id: workspace_id.to_owned(),
+                dir: dir.to_path_buf(),
+            },
+            palette,
+            appearance,
+        );
+        Hoverable::new(
+            self.mouse_state(format!("workspace-dir:{key}")),
+            move |hover_state| {
+                let mut label = Flex::row()
+                    .with_main_axis_size(MainAxisSize::Min)
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_spacing(6.)
+                    .with_child(render_svg(FOLDER_ICON, palette.sub_text, DIR_ICON_SIZE))
+                    .with_child(
+                        Shrinkable::new(
+                            1.,
+                            Text::new_inline(name, fonts.family, META_FONT_SIZE + 1.)
+                                .with_clip(ClipConfig::ellipsis())
+                                .with_color(palette.sub_text.into())
+                                .finish(),
+                        )
+                        .finish(),
+                    );
+                if let Some(branch) = branch {
+                    label.add_child(render_icon(
+                        WarpIcon::GitBranch,
+                        palette.detail_text,
+                        DIR_ICON_SIZE - 2.,
+                    ));
+                    label.add_child(
+                        Shrinkable::new(
+                            1.,
+                            Text::new_inline(branch, fonts.family, META_FONT_SIZE)
+                                .with_clip(ClipConfig::ellipsis())
+                                .with_color(palette.detail_text.into())
+                                .finish(),
+                        )
+                        .finish(),
+                    );
+                }
+                let trailing = if hover_state.is_hovered() {
+                    remove_button
+                } else {
+                    Empty::new().finish()
+                };
+                let row = Flex::row()
+                    .with_main_axis_size(MainAxisSize::Max)
+                    .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_spacing(ICON_TEXT_GAP)
+                    .with_child(Shrinkable::new(1., label.finish()).finish())
+                    .with_child(
+                        ConstrainedBox::new(trailing)
+                            .with_height(META_HEIGHT)
+                            .finish(),
+                    )
+                    .finish();
+                let content = Container::new(row)
+                    .with_padding_left(THREAD_INDENT)
+                    .finish();
+                render_row_container(content, 2., None)
+            },
+        )
+        .with_defer_events_to_children()
+        .finish()
+    }
+
+    /// "Adicionar pasta", below a workspace's folders.
+    fn render_add_workspace_dir_row(
+        &self,
+        workspace_id: &str,
+        rows: RowContext<'_>,
+    ) -> Box<dyn Element> {
+        let RowContext { palette, fonts, .. } = rows;
+        let action = ClaudeThreadsAction::AddWorkspaceDirs(workspace_id.to_owned());
+        Hoverable::new(
+            self.mouse_state(format!("workspace-add-dir:{workspace_id}")),
+            move |hover_state| {
+                let color = if hover_state.is_hovered() {
+                    palette.main_text
+                } else {
+                    palette.detail_text
+                };
+                let content = Flex::row()
+                    .with_main_axis_size(MainAxisSize::Max)
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_spacing(6.)
+                    .with_child(render_icon(WarpIcon::Plus, color, DIR_ICON_SIZE))
+                    .with_child(
+                        Text::new_inline("Adicionar pasta", fonts.family, META_FONT_SIZE)
+                            .with_color(color.into())
+                            .finish(),
+                    )
+                    .finish();
+                let content = Container::new(content)
+                    .with_padding_left(THREAD_INDENT)
+                    .finish();
+                render_row_container(content, 3., None)
+            },
+        )
+        .with_cursor(Cursor::PointingHand)
+        .on_click(move |ctx, _, _| ctx.dispatch_typed_action(action.clone()))
+        .finish()
     }
 
     /// The app's name, with the buttons that show the search field and hide the sidebar.
@@ -1612,21 +2461,17 @@ impl ClaudeThreadsView {
             .finish()
     }
 
-    /// The latest `RECENT_THREAD_LIMIT` threads of a project (or of "Recentes", when `project` is
-    /// `None`) and the toggle that shows the rest.
+    /// The latest `RECENT_THREAD_LIMIT` threads of `list` and the toggle that shows the rest.
     fn add_thread_rows(
         &self,
         list: &mut Flex,
         threads: &[ClaudeThread],
-        project: Option<&Path>,
+        thread_list: ThreadList,
         indent: f32,
         rows: RowContext<'_>,
     ) {
-        let show_all = !self.search_query.is_empty()
-            || match project {
-                Some(path) => self.show_all_threads.contains(path),
-                None => self.show_all_recent,
-            };
+        let show_all =
+            !self.search_query.is_empty() || self.show_all_threads.contains(&thread_list);
         let shown = if show_all {
             threads.len()
         } else {
@@ -1648,8 +2493,7 @@ impl ClaudeThreadsView {
                 WarpIcon::ChevronDown,
             )
         };
-        let key = project.map(PathBuf::from);
-        let mouse_state = self.mouse_state(format!("show-all:{key:?}"));
+        let mouse_state = self.mouse_state(format!("show-all:{thread_list:?}"));
         list.add_child(
             Hoverable::new(mouse_state, move |hover_state| {
                 let color = if hover_state.is_hovered() {
@@ -1673,14 +2517,16 @@ impl ClaudeThreadsView {
             })
             .with_cursor(Cursor::PointingHand)
             .on_click(move |ctx, _, _| {
-                ctx.dispatch_typed_action(ClaudeThreadsAction::ToggleShowAllThreads(key.clone()));
+                ctx.dispatch_typed_action(ClaudeThreadsAction::ToggleShowAllThreads(
+                    thread_list.clone(),
+                ));
             })
             .finish(),
         );
     }
 
     /// The title with its age, or what the session is doing. The thread open in the focused pane
-    /// gets a raised card. On hover the age gives way to the pin button and the "⋯" menu;
+    /// gets a raised card. On hover the age gives way to the archive button and the "⋯" menu;
     /// deleting asks for confirmation in the row.
     fn render_thread_row(
         &self,
@@ -1730,7 +2576,6 @@ impl ClaudeThreadsView {
         let session_id = &thread.session_id;
         let is_confirming = self.pending_delete.as_deref() == Some(session_id.as_str());
         let is_menu_open = self.menu_open_for.as_deref() == Some(session_id.as_str());
-        let is_pinned = self.config.is_pinned(session_id);
         let rename_input = (self.renaming.as_deref() == Some(session_id.as_str())).then(|| {
             TextInput::new(
                 self.rename_editor.clone(),
@@ -1754,16 +2599,23 @@ impl ClaudeThreadsView {
             &thread_menu_button_position_id(session_id),
         )
         .finish();
-        let pin_action = ClaudeThreadsAction::TogglePinThread(session_id.clone());
-        let pin_button = render_svg_button(
-            PIN_ICON,
-            if is_pinned { "Desafixar" } else { "Fixar" },
-            self.mouse_state(format!("thread-pin:{session_id}")),
-            ACTION_ICON_SIZE,
-            palette,
-            appearance,
-            move |ctx| ctx.dispatch_typed_action(pin_action.clone()),
-        );
+        // An unsent chat has no conversation to archive yet.
+        let archive_button = (!self.is_unsent_chat(session_id, app)).then(|| {
+            let archive_action = ClaudeThreadsAction::ToggleArchiveThread(session_id.clone());
+            render_svg_button(
+                ARCHIVE_ICON,
+                if self.config.is_archived(session_id) {
+                    "Desarquivar"
+                } else {
+                    "Arquivar"
+                },
+                self.mouse_state(format!("thread-archive:{session_id}")),
+                ACTION_ICON_SIZE,
+                palette,
+                appearance,
+                move |ctx| ctx.dispatch_typed_action(archive_action.clone()),
+            )
+        });
         let confirm_buttons = is_confirming.then(|| {
             [
                 render_icon_button(
@@ -1789,6 +2641,7 @@ impl ClaudeThreadsView {
         let can_drop = thread.resume_command().is_some();
         let drop_cwd = thread.cwd.clone();
         let is_running = running_session.is_some();
+        let is_renaming = rename_input.is_some();
 
         let row = Hoverable::new(
             self.mouse_state(format!("thread:{session_id}")),
@@ -1813,7 +2666,9 @@ impl ClaudeThreadsView {
                 } else if rename_input.is_some() {
                     // The editor takes the whole line.
                 } else if hover_state.is_hovered() || is_menu_open {
-                    meta.add_child(pin_button);
+                    if let Some(archive_button) = archive_button {
+                        meta.add_child(archive_button);
+                    }
                     meta.add_child(menu_button);
                 } else {
                     match status {
@@ -1885,18 +2740,23 @@ impl ClaudeThreadsView {
                 };
                 render_row_container(content, THREAD_ROW_VERTICAL_PADDING, background)
             },
-        )
-        .with_cursor(Cursor::PointingHand)
-        .on_click(move |ctx, _, _| {
-            ctx.dispatch_typed_action(action.clone());
-        })
+        );
+        // While renaming, pressing and dragging in the row selects the title's text.
+        let row = if is_renaming {
+            row
+        } else {
+            row.with_cursor(Cursor::PointingHand)
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(action.clone());
+                })
+        }
         .with_defer_events_to_children()
         .finish();
 
         // Dragging a thread onto a pane of the active tab splits it there (see
         // `tab_merge`): an open thread moves its pane, so the same conversation
         // never runs twice.
-        if !can_drop && !is_running {
+        if is_renaming || (!can_drop && !is_running) {
             return row;
         }
         let drop_session_id = session_id.clone();
@@ -1942,13 +2802,16 @@ impl ThreadStatus {
 }
 
 fn render_empty_state(rows: RowContext<'_>) -> Box<dyn Element> {
-    let hint = Text::new(
+    render_hint(
         "Adicione uma pasta com o + de Projetos para ver as conversas do Claude Code feitas nela.",
-        rows.fonts.family,
-        META_FONT_SIZE,
+        rows,
     )
-    .with_color(rows.palette.sub_text.into())
-    .finish();
+}
+
+fn render_hint(text: &'static str, rows: RowContext<'_>) -> Box<dyn Element> {
+    let hint = Text::new(text, rows.fonts.family, META_FONT_SIZE)
+        .with_color(rows.palette.sub_text.into())
+        .finish();
     Container::new(hint)
         .with_horizontal_padding(ROW_HORIZONTAL_PADDING)
         .with_vertical_padding(THREAD_ROW_VERTICAL_PADDING)

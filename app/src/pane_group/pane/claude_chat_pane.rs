@@ -6,16 +6,21 @@ use super::{
     ShareableLinkError,
 };
 use crate::app_state::LeafContents;
+use crate::native_chat::session::ClaudeChatSession;
 use crate::native_chat::{ClaudeChatPaneSnapshot, ClaudeChatView, ClaudeChatViewEvent};
 
 pub struct ClaudeChatPane {
     view: ViewHandle<PaneView<ClaudeChatView>>,
     pane_configuration: ModelHandle<PaneConfiguration>,
+    /// Kept apart from the view so the pane group can read the chat's folder while the view is
+    /// mid-update (its actions can make the workspace refresh working directories).
+    session: ModelHandle<ClaudeChatSession>,
 }
 
 impl ClaudeChatPane {
     pub fn from_view(backing_view: ViewHandle<ClaudeChatView>, ctx: &mut AppContext) -> Self {
         let pane_configuration = backing_view.as_ref(ctx).pane_configuration();
+        let session = backing_view.as_ref(ctx).session().clone();
 
         let view = ctx.add_typed_action_view(backing_view.window_id(ctx), |ctx| {
             let pane_id = PaneId::from_claude_chat_pane_ctx(ctx);
@@ -25,6 +30,7 @@ impl ClaudeChatPane {
         Self {
             view,
             pane_configuration,
+            session,
         }
     }
 
@@ -35,6 +41,10 @@ impl ClaudeChatPane {
 
     pub fn backing_view(&self, ctx: &AppContext) -> ViewHandle<ClaudeChatView> {
         self.view.as_ref(ctx).child(ctx)
+    }
+
+    pub fn session(&self) -> &ModelHandle<ClaudeChatSession> {
+        &self.session
     }
 }
 

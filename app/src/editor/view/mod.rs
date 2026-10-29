@@ -1919,6 +1919,10 @@ pub struct EditorView {
     /// the buffer. See [`EditorOptions::drag_drop_path_transformer`].
     drag_drop_path_transformer: Option<PathTransformerFn>,
 
+    /// Whether dropped paths are all forwarded through [`Event::DroppedFiles`] instead of being
+    /// inserted as text.
+    forwards_dropped_files: bool,
+
     process_attached_images_future_handle: Option<SpawnedFutureHandle>,
 
     is_password: bool,
@@ -2977,6 +2981,11 @@ impl EditorView {
         self.drag_drop_path_transformer = transformer;
     }
 
+    /// Has dropped files, images included, reach the parent as [`Event::DroppedFiles`].
+    pub fn set_forwards_dropped_files(&mut self, forwards: bool) {
+        self.forwards_dropped_files = forwards;
+    }
+
     fn clipboard_content(&mut self, ctx: &mut ViewContext<Self>) -> String {
         let content = ctx.clipboard().read();
         self.clipboard_text_content(content)
@@ -3258,6 +3267,7 @@ impl EditorView {
             ai_context_menu_state,
             delegate_paste_handling: options.delegate_paste_handling,
             drag_drop_path_transformer: options.drag_drop_path_transformer,
+            forwards_dropped_files: false,
             process_attached_images_future_handle: None,
             is_password: options.is_password,
             keymap_context_modifier: options.keymap_context_modifier,
@@ -6692,6 +6702,20 @@ impl EditorView {
         }
     }
 
+    /// The first selection's tail and head as character offsets; they're equal for a cursor.
+    pub fn first_selection_char_offsets(
+        &self,
+        ctx: &AppContext,
+    ) -> Option<(CharOffset, CharOffset)> {
+        let model = self.editor_model.as_ref(ctx);
+        let buffer = model.buffer(ctx);
+        let selection = model.first_selection(ctx);
+        Some((
+            selection.tail().to_char_offset(buffer).ok()?,
+            selection.head().to_char_offset(buffer).ok()?,
+        ))
+    }
+
     /// Return the end position of the first selection, used for positioning argument suggestions in the editor input
     pub fn first_selection_end_to_point(&self, ctx: &AppContext) -> Point {
         let model = self.editor_model.as_ref(ctx);
@@ -8053,6 +8077,10 @@ impl EditorView {
         // Image paths are forwarded to the parent unchanged so the host can still read them
         // from the filesystem (the path transformer, if any, only applies to text insertion).
         let paths_as_strings: Vec<String> = paths.iter().map(|path| path.to_string()).collect();
+        if self.forwards_dropped_files {
+            ctx.emit(Event::DroppedFiles(paths_as_strings));
+            return;
+        }
         let image_filepaths =
             warpui::clipboard_utils::get_image_filepaths_from_paths(&paths_as_strings);
 
@@ -8491,6 +8519,9 @@ pub enum Event {
     },
     /// Request parent to process image file paths from drag-and-drop
     DroppedImageFiles(Vec<String>),
+    /// Paths dropped on an editor that forwards them; see
+    /// [`EditorView::set_forwards_dropped_files`].
+    DroppedFiles(Vec<String>),
     IgnoreAutosuggestion {
         suggestion: String,
     },

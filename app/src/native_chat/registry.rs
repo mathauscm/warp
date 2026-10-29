@@ -46,6 +46,11 @@ pub enum ChatActivity {
 
 impl ChatActivity {
     pub fn new(has_transcript: bool, has_draft: bool, status: NativeChatStatus) -> Self {
+        // Without a message sent, nothing the CLI reports (a hidden `/effort` command, say) holds
+        // anything worth keeping.
+        if !has_transcript && !has_draft {
+            return Self::Unused;
+        }
         match status {
             NativeChatStatus::Working | NativeChatStatus::AwaitingUser => Self::Busy,
             NativeChatStatus::Idle if has_draft => Self::Drafting,
@@ -71,6 +76,8 @@ pub struct OpenChat {
     pub cwd: PathBuf,
     pub title: Option<String>,
     pub has_transcript: bool,
+    /// The Threads panel workspace the chat is in.
+    pub workspace_id: Option<String>,
 }
 
 struct RegisteredSession {
@@ -148,16 +155,26 @@ impl NativeChatRegistry {
                     cwd: session.cwd().to_path_buf(),
                     title: session.title().map(str::to_owned),
                     has_transcript: session.has_transcript(),
+                    workspace_id: session.workspace().map(|workspace| workspace.id.clone()),
                 })
             })
             .collect()
     }
 
-    /// The open chat in `cwd` that hasn't been sent a message, to reuse instead of opening another.
+    /// The open chat in `cwd`, outside every workspace, that hasn't been sent a message, to reuse
+    /// instead of opening another.
     pub fn unused_chat_in(&self, cwd: &Path, app: &AppContext) -> Option<String> {
         self.open_chats(app)
             .into_iter()
-            .find(|chat| !chat.has_transcript && chat.cwd == cwd)
+            .find(|chat| !chat.has_transcript && chat.cwd == cwd && chat.workspace_id.is_none())
+            .map(|chat| chat.session_id)
+    }
+
+    /// [`Self::unused_chat_in`] for the workspace `workspace_id`.
+    pub fn unused_chat_in_workspace(&self, workspace_id: &str, app: &AppContext) -> Option<String> {
+        self.open_chats(app)
+            .into_iter()
+            .find(|chat| !chat.has_transcript && chat.workspace_id.as_deref() == Some(workspace_id))
             .map(|chat| chat.session_id)
     }
 

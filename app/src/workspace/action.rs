@@ -304,9 +304,6 @@ pub enum WorkspaceAction {
         source: PaletteSource,
     },
     ShowUpgrade,
-    ShowReferralSettingsPage,
-    JoinSlack,
-    ViewUserDocs,
     ViewLatestChangelog,
     ViewPrivacyPolicy,
     SendFeedback,
@@ -383,6 +380,9 @@ pub enum WorkspaceAction {
     /// Opens the code review panel (right panel) without toggling. If already open,
     /// switches to the target pane's repo. Used by vertical tabs diff stats chip.
     OpenCodeReviewPanel(PaneViewLocator),
+    /// Opens the code review panel (right panel) on the git repository rooted at this path,
+    /// without toggling.
+    OpenCodeReviewForRepo(PathBuf),
     /// Toggles the vertical tabs panel. This happens as an explicit action from the user.
     ToggleVerticalTabsPanel,
     OpenVerticalTabsPanel,
@@ -851,17 +851,6 @@ pub enum WorkspaceAction {
     OpenDirectoryInNewTab {
         path: PathBuf,
     },
-    /// Run `claude` in the active terminal when it's idle, otherwise in a new tab.
-    OpenClaudeSession,
-    /// Open a new terminal tab in `directory` and run `command` in it (used by
-    /// the Threads panel to start or resume Claude Code conversations).
-    RunCommandInNewTab {
-        directory: PathBuf,
-        command: String,
-        /// Tab group to put the new tab in, created when no group has this
-        /// name yet (e.g. the project folder of a Claude thread).
-        group: Option<String>,
-    },
     /// Open a native Claude chat: focus the pane already showing the conversation, show it in the
     /// most recent chat tab that holds nothing unsaved, or open a new tab.
     OpenClaudeChat {
@@ -873,6 +862,16 @@ pub enum WorkspaceAction {
         /// The kind of artifact (`ArtifactKind::as_str`) the first message asks for.
         artifact_kind: Option<String>,
         /// Tab group to put the chat's tab in, like the thread's project.
+        group: Option<String>,
+    },
+    /// [`Self::OpenClaudeChat`] for a chat in a Threads panel workspace, which gets access to the
+    /// workspace's other folders.
+    OpenClaudeWorkspaceChat {
+        cwd: PathBuf,
+        workspace: crate::native_chat::ChatWorkspace,
+        /// The conversation to resume; `None` starts a new one.
+        session_id: Option<String>,
+        /// Tab group to put the chat's tab in, like the workspace's name.
         group: Option<String>,
     },
     /// Open the gallery of local artifacts, or an artifact in it.
@@ -1110,9 +1109,6 @@ impl WorkspaceAction {
             | OpenPalette { .. }
             | TogglePalette { mode: _, source: _ }
             | ShowUpgrade
-            | ShowReferralSettingsPage
-            | JoinSlack
-            | ViewUserDocs
             | ViewLatestChangelog
             | ViewPrivacyPolicy
             | SendFeedback
@@ -1170,6 +1166,7 @@ impl WorkspaceAction {
             | ClosePanel
             | ToggleRightPanel
             | OpenCodeReviewPanel(..)
+            | OpenCodeReviewForRepo(_)
             | ToggleVerticalTabsSettingsPopup
             | SetVerticalTabsDisplayGranularity(_)
             | SetVerticalTabsTabItemMode(_)
@@ -1188,9 +1185,8 @@ impl WorkspaceAction {
             | OpenNewWorktreeRepoPicker
             | OpenWorktreeInRepo { .. }
             | OpenDirectoryInNewTab { .. }
-            | OpenClaudeSession
-            | RunCommandInNewTab { .. }
             | OpenClaudeChat { .. }
+            | OpenClaudeWorkspaceChat { .. }
             | OpenArtifacts { .. }
             | ToggleClaudeThreadsPanel
             | ToggleTerminalPanel

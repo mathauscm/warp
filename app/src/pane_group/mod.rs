@@ -5429,17 +5429,24 @@ impl PaneGroup {
     }
 
     /// Adds an editor the way VS Code lays one out: beside the open editors when there are some,
-    /// otherwise above everything else, leaving the terminals a short strip at the bottom.
+    /// otherwise beside the focused chat, or above everything else, leaving the terminals a short
+    /// strip at the bottom.
     pub fn add_editor_pane<C: PaneContent>(
         &mut self,
         pane: C,
         focus_new_pane: bool,
         ctx: &mut ViewContext<Self>,
     ) {
-        if let Some(editor) = self.visible_editor_pane() {
+        // A chat keeps its full height, with the file side by side, rather than being squeezed
+        // into a strip under the editor.
+        let focused = self.focused_pane_id(ctx);
+        let beside = self
+            .visible_editor_pane()
+            .or_else(|| focused.is_claude_chat_pane().then_some(focused));
+        if let Some(beside) = beside {
             let _ = self.add_pane(
                 Direction::Right,
-                Some(editor),
+                Some(beside),
                 Box::new(pane),
                 focus_new_pane,
                 ctx,
@@ -7155,8 +7162,7 @@ impl PaneGroup {
     /// The folder Claude runs in, when `pane_id` is a native chat.
     fn claude_chat_cwd(&self, pane_id: PaneId, ctx: &AppContext) -> Option<PathBuf> {
         let pane = self.downcast_pane_by_id::<ClaudeChatPane>(pane_id)?;
-        let session = pane.backing_view(ctx).as_ref(ctx).session().clone();
-        Some(session.as_ref(ctx).cwd().to_path_buf())
+        Some(pane.session().as_ref(ctx).cwd().to_path_buf())
     }
 
     pub fn startup_path_for_new_session(
@@ -8209,15 +8215,20 @@ impl PaneGroup {
         })
     }
 
-    /// The folders native chats in this group run in.
+    /// The folders native chats in this group work in: each chat's cwd, then its workspace's other
+    /// folders.
     pub fn claude_chat_paths<'a>(
         &'a self,
         ctx: &'a AppContext,
     ) -> impl Iterator<Item = (EntityId, LocalOrRemotePath)> + 'a {
-        self.panes_of::<ClaudeChatPane>().map(move |pane| {
-            let view = pane.backing_view(ctx);
-            let cwd = view.as_ref(ctx).session().as_ref(ctx).cwd().to_path_buf();
-            (view.id(), LocalOrRemotePath::Local(cwd))
+        self.panes_of::<ClaudeChatPane>().flat_map(move |pane| {
+            let id = pane.session().id();
+            pane.session()
+                .as_ref(ctx)
+                .dirs()
+                .into_iter()
+                .map(move |dir| (id, LocalOrRemotePath::Local(dir.to_path_buf())))
+                .collect::<Vec<_>>()
         })
     }
 

@@ -1416,6 +1416,10 @@ fn save_pane_state(
                 id,
                 session_id: snapshot.session_id.clone(),
                 cwd: snapshot.cwd.to_string_lossy().into_owned(),
+                workspace: snapshot
+                    .workspace
+                    .as_ref()
+                    .and_then(|workspace| serde_json::to_string(workspace).ok()),
             };
             diesel::insert_into(schema::claude_chat_panes::dsl::claude_chat_panes)
                 .values(claude_chat_pane)
@@ -2414,6 +2418,9 @@ fn read_node(conn: &mut SqliteConnection, node: model::PaneNode) -> Result<PaneN
                     LeafContents::ClaudeChat(crate::app_state::ClaudeChatPaneSnapshot {
                         session_id: pane.session_id,
                         cwd: PathBuf::from(pane.cwd),
+                        workspace: pane
+                            .workspace
+                            .and_then(|json| serde_json::from_str(&json).ok()),
                         draft: None,
                         artifact_kind: None,
                     })

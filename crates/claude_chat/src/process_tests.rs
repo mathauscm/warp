@@ -212,3 +212,45 @@ fn live_smoke() {
     assert!(status.expect("exit status").success());
     assert!(process.exit_status().is_some());
 }
+
+#[test]
+fn args_add_every_extra_dir_but_the_cwd() {
+    let mut config = SpawnConfig::new("/bin/claude", "/w/web");
+    config.add_dirs = vec![
+        PathBuf::from("/w/api"),
+        PathBuf::from("/w/web"),
+        PathBuf::from("/w/plugin dir"),
+    ];
+    config.session_id = Some("new-id".to_owned());
+    let args = config.args();
+    assert_eq!(
+        &args[8..],
+        [
+            "--thinking-display",
+            "summarized",
+            "--session-id",
+            "new-id",
+            "--add-dir",
+            "/w/api",
+            "--add-dir",
+            "/w/plugin dir",
+        ]
+    );
+    assert!(config.env().contains(&(
+        "CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD".to_owned(),
+        "1".to_owned()
+    )));
+}
+
+#[test]
+fn no_extra_dirs_adds_no_flag_nor_env() {
+    let mut config = SpawnConfig::new("/bin/claude", "/w/web");
+    config.add_dirs = vec![PathBuf::from("/w/web")];
+    assert!(!config.args().contains(&"--add-dir".to_owned()));
+    assert!(
+        !config
+            .env()
+            .iter()
+            .any(|(key, _)| key == "CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD")
+    );
+}

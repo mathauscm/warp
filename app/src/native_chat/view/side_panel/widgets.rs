@@ -5,7 +5,7 @@ use pathfinder_geometry::vector::vec2f;
 use warpui::elements::{
     Border, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, DropShadow, Element,
     Empty, Expanded, Flex, Hoverable, Icon as SvgIcon, MainAxisAlignment, MainAxisSize,
-    MouseStateHandle, ParentElement, Radius, Rect, Shrinkable, Text,
+    MouseStateHandle, ParentElement, Radius, Rect, Shrinkable, Stack, Text,
 };
 use warpui::fonts::{FamilyId, Properties, Weight};
 use warpui::platform::Cursor;
@@ -307,7 +307,7 @@ pub(super) fn switch_button(
 }
 
 /// A track filled to `fraction` (0 to 1).
-pub(super) fn progress_bar(
+pub(in crate::native_chat::view) fn progress_bar(
     fraction: f64,
     fill: ColorU,
     track: ColorU,
@@ -342,6 +342,54 @@ pub(super) fn progress_bar(
     )
     .with_height(height)
     .finish()
+}
+
+/// A circular gauge filled clockwise to `fraction` (0 to 1), in steps of 5%.
+pub(in crate::native_chat::view) fn ring(
+    fraction: f64,
+    fill: ColorU,
+    track: ColorU,
+    size: f32,
+) -> Box<dyn Element> {
+    let mut ring = Stack::new().with_child(svg(RING_TRACK_ICON, track, size));
+    if let Some(arc) = ring_arc(fraction) {
+        ring.add_child(svg(arc, fill, size));
+    }
+    ring.finish()
+}
+
+const RING_TRACK_ICON: &str = "bundled/svg/picolas-ring-track.svg";
+const RING_ARCS: [&str; 20] = [
+    "bundled/svg/picolas-ring-005.svg",
+    "bundled/svg/picolas-ring-010.svg",
+    "bundled/svg/picolas-ring-015.svg",
+    "bundled/svg/picolas-ring-020.svg",
+    "bundled/svg/picolas-ring-025.svg",
+    "bundled/svg/picolas-ring-030.svg",
+    "bundled/svg/picolas-ring-035.svg",
+    "bundled/svg/picolas-ring-040.svg",
+    "bundled/svg/picolas-ring-045.svg",
+    "bundled/svg/picolas-ring-050.svg",
+    "bundled/svg/picolas-ring-055.svg",
+    "bundled/svg/picolas-ring-060.svg",
+    "bundled/svg/picolas-ring-065.svg",
+    "bundled/svg/picolas-ring-070.svg",
+    "bundled/svg/picolas-ring-075.svg",
+    "bundled/svg/picolas-ring-080.svg",
+    "bundled/svg/picolas-ring-085.svg",
+    "bundled/svg/picolas-ring-090.svg",
+    "bundled/svg/picolas-ring-095.svg",
+    "bundled/svg/picolas-ring-100.svg",
+];
+
+/// The arc of a ring filled to `fraction`; a sliver still shows the first step rather than
+/// nothing.
+pub(in crate::native_chat::view) fn ring_arc(fraction: f64) -> Option<&'static str> {
+    if fraction.is_nan() || fraction <= 0. {
+        return None;
+    }
+    let step = ((fraction.min(1.) * 20.).round() as usize).clamp(1, RING_ARCS.len());
+    Some(RING_ARCS[step - 1])
 }
 
 /// A fixed-width progress bar, for summaries in collapsed headers.
@@ -444,7 +492,7 @@ pub(super) fn wide_button(
 
 /// A meter's color: `normal`, then the warning color from `warning_percent` and the error color
 /// when nearly full.
-pub(super) fn meter_color(
+pub(in crate::native_chat::view) fn meter_color(
     percent: f64,
     normal: ColorU,
     warning_percent: f64,

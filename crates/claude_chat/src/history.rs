@@ -185,7 +185,9 @@ pub fn load_transcript_with(
     }
 
     let first_prompt = items.iter().find_map(|item| match item {
-        TimelineItem::User(message) if message.command.is_none() => first_line_title(&message.text),
+        TimelineItem::User(message) if message.command.is_none() => {
+            first_line_title(&crate::inline::display_text(&message.text))
+        }
         _ => None,
     });
     let truncated = options

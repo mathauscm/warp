@@ -5,7 +5,11 @@
 mod composer;
 mod side_panel;
 mod transcript;
+mod usage_bar;
 
+pub use usage_bar::ChatUsageBar;
+
+use std::path::PathBuf;
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -28,7 +32,7 @@ use warpui::{
 };
 
 use self::composer::{ComposerEvent, ComposerView};
-use self::side_panel::SidePanelView;
+use self::side_panel::{SidePanelEvent, SidePanelView};
 use self::transcript::{TranscriptEvent, TranscriptView};
 use super::ClaudeChatPaneSnapshot;
 use super::design::{ChatDesign, ChatDesignEvent, Palette, Sizes};
@@ -104,7 +108,15 @@ impl ClaudeChatView {
     pub fn new(snapshot: ClaudeChatPaneSnapshot, ctx: &mut ViewContext<Self>) -> Self {
         let pane_configuration = ctx.add_model(|_| PaneConfiguration::new(NEW_CHAT_TITLE));
         let session = ctx.add_model(|ctx| {
-            ClaudeChatSession::new(snapshot.cwd.clone(), snapshot.session_id.clone(), ctx)
+            ClaudeChatSession::new_in_workspace(
+                snapshot.cwd.clone(),
+                snapshot
+                    .workspace
+                    .clone()
+                    .or_else(|| super::dev_workspace_for(&snapshot.cwd)),
+                snapshot.session_id.clone(),
+                ctx,
+            )
         });
         let transcript = ctx.add_typed_action_view(|ctx| TranscriptView::new(session.clone(), ctx));
         let send_draft = cfg!(debug_assertions) && std::env::var_os("PICOLAS_CHAT_SEND").is_some();
@@ -132,7 +144,9 @@ impl ClaudeChatView {
         ctx.subscribe_to_view(&composer, |me, _, event, ctx| {
             me.on_composer_event(event, ctx)
         });
-        ctx.subscribe_to_view(&side_panel, |_, _, event, _| match *event {});
+        ctx.subscribe_to_view(&side_panel, |me, _, event, ctx| {
+            me.on_side_panel_event(event, ctx)
+        });
 
         if cfg!(debug_assertions)
             && let Ok(model) = std::env::var("PICOLAS_CHAT_MODEL")
@@ -180,6 +194,7 @@ impl ClaudeChatView {
                 .has_transcript()
                 .then(|| session.session_id().to_owned()),
             cwd: session.cwd().to_path_buf(),
+            workspace: session.workspace().cloned(),
             draft: None,
             artifact_kind: None,
         }
@@ -271,30 +286,50 @@ impl ClaudeChatView {
                     .update(ctx, |composer, ctx| composer.add_mention(text, ctx));
             }
             TranscriptEvent::OpenArtifact(artifact_id) => {
-                ctx.dispatch_typed_action(&WorkspaceAction::OpenArtifacts {
+                ctx.dispatch_typed_action_deferred(WorkspaceAction::OpenArtifacts {
                     artifact_id: Some(artifact_id.clone()),
+                });
+            }
+            TranscriptEvent::OpenFile(path) => {
+                // Focusing this chat first makes the editor open beside it rather than beside
+                // whichever pane had focus.
+                ctx.emit(ClaudeChatViewEvent::Pane(PaneEvent::FocusSelf));
+                ctx.dispatch_typed_action_deferred(WorkspaceAction::OpenFileInSplitPane {
+                    path: path.clone(),
                 });
             }
         }
     }
 
+    /// Shows the side panel's cards wherever they fit, with `section` expanded and scrolled to.
+    pub fn reveal_side_panel(&mut self, section: SidePanelSection, ctx: &mut ViewContext<Self>) {
+        self.open_side_panel(ctx);
+        self.side_panel
+            .update(ctx, |side_panel, ctx| side_panel.reveal(section, ctx));
+    }
+
     fn on_composer_event(&mut self, event: &ComposerEvent, ctx: &mut ViewContext<Self>) {
         match event {
-            ComposerEvent::OpenSidePanel(section) => {
-                self.open_side_panel(ctx);
-                let section = *section;
-                self.side_panel
-                    .update(ctx, |side_panel, ctx| side_panel.reveal(section, ctx));
-            }
+            ComposerEvent::OpenSidePanel(section) => self.reveal_side_panel(*section, ctx),
             ComposerEvent::NewChat => {
                 let cwd = self.session.as_ref(ctx).cwd().to_path_buf();
-                ctx.dispatch_typed_action(&WorkspaceAction::OpenClaudeChat {
-                    cwd,
-                    session_id: None,
-                    draft: None,
-                    artifact_kind: None,
-                    group: None,
-                });
+                let action = match self.session.as_ref(ctx).workspace().cloned() {
+                    Some(workspace) => WorkspaceAction::OpenClaudeWorkspaceChat {
+                        cwd,
+                        workspace,
+                        session_id: None,
+                        group: None,
+                    },
+                    None => WorkspaceAction::OpenClaudeChat {
+                        cwd,
+                        session_id: None,
+                        draft: None,
+                        artifact_kind: None,
+                        group: None,
+                    },
+                };
+                // Deferred: opening a chat reads every chat view, this one included.
+                ctx.dispatch_typed_action_deferred(action);
             }
             ComposerEvent::Rename(title) => {
                 let title = title.clone();
@@ -305,7 +340,25 @@ impl ClaudeChatView {
                 self.transcript
                     .update(ctx, |transcript, ctx| transcript.copy_selection(ctx));
             }
+            ComposerEvent::OpenDiff { repo_root } => self.open_diff(repo_root.clone(), ctx),
+            ComposerEvent::GitChanged => {
+                let statuses = self.composer.as_ref(ctx).git_statuses().to_vec();
+                self.side_panel
+                    .update(ctx, |side_panel, ctx| side_panel.set_git(statuses, ctx));
+            }
         }
+    }
+
+    fn on_side_panel_event(&mut self, event: &SidePanelEvent, ctx: &mut ViewContext<Self>) {
+        match event {
+            SidePanelEvent::OpenDiff { repo_root } => self.open_diff(repo_root.clone(), ctx),
+        }
+    }
+
+    fn open_diff(&mut self, repo_root: PathBuf, ctx: &mut ViewContext<Self>) {
+        // Deferred: the workspace's handler refreshes working directories, which reads this
+        // view's pane.
+        ctx.dispatch_typed_action_deferred(WorkspaceAction::OpenCodeReviewForRepo(repo_root));
     }
 
     fn is_in_split_pane(&self, app: &AppContext) -> bool {

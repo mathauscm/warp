@@ -75,6 +75,7 @@ diesel::table! {
         kind -> Text,
         session_id -> Nullable<Text>,
         cwd -> Text,
+        workspace -> Nullable<Text>,
     }
 }
 

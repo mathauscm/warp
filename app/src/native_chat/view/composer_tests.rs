@@ -140,17 +140,6 @@ fn mention_query_is_the_trailing_at_word() {
 }
 
 #[test]
-fn mentions_are_quoted_before_the_message() {
-    let quotes = vec!["first line\n\nsecond line\n".to_owned(), "other".to_owned()];
-    assert_eq!(
-        message_with_quotes(&quotes, "  what is this?  "),
-        "> first line\n>\n> second line\n\n> other\n\nwhat is this?"
-    );
-    assert_eq!(message_with_quotes(&[], "hi"), "hi");
-    assert_eq!(message_with_quotes(&["x".to_owned()], " "), "> x");
-}
-
-#[test]
 fn preview_flattens_and_truncates() {
     assert_eq!(preview("a\n  b   c", 10), "a b c");
     assert_eq!(preview("abcdef ghij", 7), "abcdef…");

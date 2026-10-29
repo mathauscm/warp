@@ -1,8 +1,11 @@
 //! Drawing the transcript's rows: bubbles, prose, code, tables, thinking, notices and work groups.
 
+use std::cell::RefCell;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
+use claude_chat::attachments::{AttachedFile, split_attached_files};
+use claude_chat::inline::{self, MessageLayout, MessagePart, TokenKind};
 use claude_chat::presentation::{Row, WorkGroup};
 use claude_chat::timeline::{
     AssistantText, Notice, NoticeKind, SlashCommandInvocation, Thinking, TimelineItem, UserMessage,
@@ -14,15 +17,16 @@ use warpui::elements::new_scrollable::{ScrollableAppearance, SingleAxisConfig};
 use warpui::elements::shimmering_text::{ShimmerConfig, ShimmeringTextElement};
 use warpui::elements::{
     Align, Border, Clipped, ClippedScrollable, ConstrainedBox, Container, CornerRadius,
-    CrossAxisAlignment, Empty, Expanded, Fill, Flex, FormattedTextElement,
-    HeadingFontSizeMultipliers, Highlight, HighlightedRange, Hoverable, Icon as SvgIcon,
-    MainAxisAlignment, MainAxisSize, NewScrollable, ParentElement, Point, Radius, ScrollbarWidth,
-    SelectableElement, Shrinkable, Text,
+    CrossAxisAlignment, DispatchEventResult, Empty, EventHandler, Expanded, Fill, Flex,
+    FormattedTextElement, HeadingFontSizeMultipliers, Highlight, HighlightedRange, Hoverable,
+    Icon as SvgIcon, MainAxisAlignment, MainAxisSize, NewScrollable, ParentElement, Point, Radius,
+    ScrollbarWidth, SelectableElement, Shrinkable, Text, Wrap,
 };
 use warpui::event::DispatchedEvent;
 use warpui::fonts::{FamilyId, Properties, Weight};
 use warpui::platform::Cursor;
-use warpui::text_layout::{ClipConfig, TextBorder};
+use warpui::text_layout::{ClipConfig, TextBorder, TextStyle};
+use warpui::units::Pixels;
 use warpui::{
     AfterLayoutContext, AppContext, ClipBounds, Element, EventContext, LayoutContext, PaintContext,
     SingletonEntity, SizeConstraint,
@@ -30,7 +34,8 @@ use warpui::{
 
 use super::details::{self, format_time};
 use super::markdown::{self, Block};
-use super::{TranscriptAction, TranscriptView, tools};
+use super::paths::PathChip;
+use super::{TranscriptAction, TranscriptView, chips, tools};
 use crate::native_chat::design::{self, ChatDesign, Palette, Sizes};
 
 pub(super) const ICON_CHEVRON_RIGHT: &str = "bundled/svg/picolas-chevron-right.svg";
@@ -46,7 +51,10 @@ const ICON_IMAGE: &str = "bundled/svg/picolas-image.svg";
 const THUMBNAIL_SIZE: f32 = 112.;
 const THUMBNAIL_GAP: f32 = 6.;
 const THUMBNAIL_RADIUS: f32 = 8.;
-const THUMBNAIL_SCROLLBAR_WIDTH: f32 = 4.;
+/// How far a press on an image carousel moves before it pans instead of clicking.
+const CAROUSEL_DRAG_THRESHOLD: f32 = 4.;
+/// How tall a token's label is in a bubble, as a percentage of the font size.
+const TOKEN_HEIGHT_PERCENT: u8 = 132;
 /// The first line of a thinking block shown while it's folded.
 const THINKING_PREVIEW_CHARS: usize = 90;
 /// Space between a row's blocks (paragraph runs, code, tables).
@@ -182,34 +190,94 @@ fn render_user_message(cx: &RowContext, message: &UserMessage) -> Box<dyn Elemen
         None => message.text.clone(),
     };
     let footer_time = message.timestamp.map(|time| format_time(time, cx.now));
+    let (layout, files) = match &message.command {
+        Some(_) => (MessageLayout::default(), Vec::new()),
+        None => {
+            let (body, files) = split_attached_files(&message.text);
+            (inline::message_layout(body, message.images.len()), files)
+        }
+    };
 
     let mut column = Flex::column()
         .with_cross_axis_alignment(CrossAxisAlignment::End)
         .with_main_axis_size(MainAxisSize::Min);
     if !message.images.is_empty() {
+        let positions: Vec<usize> = (0..message.images.len()).collect();
         column.add_child(
-            Container::new(render_thumbnails(cx, message))
+            Container::new(
+                FractionWidth::new(
+                    render_thumbnails(cx, message, &positions, "all"),
+                    sizes.bubble_max_width_ratio,
+                )
+                .finish(),
+            )
+            .with_padding_bottom(6.)
+            .finish(),
+        );
+    }
+    let (chips, expanded_pastes) = render_attachment_chips(cx, &key, &layout.parts, &files);
+    if let Some(chips) = chips {
+        column.add_child(
+            Container::new(FractionWidth::new(chips, sizes.bubble_max_width_ratio).finish())
                 .with_padding_bottom(6.)
                 .finish(),
         );
     }
     let bubble_content = match &message.command {
-        Some(command) => render_command_text(cx, command),
-        None => Text::new(message.text.trim().to_owned(), cx.style.ui, sizes.font_size)
-            .with_color(palette.text.0)
-            .with_line_height_ratio(sizes.line_height_ratio)
-            .with_selection_color(palette.selection.0)
-            .finish(),
+        Some(command) => Some(render_command_text(cx, command)),
+        None => {
+            let (text, tokens) = inline::text_with_tokens(&layout.parts);
+            (!text.trim().is_empty()).then(|| {
+                // Tinted like the composer's pills, so a sent message reads as it was typed.
+                let token_style = |kind: TokenKind| {
+                    let tint = match kind {
+                        TokenKind::Image => palette.kind_design.0,
+                        TokenKind::File | TokenKind::Mention => palette.accent.0,
+                        TokenKind::Pasted => palette.text_muted.0,
+                    };
+                    TextStyle::new()
+                        .with_foreground_color(palette.text.0)
+                        .with_background_color(ColorU { a: 0x2e, ..tint })
+                        .with_border(TextBorder {
+                            color: ColorU { a: 0x73, ..tint },
+                            radius: 5,
+                            width: 1,
+                            line_height_ratio_override: Some(TOKEN_HEIGHT_PERCENT),
+                        })
+                };
+                Text::new(text, cx.style.ui, sizes.font_size)
+                    .with_color(palette.text.0)
+                    .with_line_height_ratio(sizes.line_height_ratio)
+                    .with_selection_color(palette.selection.0)
+                    .with_highlights(tokens.into_iter().map(|(range, kind)| HighlightedRange {
+                        highlight_indices: range.collect(),
+                        highlight: Highlight::new().with_text_style(token_style(kind)),
+                    }))
+                    .finish()
+            })
+        }
     };
-    let show_bubble = message.command.is_some() || !message.text.trim().is_empty();
-    if show_bubble {
-        let bubble = Container::new(bubble_content)
+    if let Some(content) = bubble_content {
+        let bubble = Container::new(content)
             .with_horizontal_padding(sizes.bubble_padding_x)
             .with_vertical_padding(sizes.bubble_padding_y)
             .with_background_color(palette.user_bubble.0)
             .with_corner_radius(CornerRadius::with_all(Radius::Pixels(sizes.bubble_radius)))
             .finish();
         column.add_child(FractionWidth::new(bubble, sizes.bubble_max_width_ratio).finish());
+    }
+    for (toggle_key, text) in expanded_pastes {
+        column.add_child(
+            Container::new(
+                FractionWidth::new(
+                    mono_box(cx, &toggle_key, &text, palette.text.0),
+                    sizes.bubble_max_width_ratio,
+                )
+                .finish(),
+            )
+            .with_padding_top(6.)
+            .finish(),
+        );
     }
     if let Some(output) = message
         .command
@@ -245,6 +313,70 @@ fn render_user_message(cx: &RowContext, message: &UserMessage) -> Box<dyn Elemen
         .with_main_axis_size(MainAxisSize::Max)
         .with_child(Shrinkable::new(1., row).finish())
         .finish()
+}
+
+/// The pills above a user message's bubble: its files, quotes and pastes, numbered like their
+/// tokens in the text, then the files of an older message's `<attached_files>` block. Also returns
+/// the pastes that are unfolded, to show under the bubble.
+fn render_attachment_chips(
+    cx: &RowContext,
+    key: &str,
+    parts: &[MessagePart],
+    listed_files: &[AttachedFile],
+) -> (Option<Box<dyn Element>>, Vec<(String, String)>) {
+    let mut row = Wrap::row()
+        .with_spacing(6.)
+        .with_run_spacing(6.)
+        .with_main_axis_alignment(MainAxisAlignment::End);
+    let mut is_empty = true;
+    let mut expanded = Vec::new();
+    let (mut files, mut mentions, mut pastes) = (0, 0, 0);
+    for (index, part) in parts.iter().enumerate() {
+        let chip_key = format!("{key}:part{index}");
+        let chip = match part {
+            MessagePart::Text(_) | MessagePart::Image(_) => continue,
+            MessagePart::File(file) => {
+                files += 1;
+                let numbered = AttachedFile {
+                    name: format!("{files} · {}", file.name),
+                    ..file.clone()
+                };
+                chips::attached_file_chip(cx, &chip_key, &numbered)
+            }
+            MessagePart::Quote(quote) => {
+                mentions += 1;
+                chips::quote_chip(cx, &chip_key, &format!("{mentions} · {quote}"))
+            }
+            MessagePart::Pasted { text, lines } => {
+                pastes += 1;
+                let toggle_key = format!("pasted:{key}:{index}");
+                let is_expanded = cx.view.is_expanded(&toggle_key, false);
+                let chip = chips::pasted_chip(
+                    cx,
+                    &toggle_key,
+                    pastes,
+                    text,
+                    *lines,
+                    cx.toggle_action(&toggle_key, is_expanded),
+                );
+                if is_expanded {
+                    expanded.push((toggle_key, text.clone()));
+                }
+                chip
+            }
+        };
+        row.add_child(chip);
+        is_empty = false;
+    }
+    for (position, file) in listed_files.iter().enumerate() {
+        row.add_child(chips::attached_file_chip(
+            cx,
+            &format!("{key}:{position}"),
+            file,
+        ));
+        is_empty = false;
+    }
+    ((!is_empty).then(|| row.finish()), expanded)
 }
 
 fn render_command_text(cx: &RowContext, command: &SlashCommandInvocation) -> Box<dyn Element> {
@@ -309,12 +441,22 @@ fn render_command_output(cx: &RowContext, key: &str, output: &str) -> Box<dyn El
     column.finish()
 }
 
-fn render_thumbnails(cx: &RowContext, message: &UserMessage) -> Box<dyn Element> {
+/// The message's images at `positions`, in a row that scrolls sideways; `group` tells the rows
+/// of one message apart.
+fn render_thumbnails(
+    cx: &RowContext,
+    message: &UserMessage,
+    positions: &[usize],
+    group: &str,
+) -> Box<dyn Element> {
     let palette = cx.palette();
     let mut thumbnails = Flex::row()
         .with_spacing(THUMBNAIL_GAP)
         .with_main_axis_size(MainAxisSize::Min);
-    for (position, image) in message.images.iter().enumerate() {
+    for (position, image) in positions
+        .iter()
+        .filter_map(|&position| Some((position, message.images.get(position)?)))
+    {
         let source = match &image.path {
             Some(path) => Some(warpui::assets::asset_cache::AssetSource::LocalFile {
                 path: path.clone(),
@@ -346,36 +488,96 @@ fn render_thumbnails(cx: &RowContext, message: &UserMessage) -> Box<dyn Element>
         .with_width(THUMBNAIL_SIZE)
         .with_height(THUMBNAIL_SIZE)
         .finish();
-        let tile = match image.path.clone() {
-            Some(path) => Hoverable::new(
-                cx.view.mouse(&format!("image:{}:{position}", message.id)),
-                move |_| tile,
-            )
-            .with_cursor(Cursor::PointingHand)
-            .on_click(move |ctx, _, _| {
-                ctx.dispatch_typed_action(TranscriptAction::OpenFile(path.clone()))
-            })
-            .finish(),
-            None => tile,
+        let action = TranscriptAction::OpenImage {
+            message_id: message.id.clone(),
+            position,
         };
+        let tile = Hoverable::new(
+            cx.view.mouse(&format!("image:{}:{position}", message.id)),
+            move |_| tile,
+        )
+        .with_cursor(Cursor::PointingHand)
+        .on_click(move |ctx, _, _| {
+            if !carousel_was_dragged() {
+                ctx.dispatch_typed_action(action.clone())
+            }
+        })
+        .finish();
         thumbnails.add_child(tile);
     }
+    let handle = cx
+        .view
+        .scroll_handle(&format!("images:{}:{group}", message.id));
     // A wheel that's mostly vertical goes on to the transcript.
-    NewScrollable::horizontal(
+    let scrollable = NewScrollable::horizontal(
         SingleAxisConfig::Clipped {
-            handle: cx.view.scroll_handle(&format!("images:{}", message.id)),
+            handle: handle.clone(),
             child: thumbnails.finish(),
         },
-        Fill::Solid(palette.border_strong.0),
-        Fill::Solid(palette.text_faint.0),
+        Fill::None,
+        Fill::None,
         Fill::None,
     )
-    .with_horizontal_scrollbar(ScrollableAppearance::new(
-        ScrollbarWidth::Custom(THUMBNAIL_SCROLLBAR_WIDTH),
-        true,
-    ))
+    .with_horizontal_scrollbar(ScrollableAppearance::new(ScrollbarWidth::None, true))
     .with_propagate_mousewheel_if_not_handled(true)
-    .finish()
+    .finish();
+    let carousel = format!("{}:{group}", message.id);
+    let drag_handle = handle.clone();
+    let drag_carousel = carousel.clone();
+    EventHandler::new(scrollable)
+        .with_always_handle()
+        .on_left_mouse_down(move |_, _, position| {
+            CAROUSEL_DRAG.with_borrow_mut(|drag| {
+                *drag = Some(CarouselDrag {
+                    carousel: carousel.clone(),
+                    start_x: position.x(),
+                    start_scroll: handle.scroll_start().as_f32(),
+                    moved: false,
+                })
+            });
+            DispatchEventResult::PropagateToParent
+        })
+        .on_mouse_dragged(move |ctx, _, position| {
+            let scroll = CAROUSEL_DRAG.with_borrow_mut(|drag| {
+                let drag = drag
+                    .as_mut()
+                    .filter(|drag| drag.carousel == drag_carousel)?;
+                let dx = position.x() - drag.start_x;
+                drag.moved |= dx.abs() > CAROUSEL_DRAG_THRESHOLD;
+                drag.moved.then_some(drag.start_scroll - dx)
+            });
+            match scroll {
+                Some(scroll) => {
+                    drag_handle.scroll_to(Pixels::new(scroll));
+                    ctx.notify();
+                    DispatchEventResult::StopPropagation
+                }
+                None => DispatchEventResult::PropagateToParent,
+            }
+        })
+        .on_left_mouse_up(|_, _, _| {
+            CAROUSEL_DRAG.set(None);
+            DispatchEventResult::PropagateToParent
+        })
+        .finish()
+}
+
+/// A press on an image carousel, which pans it once it moves past a few pixels.
+struct CarouselDrag {
+    carousel: String,
+    start_x: f32,
+    start_scroll: f32,
+    moved: bool,
+}
+
+thread_local! {
+    // Elements are rebuilt every frame, so the press outlives the element that saw it.
+    static CAROUSEL_DRAG: RefCell<Option<CarouselDrag>> = const { RefCell::new(None) };
+}
+
+/// Whether the press being released panned a carousel, which then isn't a click.
+fn carousel_was_dragged() -> bool {
+    CAROUSEL_DRAG.with_borrow(|drag| drag.as_ref().is_some_and(|drag| drag.moved))
 }
 
 /// The line under a message: its time and a copy button, shown on hover. It always takes its
@@ -524,7 +726,7 @@ pub(super) fn render_markdown(
     markdown: &str,
     tone: MarkdownTone,
 ) -> Box<dyn Element> {
-    let blocks = cx.view.blocks(cache_key, markdown);
+    let blocks = cx.view.blocks(cache_key, markdown, cx.cwd);
     render_blocks(cx, cache_key, &blocks, tone)
 }
 
@@ -537,7 +739,13 @@ fn render_blocks(
     let mut column = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
     for (position, block) in blocks.iter().enumerate() {
         let element = match block {
-            Block::Prose(text) => render_prose(cx, text.clone(), tone),
+            Block::Prose(text, path_chips) => render_prose(
+                cx,
+                &format!("{cache_key}#{position}"),
+                text.clone(),
+                path_chips,
+                tone,
+            ),
             Block::Code { language, code } => {
                 render_code_block(cx, &format!("{cache_key}#{position}"), language, code)
             }
@@ -577,7 +785,9 @@ fn render_quote(cx: &RowContext, key: &str, blocks: &[Block]) -> Box<dyn Element
 
 fn render_prose(
     cx: &RowContext,
+    key: &str,
     text: std::sync::Arc<FormattedText>,
+    path_chips: &[PathChip],
     tone: MarkdownTone,
 ) -> Box<dyn Element> {
     let palette = cx.palette();
@@ -586,8 +796,8 @@ fn render_prose(
         MarkdownTone::Normal => (sizes.font_size, palette.text.0),
         MarkdownTone::Muted => (sizes.small_font_size + 0.5, palette.text_muted.0),
     };
-    FormattedTextElement::new_arc(
-        text,
+    let element = FormattedTextElement::new_arc(
+        text.clone(),
         font_size,
         cx.style.ui,
         cx.view.inline_code_font.unwrap_or(cx.style.mono),
@@ -607,11 +817,8 @@ fn render_prose(
     .with_inline_code_border(inline_code_border(cx))
     .with_hyperlink_font_color(palette.link.0)
     .with_selection_color(palette.selection.0)
-    .set_selectable(true)
-    .register_default_click_handlers(|url, ctx, _| {
-        ctx.dispatch_typed_action(TranscriptAction::OpenUrl(url.url));
-    })
-    .finish()
+    .set_selectable(true);
+    chips::prose_with_chips(cx, key, element, &text, path_chips, font_size)
 }
 
 fn render_code_block(cx: &RowContext, key: &str, language: &str, code: &str) -> Box<dyn Element> {

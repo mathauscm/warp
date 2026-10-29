@@ -9,6 +9,16 @@ fn a_chat_that_never_sent_anything_is_unused() {
 }
 
 #[test]
+fn an_empty_unsent_chat_is_unused_whatever_the_cli_reports() {
+    for status in [NativeChatStatus::Working, NativeChatStatus::AwaitingUser] {
+        assert_eq!(
+            ChatActivity::new(false, false, status),
+            ChatActivity::Unused
+        );
+    }
+}
+
+#[test]
 fn typed_text_keeps_a_chat_from_being_replaced() {
     for has_transcript in [false, true] {
         let activity = ChatActivity::new(has_transcript, true, NativeChatStatus::Idle);
@@ -20,7 +30,7 @@ fn typed_text_keeps_a_chat_from_being_replaced() {
 #[test]
 fn a_working_or_waiting_chat_is_busy() {
     for status in [NativeChatStatus::Working, NativeChatStatus::AwaitingUser] {
-        for (has_transcript, has_draft) in [(false, false), (true, false), (true, true)] {
+        for (has_transcript, has_draft) in [(false, true), (true, false), (true, true)] {
             let activity = ChatActivity::new(has_transcript, has_draft, status);
             assert_eq!(activity, ChatActivity::Busy);
             assert!(!activity.can_be_replaced());

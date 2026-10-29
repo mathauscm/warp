@@ -248,31 +248,6 @@ pub fn complete_mention(text: &str, at: usize, path: &str) -> String {
 
 // --- quoted mentions ----------------------------------------------------------------------
 
-/// The message to send: each mention as a Markdown quote, then what the user typed.
-pub fn message_with_quotes(quotes: &[String], text: &str) -> String {
-    let mut parts: Vec<String> = quotes.iter().map(|text| quote(text)).collect();
-    let text = text.trim();
-    if !text.is_empty() {
-        parts.push(text.to_owned());
-    }
-    parts.join("\n\n")
-}
-
-fn quote(text: &str) -> String {
-    text.trim_matches('\n')
-        .lines()
-        .map(|line| {
-            let line = line.trim_end();
-            if line.is_empty() {
-                ">".to_owned()
-            } else {
-                format!("> {line}")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 /// The start of `text` on one line, for a chip.
 pub fn preview(text: &str, max_chars: usize) -> String {
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");

@@ -8,7 +8,35 @@ pub mod registry;
 pub mod session;
 pub mod view;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+/// The Threads panel workspace a chat belongs to (see `crate::claude_threads::ThreadWorkspace`),
+/// as of when the chat opened.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatWorkspace {
+    pub id: String,
+    pub name: String,
+    /// The workspace's folders besides the one Claude runs in, which Claude gets access to.
+    #[serde(default)]
+    pub extra_dirs: Vec<PathBuf>,
+}
+
+impl ChatWorkspace {
+    /// The line appended to Claude Code's system prompt, so Claude knows the folders belong
+    /// together.
+    pub fn system_prompt(&self, cwd: &Path) -> String {
+        let projects = std::iter::once(format!("{} (the working directory)", cwd.display()))
+            .chain(self.extra_dirs.iter().map(|dir| dir.display().to_string()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "This chat is in the workspace \"{}\", which spans these projects: {projects}.",
+            self.name
+        )
+    }
+}
 
 /// What a chat pane restores from: the conversation and the folder Claude runs in.
 #[derive(Clone, Debug, PartialEq)]
@@ -16,6 +44,8 @@ pub struct ClaudeChatPaneSnapshot {
     /// `None` until a new chat's first message creates its conversation.
     pub session_id: Option<String>,
     pub cwd: PathBuf,
+    /// The workspace whose other folders Claude gets access to, if the chat is in one.
+    pub workspace: Option<ChatWorkspace>,
     /// Text to start the composer with, like an artifact's starter prompt. Not persisted.
     pub draft: Option<String>,
     /// The kind of artifact (`ArtifactKind::as_str`) the first message asks for, from a gallery
@@ -29,6 +59,7 @@ impl ClaudeChatPaneSnapshot {
         Self {
             session_id: None,
             cwd,
+            workspace: None,
             draft: None,
             artifact_kind: None,
         }
@@ -39,6 +70,7 @@ impl ClaudeChatPaneSnapshot {
         Self {
             session_id: Some(session_id),
             cwd,
+            workspace: None,
             draft: None,
             artifact_kind: None,
         }
@@ -72,6 +104,29 @@ pub fn take_dev_open_chat_action() -> Option<crate::workspace::WorkspaceAction> 
         draft: std::env::var("PICOLAS_CHAT_DRAFT").ok(),
         artifact_kind: std::env::var("PICOLAS_CHAT_ARTIFACT_KIND").ok(),
         group: None,
+    })
+}
+
+/// Id of the workspace `PICOLAS_SEED_WORKSPACE=<name>=<folder>,<folder>...` lists in the Threads
+/// panel.
+pub const DEV_WORKSPACE_ID: &str = "picolas-dev-workspace";
+
+/// The `PICOLAS_SEED_WORKSPACE` workspace, for a chat opened in its first folder, so
+/// `PICOLAS_OPEN_CHAT` can open a workspace chat. Debug builds only.
+pub fn dev_workspace_for(cwd: &Path) -> Option<ChatWorkspace> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    let spec = std::env::var("PICOLAS_SEED_WORKSPACE").ok()?;
+    let (name, dirs) = spec.split_once('=')?;
+    let mut dirs = dirs
+        .split(',')
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from);
+    (dirs.next()? == cwd).then(|| ChatWorkspace {
+        id: DEV_WORKSPACE_ID.to_owned(),
+        name: name.to_owned(),
+        extra_dirs: dirs.collect(),
     })
 }
 
@@ -133,3 +188,7 @@ pub fn take_dev_open_artifacts_action() -> Option<crate::workspace::WorkspaceAct
         artifact_id: (spec != "1").then_some(spec),
     })
 }
+
+#[cfg(test)]
+#[path = "mod_tests.rs"]
+mod tests;

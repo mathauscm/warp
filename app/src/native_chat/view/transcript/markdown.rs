@@ -7,9 +7,12 @@ use markdown_parser::{
     FormattedTable, FormattedText, FormattedTextFragment, FormattedTextInline, FormattedTextLine,
 };
 
+use super::paths::PathChip;
+
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum Block {
-    Prose(Arc<FormattedText>),
+    /// A prose run and the files and folders it names, drawn as chips.
+    Prose(Arc<FormattedText>, Vec<PathChip>),
     Code {
         language: String,
         code: String,
@@ -90,7 +93,7 @@ fn split_unquoted(markdown: &str) -> Vec<Block> {
     let flush = |prose: &mut Vec<FormattedTextLine>, blocks: &mut Vec<Block>| {
         let text = FormattedText::new_trimmed(std::mem::take(prose));
         if text.lines.iter().any(|line| !is_blank(line)) {
-            blocks.push(Block::Prose(Arc::new(text)));
+            blocks.push(Block::Prose(Arc::new(text), Vec::new()));
         }
     };
     for line in lines {

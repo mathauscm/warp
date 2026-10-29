@@ -2,21 +2,25 @@
 //! questions, the plan, queued messages, the task list).
 
 mod cards;
+pub(super) mod git_status;
 mod logic;
 mod popovers;
 mod widgets;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use base64::Engine as _;
 use claude_chat::artifacts::{ArtifactKind, kind_label_pt};
-use claude_chat::protocol::OutgoingImage;
+use claude_chat::attachments::{self, AttachmentKind, FileDelivery, ListedFile};
+use claude_chat::inline::{self, DraftAttachment, DraftContent, TokenId, TokenKind};
+use claude_chat::protocol::{OutgoingDocument, OutgoingImage};
 use claude_chat::reducer::{ConversationChange, ConversationStatus};
 use claude_chat::timeline::{PendingRequest, PendingRequestKind, TimelineItem};
 use instant::Instant;
 use pathfinder_color::ColorU;
+use string_offset::{ByteOffset, CharOffset};
 use warp_core::ui::Icon as WarpIcon;
 use warp_core::ui::theme::Fill as ThemeFill;
 use warp_editor::editor::NavigationKey;
@@ -27,12 +31,13 @@ use warpui::elements::{
     Border, ChildAnchor, ChildView, Clipped, ClippedScrollStateHandle, ConstrainedBox, Container,
     CrossAxisAlignment, DropShadow, Element, Flex, Hoverable, Image, MainAxisAlignment,
     MainAxisSize, MouseStateHandle, OffsetPositioning, ParentElement, PositionedElementAnchor,
-    PositionedElementOffsetBounds, SavePosition, Stack,
+    PositionedElementOffsetBounds, SavePosition, Shrinkable, Stack,
 };
 use warpui::geometry::vector::vec2f;
 use warpui::image_cache::{CacheOption, ImageType};
 use warpui::keymap::FixedBinding;
-use warpui::platform::{Cursor, FilePickerConfiguration, FileType};
+use warpui::platform::{Cursor, FilePickerConfiguration};
+use warpui::text_layout::TextBorder;
 use warpui::{
     AppContext, Entity, FocusContext, ModelHandle, SingletonEntity, TypedActionView, View,
     ViewContext, ViewHandle, WindowId,
@@ -43,7 +48,7 @@ use self::widgets::{Look, icon, with_alpha};
 use super::SidePanelSection;
 use crate::editor::{
     CursorColors, EditorOptions, EditorView, Event as EditorEvent, PlainTextEditorViewAction,
-    PropagateAndNoOpNavigationKeys, TextColors, TextOptions,
+    PropagateAndNoOpNavigationKeys, TextColors, TextOptions, TextStyleOperation,
 };
 use crate::native_chat::design::{self, ChatDesign};
 use crate::native_chat::session::{
@@ -90,8 +95,15 @@ const MAX_MODELS: usize = 32;
 const MAX_EFFORT_LEVELS: usize = 8;
 const MAX_CHIPS: usize = 16;
 const MENTION_PREVIEW_CHARS: usize = 36;
+const FILE_CHIP_MAX_NAME_WIDTH: f32 = 220.;
+const GIT_BRANCH_MAX_WIDTH: f32 = 180.;
+/// How often the footer's git status is read again between Claude's turns.
+const GIT_POLL_INTERVAL: Duration = Duration::from_secs(15);
 const QUEUED_PREVIEW_CHARS: usize = 160;
 const QUEUED_ALREADY_SENT: &str = "O Claude já começou a ler essa mensagem.";
+/// How tall an attachment's token is in the editor, as a percentage of the font size.
+const TOKEN_HEIGHT_PERCENT: u8 = 132;
+const TOKEN_RADIUS: u8 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComposerEvent {
@@ -101,6 +113,12 @@ pub enum ComposerEvent {
     Rename(String),
     /// ⌘C with nothing selected in the composer, which copies what's selected in the transcript.
     CopyWithoutSelection,
+    /// The git chip was clicked: show the changes of the repository rooted here.
+    OpenDiff {
+        repo_root: PathBuf,
+    },
+    /// The git status read for the chat's repositories changed; see [`ComposerView::git_statuses`].
+    GitChanged,
 }
 
 /// What the effort slider and the permission card's buttons do, among others.
@@ -108,9 +126,18 @@ pub enum ComposerEvent {
 pub enum ComposerAction {
     Submit,
     Interrupt,
-    AttachImage,
+    AttachFiles,
     RemoveImage(usize),
+    RemoveFile(usize),
+    /// The git chip was clicked: opens the diff, or the list of repositories when there are
+    /// several.
+    OpenDiff,
+    /// A repository of the git chip's list was picked.
+    OpenRepoDiff(usize),
     RemoveMention(usize),
+    RemovePasted(usize),
+    /// Puts a long paste's text back in the editor in place of its token.
+    ExpandPasted(usize),
     ToggleModeMenu,
     SetMode(usize),
     CycleMode,
@@ -210,6 +237,8 @@ impl Menu {
 }
 
 struct Mention {
+    /// The number in its token.
+    number: usize,
     text: String,
     remove: MouseStateHandle,
 }
@@ -217,9 +246,13 @@ struct Mention {
 /// A message sent while Claude was busy, until it gets to it.
 struct QueuedMessage {
     uuid: String,
+    /// The draft as typed, tokens included, for editing it again.
     text: String,
     preview: String,
     images: Vec<Attachment>,
+    files: Vec<FileChip>,
+    mentions: Vec<Mention>,
+    pasted: Vec<PastedText>,
     artifact_kind: Option<ArtifactKind>,
     /// What the user asked for while the CLI is answering whether it could still take it back.
     withdrawing: Option<Withdrawal>,
@@ -238,9 +271,50 @@ enum Withdrawal {
 }
 
 struct Attachment {
+    /// The number in its token.
+    number: usize,
     image: OutgoingImage,
     asset_id: String,
     remove: MouseStateHandle,
+}
+
+/// A file or folder, other than an inline image, waiting to go with the next message.
+struct FileChip {
+    /// The number in its token.
+    number: usize,
+    /// Absolute path.
+    path: String,
+    name: String,
+    kind: AttachmentKind,
+    delivery: FileDelivery,
+    /// The base64 block for a [`FileDelivery::Document`].
+    document: Option<OutgoingDocument>,
+    remove: MouseStateHandle,
+}
+
+impl FileChip {
+    fn listed(&self) -> ListedFile {
+        ListedFile {
+            path: self.path.clone(),
+            is_dir: self.kind == AttachmentKind::Folder,
+            is_mention: self.delivery == FileDelivery::Mention,
+        }
+    }
+}
+
+/// A long paste kept out of the editor, whose text holds its token instead.
+struct PastedText {
+    /// The number in its token.
+    number: usize,
+    text: String,
+    open: MouseStateHandle,
+    remove: MouseStateHandle,
+}
+
+/// What reading a picked, pasted or dropped path gave.
+enum LoadedPath {
+    Image { media_type: String, bytes: Vec<u8> },
+    File(FileChip),
 }
 
 /// The options picked in the question card on top.
@@ -285,6 +359,8 @@ fn handles(count: usize) -> Vec<MouseStateHandle> {
 /// Mouse states created once, so hovering works across renders.
 struct MouseStates {
     attach: MouseStateHandle,
+    git: MouseStateHandle,
+    git_repos: Vec<MouseStateHandle>,
     mic: MouseStateHandle,
     artifact_kind: MouseStateHandle,
     remove_artifact_kind: MouseStateHandle,
@@ -315,6 +391,8 @@ impl Default for MouseStates {
     fn default() -> Self {
         Self {
             attach: Default::default(),
+            git: Default::default(),
+            git_repos: handles(MAX_CHIPS),
             mic: Default::default(),
             artifact_kind: Default::default(),
             remove_artifact_kind: Default::default(),
@@ -354,6 +432,18 @@ pub struct ComposerView {
     mentions: Vec<Mention>,
     images: Vec<Attachment>,
     next_image_id: usize,
+    files: Vec<FileChip>,
+    pasted: Vec<PastedText>,
+    /// The editor's text as of the last edit, to tell when an edit cut into a token.
+    last_text: String,
+    /// Whether some token was drawn as a pill, so plain text skips restyling.
+    has_styled_tokens: bool,
+    /// Where the cursor was, in bytes, so one moving into a token goes on past it.
+    last_cursor: Option<usize>,
+    /// The git status of each repository the chat works in, the chat's folder first.
+    git: Vec<git_status::GitStatus>,
+    is_loading_git: bool,
+    is_git_menu_open: bool,
     menu: Option<Menu>,
     /// The text the menu was closed with Esc for; it stays closed until the text changes.
     menu_dismissed_for: Option<String>,
@@ -433,6 +523,7 @@ impl ComposerView {
                 ..Default::default()
             };
             let mut editor = EditorView::new(options, ctx);
+            editor.set_forwards_dropped_files(true);
             editor.set_placeholder_text(PLACEHOLDER, ctx);
             if let Some(draft) = &draft {
                 editor.system_reset_buffer_text(draft, ctx);
@@ -460,6 +551,14 @@ impl ComposerView {
             mentions: Vec::new(),
             images: Vec::new(),
             next_image_id: 0,
+            files: Vec::new(),
+            pasted: Vec::new(),
+            last_text: draft.clone().unwrap_or_default(),
+            has_styled_tokens: false,
+            last_cursor: None,
+            git: Vec::new(),
+            is_loading_git: false,
+            is_git_menu_open: false,
             menu: None,
             menu_dismissed_for: None,
             picker: None,
@@ -481,7 +580,85 @@ impl ComposerView {
         me.refresh_menu(ctx);
         me.update_placeholder(ctx);
         me.send_dev_queue(ctx);
+        me.attach_dev_files(ctx);
+        me.refresh_git(ctx);
+        me.poll_git(ctx);
+        me.open_dev_diff(ctx);
         me
+    }
+
+    /// `PICOLAS_CHAT_OPEN_DIFF=<n>` clicks the git chip a few seconds after the chat opens, then
+    /// picks the n-th repository when the chat has several (`menu` leaves the list open). Debug
+    /// builds only.
+    fn open_dev_diff(&self, ctx: &mut ViewContext<Self>) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        let Ok(choice) = std::env::var("PICOLAS_CHAT_OPEN_DIFF") else {
+            return;
+        };
+        // Only the chat `PICOLAS_OPEN_CHAT` opened, not the ones restored with the window.
+        let cwd = self.session.as_ref(ctx).cwd().to_path_buf();
+        let is_dev_chat = std::env::var("PICOLAS_OPEN_CHAT").is_ok_and(|spec| {
+            let folder = spec.split('#').next().unwrap_or_default();
+            Path::new(folder) == cwd || std::fs::canonicalize(folder).is_ok_and(|path| path == cwd)
+        });
+        if !is_dev_chat {
+            return;
+        }
+        ctx.spawn(Timer::after(Duration::from_secs(8)), move |me, _, ctx| {
+            me.handle_action(&ComposerAction::OpenDiff, ctx);
+            if me.is_git_menu_open
+                && let Ok(index) = choice.parse::<usize>()
+            {
+                me.handle_action(&ComposerAction::OpenRepoDiff(index), ctx);
+            }
+        });
+    }
+
+    /// `PICOLAS_CHAT_FILES=<path>[|<path>…]` attaches those files when the chat opens (with
+    /// `PICOLAS_CHAT_PASTE=<path>` pasting that file's text and `PICOLAS_CHAT_MENTION=<text>`
+    /// mentioning that text), and `PICOLAS_CHAT_FILES_SEND=<text>` sends them with that text a
+    /// few seconds later, its `{Imagem 1}`-like placeholders replaced by the tokens. Debug builds
+    /// only.
+    fn attach_dev_files(&mut self, ctx: &mut ViewContext<Self>) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        let Ok(paths) = std::env::var("PICOLAS_CHAT_FILES") else {
+            return;
+        };
+        let paths = paths
+            .split('|')
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(str::to_owned)
+            .collect();
+        self.attach_paths(paths, ctx);
+        if let Ok(path) = std::env::var("PICOLAS_CHAT_PASTE")
+            && let Ok(text) = std::fs::read_to_string(path)
+        {
+            self.add_pasted(text, ctx);
+        }
+        if let Ok(text) = std::env::var("PICOLAS_CHAT_MENTION") {
+            self.add_mention(text, ctx);
+        }
+        if let Ok(text) = std::env::var("PICOLAS_CHAT_FILES_SEND") {
+            ctx.spawn(Timer::after(Duration::from_secs(4)), move |me, _, ctx| {
+                let current = me.buffer_text(ctx);
+                let text =
+                    inline::find_tokens(&current)
+                        .into_iter()
+                        .fold(text.clone(), |text, token| {
+                            let token = &current[token.range];
+                            let name_end = token.find([':', '·']).unwrap_or(token.len() - 1);
+                            let placeholder = format!("{{{}}}", token[1..name_end].trim_end());
+                            text.replace(&placeholder, token)
+                        });
+                me.set_text(&text, ctx);
+                me.submit(ctx);
+            });
+        }
     }
 
     /// `PICOLAS_CHAT_QUEUE=<text>[|<text>…]` sends those messages a few seconds after the chat
@@ -510,18 +687,309 @@ impl ComposerView {
         !self.is_editor_empty
             || !self.mentions.is_empty()
             || !self.images.is_empty()
+            || !self.files.is_empty()
+            || !self.pasted.is_empty()
             || !self.queued.is_empty()
     }
 
-    /// Quotes `text` in the next message, shown as a chip until then.
+    fn has_attachments(&self) -> bool {
+        !self.mentions.is_empty()
+            || !self.images.is_empty()
+            || !self.files.is_empty()
+            || !self.pasted.is_empty()
+    }
+
+    /// Quotes `text` in the next message where the cursor is, shown as a chip until then.
     pub fn add_mention(&mut self, text: String, ctx: &mut ViewContext<Self>) {
         if text.trim().is_empty() || self.mentions.len() >= MAX_CHIPS {
             return;
         }
+        let number = self.next_number(TokenKind::Mention);
         self.mentions.push(Mention {
+            number,
             text,
             remove: Default::default(),
         });
+        self.insert_token(
+            TokenId {
+                kind: TokenKind::Mention,
+                number,
+            },
+            "",
+            ctx,
+        );
+        self.focus(ctx);
+        ctx.notify();
+    }
+
+    // --- inline tokens ----------------------------------------------------------------------
+
+    fn numbers(&self, kind: TokenKind) -> Vec<usize> {
+        match kind {
+            TokenKind::Image => self.images.iter().map(|image| image.number).collect(),
+            TokenKind::File => self.files.iter().map(|file| file.number).collect(),
+            TokenKind::Mention => self.mentions.iter().map(|mention| mention.number).collect(),
+            TokenKind::Pasted => self.pasted.iter().map(|pasted| pasted.number).collect(),
+        }
+    }
+
+    /// One more than the highest number in use, so a draft's numbers start at 1 again once the
+    /// previous one is sent.
+    fn next_number(&self, kind: TokenKind) -> usize {
+        self.numbers(kind).into_iter().max().unwrap_or(0) + 1
+    }
+
+    fn has_attachment(&self, id: TokenId) -> bool {
+        self.numbers(id.kind).contains(&id.number)
+    }
+
+    /// Inserts an attachment's token where the cursor is, spaced from the text around it.
+    fn insert_token(&mut self, id: TokenId, detail: &str, ctx: &mut ViewContext<Self>) {
+        let text = self.buffer_text(ctx);
+        let (before, after) = match self.editor.as_ref(ctx).single_cursor_to_point(ctx) {
+            Some(point) => chars_around(&text, point.row as usize, point.column as usize),
+            None => (None, None),
+        };
+        let mut insert = String::new();
+        if before.is_some_and(|character| !character.is_whitespace()) {
+            insert.push(' ');
+        }
+        insert.push_str(&inline::token_text(id, detail));
+        if after.is_none_or(|character| !character.is_whitespace()) {
+            insert.push(' ');
+        }
+        self.editor.update(ctx, |editor, ctx| {
+            editor.user_initiated_insert(&insert, PlainTextEditorViewAction::Paste, ctx)
+        });
+    }
+
+    /// Deletes the tokens of `id` from the editor, each with a space beside it.
+    fn remove_tokens(&mut self, id: TokenId, ctx: &mut ViewContext<Self>) {
+        let text = self.buffer_text(ctx);
+        let ranges: Vec<_> = inline::find_tokens(&text)
+            .into_iter()
+            .filter(|token| token.id == id)
+            .map(|token| {
+                let mut range = token.range;
+                if text[range.end..].starts_with(' ') {
+                    range.end += 1;
+                } else if text[..range.start].ends_with(' ') {
+                    range.start -= 1;
+                }
+                ByteOffset::from(range.start)..ByteOffset::from(range.end)
+            })
+            .collect();
+        for range in ranges.into_iter().rev() {
+            self.editor
+                .update(ctx, |editor, ctx| editor.system_delete(range, ctx));
+        }
+    }
+
+    /// The tokens of the attachments in `text`.
+    fn live_tokens(&self, text: &str) -> Vec<inline::Token> {
+        inline::find_tokens(text)
+            .into_iter()
+            .filter(|token| self.has_attachment(token.id))
+            .collect()
+    }
+
+    /// Undoes edits that broke a token: text typed inside one moves after it, and a deletion
+    /// that cut into one deletes the rest of it.
+    fn keep_tokens_whole(&mut self, ctx: &mut ViewContext<Self>) {
+        let text = self.buffer_text(ctx);
+        let previous = std::mem::replace(&mut self.last_text, text.clone());
+        let tokens = self.live_tokens(&previous);
+        if let Some((fixed, cursor)) =
+            inline::move_insertion_out_of_token(&previous, &text, &tokens)
+        {
+            self.set_text(&fixed, ctx);
+            self.place_cursor(cursor, ctx);
+            return;
+        }
+        let Some((id, remnant)) = inline::token_remnant(&previous, &text) else {
+            return;
+        };
+        if self.has_attachment(id) {
+            let range = ByteOffset::from(remnant.start)..ByteOffset::from(remnant.end);
+            self.editor
+                .update(ctx, |editor, ctx| editor.system_delete(range, ctx));
+        }
+    }
+
+    fn place_cursor(&mut self, offset: usize, ctx: &mut ViewContext<Self>) {
+        let offset = ByteOffset::from(offset);
+        self.editor.update(ctx, |editor, ctx| {
+            editor.select_ranges_by_byte_offset([offset..offset], ctx)
+        });
+    }
+
+    /// Keeps the cursor out of tokens and makes selections take tokens whole.
+    fn snap_selection(&mut self, ctx: &mut ViewContext<Self>) {
+        let Some((tail, head)) = self.editor.as_ref(ctx).first_selection_char_offsets(ctx) else {
+            return;
+        };
+        let text = self.buffer_text(ctx);
+        let byte_offset = |offset: CharOffset| {
+            text.char_indices()
+                .nth(offset.as_usize())
+                .map_or(text.len(), |(index, _)| index)
+        };
+        let (tail, head) = (byte_offset(tail), byte_offset(head));
+        let previous = self.last_cursor.replace(head);
+        let tokens = self.live_tokens(&text);
+        let Some((tail, head)) = inline::snap_selection(&tokens, tail, head, previous) else {
+            return;
+        };
+        self.last_cursor = Some(head);
+        let (start, end) = (tail.min(head), tail.max(head));
+        self.editor.update(ctx, |editor, ctx| {
+            editor
+                .select_ranges_by_byte_offset([ByteOffset::from(start)..ByteOffset::from(end)], ctx)
+        });
+    }
+
+    /// Numbers the attachments of `kind` 1, 2, 3… again after one was removed, in the editor's
+    /// tokens too, so they keep matching the chips.
+    fn renumber(&mut self, kind: TokenKind, ctx: &mut ViewContext<Self>) {
+        let mut numbers = self.numbers(kind);
+        numbers.sort_unstable();
+        let renumbered = |number: usize| {
+            numbers
+                .iter()
+                .position(|&old| old == number)
+                .map(|index| index + 1)
+        };
+        if numbers
+            .iter()
+            .enumerate()
+            .all(|(index, &number)| number == index + 1)
+        {
+            return;
+        }
+        match kind {
+            TokenKind::Image => self
+                .images
+                .iter_mut()
+                .for_each(|image| image.number = renumbered(image.number).unwrap_or(image.number)),
+            TokenKind::File => self
+                .files
+                .iter_mut()
+                .for_each(|file| file.number = renumbered(file.number).unwrap_or(file.number)),
+            TokenKind::Mention => self.mentions.iter_mut().for_each(|mention| {
+                mention.number = renumbered(mention.number).unwrap_or(mention.number)
+            }),
+            TokenKind::Pasted => self.pasted.iter_mut().for_each(|pasted| {
+                pasted.number = renumbered(pasted.number).unwrap_or(pasted.number)
+            }),
+        }
+        let text = self.buffer_text(ctx);
+        let new_number = |id: TokenId| {
+            if id.kind == kind {
+                renumbered(id.number)
+            } else {
+                None
+            }
+        };
+        let new_text = inline::renumber_tokens(&text, new_number);
+        if new_text == text {
+            return;
+        }
+        let cursor = self.last_cursor.unwrap_or(text.len()).min(text.len());
+        let new_cursor = new_text.len() - (text.len() - cursor).min(new_text.len());
+        self.set_text(&new_text, ctx);
+        self.place_cursor(new_cursor, ctx);
+    }
+
+    /// Draws the tokens of the attachments in the editor as pills.
+    fn style_tokens(&mut self, ctx: &mut ViewContext<Self>) {
+        let text = self.buffer_text(ctx);
+        let tokens: Vec<_> = inline::find_tokens(&text)
+            .into_iter()
+            .filter(|token| self.has_attachment(token.id))
+            .collect();
+        if tokens.is_empty() && !self.has_styled_tokens {
+            return;
+        }
+        self.has_styled_tokens = !tokens.is_empty();
+        let palette = ChatDesign::as_ref(ctx).palette(ctx);
+        let styled: Vec<_> = tokens
+            .into_iter()
+            .map(|token| {
+                let start = text[..token.range.start].chars().count();
+                let end = start + text[token.range.clone()].chars().count();
+                let tint = match token.id.kind {
+                    TokenKind::Image => palette.kind_design.0,
+                    TokenKind::File | TokenKind::Mention => palette.accent.0,
+                    TokenKind::Pasted => palette.text_muted.0,
+                };
+                let style = TextStyleOperation::default()
+                    .set_background_color(mix_colors(palette.surface.0, tint, 0.14))
+                    .set_border(TextBorder {
+                        color: widgets::with_alpha(tint, 0x73),
+                        radius: TOKEN_RADIUS,
+                        width: 1,
+                        line_height_ratio_override: Some(TOKEN_HEIGHT_PERCENT),
+                    });
+                (CharOffset::from(start)..CharOffset::from(end), style)
+            })
+            .collect();
+        let len = text.chars().count();
+        self.editor.update(ctx, |editor, ctx| {
+            if len > 0 {
+                editor.update_buffer_styles(
+                    [CharOffset::from(0)..CharOffset::from(len)],
+                    TextStyleOperation::default()
+                        .clear_background_color()
+                        .clear_border(),
+                    ctx,
+                );
+            }
+            for (range, style) in styled {
+                editor.update_buffer_styles([range], style, ctx);
+            }
+        });
+    }
+
+    /// Keeps a long paste out of the editor, which gets its token instead.
+    fn add_pasted(&mut self, text: String, ctx: &mut ViewContext<Self>) {
+        let number = self.next_number(TokenKind::Pasted);
+        let detail = inline::pasted_detail(&text);
+        self.pasted.push(PastedText {
+            number,
+            text,
+            open: Default::default(),
+            remove: Default::default(),
+        });
+        self.insert_token(
+            TokenId {
+                kind: TokenKind::Pasted,
+                number,
+            },
+            &detail,
+            ctx,
+        );
+        ctx.notify();
+    }
+
+    fn expand_pasted(&mut self, pasted: PastedText, ctx: &mut ViewContext<Self>) {
+        let id = TokenId {
+            kind: TokenKind::Pasted,
+            number: pasted.number,
+        };
+        let text = self.buffer_text(ctx);
+        let token = inline::find_tokens(&text)
+            .into_iter()
+            .find(|token| token.id == id);
+        self.editor.update(ctx, |editor, ctx| {
+            if let Some(token) = token {
+                editor.select_ranges_by_byte_offset(
+                    [ByteOffset::from(token.range.start)..ByteOffset::from(token.range.end)],
+                    ctx,
+                );
+            }
+            editor.user_initiated_insert(&pasted.text, PlainTextEditorViewAction::Paste, ctx);
+        });
+        self.remove_tokens(id, ctx);
         self.focus(ctx);
         ctx.notify();
     }
@@ -588,10 +1056,13 @@ impl ComposerView {
             EditorEvent::Escape => self.on_escape(ctx),
             EditorEvent::Navigate(key) => self.on_navigate(*key, ctx),
             EditorEvent::Edited(_) | EditorEvent::BufferReplaced => {
+                self.keep_tokens_whole(ctx);
                 self.is_editor_empty = self.editor.as_ref(ctx).is_empty(ctx);
+                self.style_tokens(ctx);
                 self.refresh_menu(ctx);
                 ctx.notify();
             }
+            EditorEvent::SelectionChanged => self.snap_selection(ctx),
             EditorEvent::Paste => self.on_paste(ctx),
             EditorEvent::Copy => ctx.emit(ComposerEvent::CopyWithoutSelection),
             EditorEvent::VoiceStateUpdated {
@@ -604,10 +1075,13 @@ impl ComposerView {
                 };
                 ctx.notify();
             }
-            EditorEvent::DroppedImageFiles(paths) => self.load_image_files(paths.clone(), ctx),
+            EditorEvent::DroppedImageFiles(paths) | EditorEvent::DroppedFiles(paths) => {
+                self.attach_paths(paths.clone(), ctx)
+            }
             EditorEvent::Focused => {
                 self.picker = None;
                 self.is_mode_menu_open = false;
+                self.is_git_menu_open = false;
                 ctx.notify();
             }
             _ => {}
@@ -617,6 +1091,13 @@ impl ComposerView {
     fn on_session_event(&mut self, event: &ClaudeChatSessionEvent, ctx: &mut ViewContext<Self>) {
         match event {
             ClaudeChatSessionEvent::Changed(changes) => {
+                if changes
+                    .iter()
+                    .any(|change| matches!(change, ConversationChange::Status))
+                    && !self.is_working(ctx)
+                {
+                    self.refresh_git(ctx);
+                }
                 let queued = self.queued.len();
                 self.sync_queue(changes, ctx);
                 if self.queued.len() != queued || affects_composer(changes) {
@@ -727,7 +1208,7 @@ impl ComposerView {
             ctx.notify();
             return;
         }
-        if self.picker.is_some() || self.is_mode_menu_open {
+        if self.picker.is_some() || self.is_mode_menu_open || self.is_git_menu_open {
             self.close_popovers(ctx);
             return;
         }
@@ -1019,49 +1500,83 @@ impl ComposerView {
             self.run_ui_command(command, &args, ctx);
             return;
         }
-        let is_command = text.trim_start().starts_with('/');
-        let message = if is_command {
-            text.trim().to_owned()
-        } else {
-            let quotes: Vec<String> = self
-                .mentions
-                .drain(..)
-                .map(|mention| mention.text)
-                .collect();
-            logic::message_with_quotes(&quotes, &text)
-        };
-        if message.is_empty() && self.images.is_empty() {
+        if text.trim().is_empty() && !self.has_attachments() {
             return;
         }
         self.clear_text(ctx);
-        self.send(message, ctx);
+        self.send(text, ctx);
     }
 
-    fn send(&mut self, message: String, ctx: &mut ViewContext<Self>) {
-        let attachments: Vec<Attachment> = self.images.drain(..).collect();
-        let images: Vec<OutgoingImage> = attachments
-            .iter()
-            .map(|attachment| attachment.image.clone())
-            .collect();
+    /// Sends `text` with the attachments its tokens place. A slash command goes alone, leaving
+    /// them for the next message.
+    fn send(&mut self, text: String, ctx: &mut ViewContext<Self>) {
         let is_busy = matches!(
             self.status(ctx),
             ConversationStatus::Working { .. } | ConversationStatus::AwaitingUser
         );
-        let artifact_kind = self
-            .artifact_kind
-            .take()
-            .filter(|_| !message.trim_start().starts_with('/'));
-        let text = message.clone();
-        let uuid = match artifact_kind {
-            Some(kind) => {
-                let instructions = logic::artifact_instructions(kind);
-                self.session.update(ctx, |session, ctx| {
-                    session.send_message_with_instructions(&instructions, message, images, ctx)
+        let is_command = text.trim_start().starts_with('/');
+        let (images, files, mentions, pasted, artifact_kind) = if is_command {
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), None)
+        } else {
+            (
+                std::mem::take(&mut self.images),
+                std::mem::take(&mut self.files),
+                std::mem::take(&mut self.mentions),
+                std::mem::take(&mut self.pasted),
+                self.artifact_kind.take(),
+            )
+        };
+        let uuid = if is_command {
+            let command = text.trim().to_owned();
+            self.session.update(ctx, |session, ctx| {
+                session.send_message(command, Vec::new(), ctx)
+            })
+        } else {
+            let listed: Vec<ListedFile> = files.iter().map(FileChip::listed).collect();
+            let mut draft: Vec<DraftAttachment> = images
+                .iter()
+                .map(|attachment| DraftAttachment {
+                    id: TokenId {
+                        kind: TokenKind::Image,
+                        number: attachment.number,
+                    },
+                    content: DraftContent::Image(&attachment.image),
                 })
-            }
-            None => self.session.update(ctx, |session, ctx| {
-                session.send_message(message, images, ctx)
-            }),
+                .collect();
+            draft.extend(
+                files
+                    .iter()
+                    .zip(&listed)
+                    .map(|(file, listed)| DraftAttachment {
+                        id: TokenId {
+                            kind: TokenKind::File,
+                            number: file.number,
+                        },
+                        content: DraftContent::File {
+                            file: listed,
+                            document: file.document.as_ref(),
+                        },
+                    }),
+            );
+            draft.extend(mentions.iter().map(|mention| DraftAttachment {
+                id: TokenId {
+                    kind: TokenKind::Mention,
+                    number: mention.number,
+                },
+                content: DraftContent::Mention(&mention.text),
+            }));
+            draft.extend(pasted.iter().map(|pasted| DraftAttachment {
+                id: TokenId {
+                    kind: TokenKind::Pasted,
+                    number: pasted.number,
+                },
+                content: DraftContent::Pasted(&pasted.text),
+            }));
+            let message = inline::compose(&text, &draft);
+            let instructions = artifact_kind.map(logic::artifact_instructions);
+            self.session.update(ctx, |session, ctx| {
+                session.send_composed(instructions.as_deref(), message, ctx)
+            })
         };
         let conversation = self.session.as_ref(ctx).conversation();
         let is_queued = if conversation.tracks_queue() {
@@ -1070,16 +1585,23 @@ impl ComposerView {
             is_busy
         };
         if is_queued {
-            let preview = if text.is_empty() {
+            let preview = if !text.trim().is_empty() {
+                logic::preview(&text, QUEUED_PREVIEW_CHARS)
+            } else if let Some(file) = files.first() {
+                file.name.clone()
+            } else if !images.is_empty() {
                 "Imagem".to_owned()
             } else {
-                logic::preview(&text, QUEUED_PREVIEW_CHARS)
+                "Menção".to_owned()
             };
             self.queued.push(QueuedMessage {
                 uuid,
                 text,
                 preview,
-                images: attachments,
+                images,
+                files,
+                mentions,
+                pasted,
                 artifact_kind,
                 withdrawing: None,
                 sending_now: false,
@@ -1136,18 +1658,48 @@ impl ComposerView {
         }
         let message = self.queued.remove(position);
         if message.withdrawing == Some(Withdrawal::Edit) {
+            // Numbers above the draft's own keep the restored tokens from taking its attachments.
+            let image_shift = self.next_number(TokenKind::Image) - 1;
+            let file_shift = self.next_number(TokenKind::File) - 1;
+            let mention_shift = self.next_number(TokenKind::Mention) - 1;
+            let pasted_shift = self.next_number(TokenKind::Pasted) - 1;
+            let shift = |kind: TokenKind| match kind {
+                TokenKind::Image => image_shift,
+                TokenKind::File => file_shift,
+                TokenKind::Mention => mention_shift,
+                TokenKind::Pasted => pasted_shift,
+            };
+            let restored =
+                inline::renumber_tokens(&message.text, |id| Some(id.number + shift(id.kind)));
             let current = self.buffer_text(ctx);
             let text = if current.trim().is_empty() {
-                message.text
+                restored
             } else {
-                format!("{}\n\n{current}", message.text)
+                format!("{restored}\n\n{current}")
             };
-            self.set_text(&text, ctx);
-            for attachment in message.images {
+            for mut attachment in message.images {
                 if self.images.len() < MAX_CHIPS {
+                    attachment.number += image_shift;
                     self.images.push(attachment);
                 }
             }
+            for mut file in message.files {
+                if self.files.len() < MAX_CHIPS {
+                    file.number += file_shift;
+                    self.files.push(file);
+                }
+            }
+            for mut mention in message.mentions {
+                if self.mentions.len() < MAX_CHIPS {
+                    mention.number += mention_shift;
+                    self.mentions.push(mention);
+                }
+            }
+            for mut pasted in message.pasted {
+                pasted.number += pasted_shift;
+                self.pasted.push(pasted);
+            }
+            self.set_text(&text, ctx);
             if self.artifact_kind.is_none() {
                 self.artifact_kind = message.artifact_kind;
             }
@@ -1322,57 +1874,94 @@ impl ComposerView {
                 return;
             }
         }
-        if let Some(paths) = &content.paths {
-            let images: Vec<String> = paths
-                .iter()
-                .filter(|path| image_media_type(Path::new(path)).is_some())
-                .cloned()
-                .collect();
-            if !images.is_empty() && images.len() == paths.len() {
-                self.load_image_files(images, ctx);
-                return;
-            }
+        if let Some(paths) = content.paths.as_ref().filter(|paths| !paths.is_empty()) {
+            self.attach_paths(paths.clone(), ctx);
+            return;
         }
         let text = self
             .editor
             .read(ctx, |editor, _| editor.clipboard_text_content(content));
+        if inline::is_large_paste(&text) {
+            self.add_pasted(text, ctx);
+            return;
+        }
         self.editor.update(ctx, |editor, ctx| {
             editor.user_initiated_insert(&text, PlainTextEditorViewAction::Paste, ctx)
         });
     }
 
-    fn pick_images(&mut self, ctx: &mut ViewContext<Self>) {
+    fn pick_files(&mut self, ctx: &mut ViewContext<Self>) {
         ctx.open_file_picker(
             move |result, ctx| {
                 let Ok(paths) = result else { return };
                 if let Some(handle) = ctx.handle().upgrade(ctx) {
-                    handle.update(ctx, |me, ctx| me.load_image_files(paths, ctx));
+                    handle.update(ctx, |me, ctx| me.attach_paths(paths, ctx));
                 }
             },
             FilePickerConfiguration::new()
-                .allow_multi_select()
-                .set_allowed_file_types(vec![FileType::Image]),
+                .allow_folder()
+                .allow_multi_select(),
         );
     }
 
-    fn load_image_files(&mut self, paths: Vec<String>, ctx: &mut ViewContext<Self>) {
+    /// Attaches files and folders: small images as thumbnails, everything else as file chips.
+    fn attach_paths(&mut self, paths: Vec<String>, ctx: &mut ViewContext<Self>) {
         ctx.spawn(
             async move {
-                paths
+                let mut too_large = Vec::new();
+                let loaded = paths
                     .into_iter()
                     .filter_map(|path| {
-                        let media_type = image_media_type(Path::new(&path))?;
-                        let bytes = std::fs::read(&path).ok()?;
-                        Some((media_type.to_owned(), bytes))
+                        let loaded = load_path(path)?;
+                        if let LoadedPath::File(file) = &loaded
+                            && file.delivery == FileDelivery::Path
+                            && matches!(file.kind, AttachmentKind::Image | AttachmentKind::Pdf)
+                        {
+                            too_large.push(file.name.clone());
+                        }
+                        Some(loaded)
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                (loaded, too_large)
             },
-            |me, images, ctx| {
-                for (media_type, bytes) in images {
-                    me.add_image(media_type, bytes, ctx);
+            |me, (loaded, too_large), ctx| {
+                for loaded in loaded {
+                    match loaded {
+                        LoadedPath::Image { media_type, bytes } => {
+                            me.add_image(media_type, bytes, ctx)
+                        }
+                        LoadedPath::File(file) => me.add_file(file, ctx),
+                    }
+                }
+                if !too_large.is_empty() {
+                    me.show_notice(
+                        &format!(
+                            "{} passa de {} MB: vai como caminho, e o Claude o lê com as \
+                             ferramentas dele.",
+                            too_large.join(", "),
+                            attachments::MAX_INLINE_BYTES / (1024 * 1024)
+                        ),
+                        ctx,
+                    );
                 }
             },
         );
+    }
+
+    fn add_file(&mut self, mut file: FileChip, ctx: &mut ViewContext<Self>) {
+        if self.files.len() >= MAX_CHIPS || self.files.iter().any(|chip| chip.path == file.path) {
+            return;
+        }
+        file.number = self.next_number(TokenKind::File);
+        let id = TokenId {
+            kind: TokenKind::File,
+            number: file.number,
+        };
+        let name = file.name.clone();
+        self.files.push(file);
+        self.insert_token(id, &name, ctx);
+        self.focus(ctx);
+        ctx.notify();
     }
 
     fn add_image(&mut self, media_type: String, bytes: Vec<u8>, ctx: &mut ViewContext<Self>) {
@@ -1384,7 +1973,9 @@ impl ComposerView {
         AssetCache::handle(ctx).update(ctx, |cache, ctx| {
             cache.insert_raw_asset_bytes::<ImageType>(asset_id.clone(), &bytes, ctx);
         });
+        let number = self.next_number(TokenKind::Image);
         self.images.push(Attachment {
+            number,
             image: OutgoingImage {
                 media_type,
                 data_base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
@@ -1392,8 +1983,59 @@ impl ComposerView {
             asset_id,
             remove: Default::default(),
         });
+        self.insert_token(
+            TokenId {
+                kind: TokenKind::Image,
+                number,
+            },
+            "",
+            ctx,
+        );
         self.focus(ctx);
         ctx.notify();
+    }
+
+    // --- git ---------------------------------------------------------------------------------
+
+    /// The git status of each repository the chat works in, the chat's folder first.
+    pub fn git_statuses(&self) -> &[git_status::GitStatus] {
+        &self.git
+    }
+
+    fn refresh_git(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.is_loading_git {
+            return;
+        }
+        self.is_loading_git = true;
+        let dirs = self
+            .session
+            .as_ref(ctx)
+            .dirs()
+            .into_iter()
+            .map(Path::to_path_buf)
+            .collect();
+        ctx.spawn(git_status::load_all(dirs), |me, statuses, ctx| {
+            me.is_loading_git = false;
+            if me.git != statuses {
+                me.git = statuses;
+                if me.git.len() < 2 {
+                    me.is_git_menu_open = false;
+                }
+                ctx.emit(ComposerEvent::GitChanged);
+                ctx.notify();
+            }
+        });
+    }
+
+    /// Reads the git status again every [`GIT_POLL_INTERVAL`] while the folder is a repository;
+    /// the end of each of Claude's turns reads it too.
+    fn poll_git(&self, ctx: &mut ViewContext<Self>) {
+        ctx.spawn(Timer::after(GIT_POLL_INTERVAL), |me, _, ctx| {
+            if !me.git.is_empty() {
+                me.refresh_git(ctx);
+            }
+            me.poll_git(ctx);
+        });
     }
 
     // --- model, effort and mode ---------------------------------------------------------------
@@ -1407,12 +2049,17 @@ impl ComposerView {
     }
 
     fn close_popovers(&mut self, ctx: &mut ViewContext<Self>) {
-        if self.picker.is_some() || self.is_mode_menu_open || self.is_artifact_kind_menu_open {
+        if self.picker.is_some()
+            || self.is_mode_menu_open
+            || self.is_artifact_kind_menu_open
+            || self.is_git_menu_open
+        {
             self.popovers_closed_at = Some(Instant::now());
         }
         self.picker = None;
         self.is_mode_menu_open = false;
         self.is_artifact_kind_menu_open = false;
+        self.is_git_menu_open = false;
         self.focus(ctx);
         ctx.notify();
     }
@@ -1556,7 +2203,7 @@ impl ComposerView {
             .with_main_axis_size(MainAxisSize::Min)
             .with_cross_axis_alignment(CrossAxisAlignment::Stretch);
 
-        if !self.images.is_empty() {
+        if !self.images.is_empty() || !self.files.is_empty() || !self.pasted.is_empty() {
             column.add_child(
                 Container::new(self.render_attachments(look))
                     .with_padding_bottom(8.)
@@ -1578,7 +2225,7 @@ impl ComposerView {
         );
 
         let is_working = self.is_working(app);
-        let can_send = !self.is_editor_empty || !self.images.is_empty();
+        let can_send = !self.is_editor_empty || self.has_attachments();
         let mut left = Flex::row()
             .with_main_axis_size(MainAxisSize::Min)
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
@@ -1588,7 +2235,7 @@ impl ComposerView {
                 self.mouse.attach.clone(),
                 WarpIcon::Plus,
                 sizes.button_size,
-                ComposerAction::AttachImage,
+                ComposerAction::AttachFiles,
             ))
             .with_child(self.render_mic_button(look));
         if let Some(kind) = self.artifact_kind {
@@ -1792,7 +2439,11 @@ impl ComposerView {
                     sizes.small_icon_size,
                 ))
                 .with_child(look.text(
-                    logic::preview(&mention.text, MENTION_PREVIEW_CHARS),
+                    format!(
+                        "{} · {}",
+                        mention.number,
+                        logic::preview(&mention.text, MENTION_PREVIEW_CHARS)
+                    ),
                     sizes.small_font_size,
                     text_color,
                 ))
@@ -1819,6 +2470,130 @@ impl ComposerView {
     }
 
     fn render_attachments(&self, look: &Look) -> Box<dyn Element> {
+        let mut column = Flex::column()
+            .with_main_axis_size(MainAxisSize::Min)
+            .with_cross_axis_alignment(CrossAxisAlignment::Start)
+            .with_spacing(8.);
+        if !self.images.is_empty() {
+            column.add_child(self.render_thumbnails(look));
+        }
+        if !self.files.is_empty() || !self.pasted.is_empty() {
+            column.add_child(self.render_file_chips(look));
+        }
+        column.finish()
+    }
+
+    /// Each attached file as a pill: its kind's icon, its number and name and a remove button.
+    /// Long pastes follow, opening back into the editor when clicked.
+    fn render_file_chips(&self, look: &Look) -> Box<dyn Element> {
+        let palette = &look.palette;
+        let sizes = &look.sizes;
+        let mut row = warpui::elements::Wrap::row()
+            .with_spacing(6.)
+            .with_run_spacing(6.);
+        for (index, file) in self.files.iter().enumerate() {
+            let content = Flex::row()
+                .with_main_axis_size(MainAxisSize::Min)
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_spacing(6.)
+                .with_child(icon(
+                    attachment_icon(file.kind),
+                    palette.text_muted.0,
+                    sizes.small_icon_size,
+                ))
+                .with_child(look.text(
+                    file.number.to_string(),
+                    sizes.small_font_size,
+                    palette.text_faint.0,
+                ))
+                .with_child(
+                    ConstrainedBox::new(look.text(
+                        file.name.clone(),
+                        sizes.small_font_size,
+                        palette.text.0,
+                    ))
+                    .with_max_width(FILE_CHIP_MAX_NAME_WIDTH)
+                    .finish(),
+                )
+                .with_child(self.render_remove_button(
+                    look,
+                    file.remove.clone(),
+                    ComposerAction::RemoveFile(index),
+                ))
+                .finish();
+            row.add_child(
+                Container::new(
+                    ConstrainedBox::new(content)
+                        .with_height(sizes.chip_height + 4.)
+                        .finish(),
+                )
+                .with_padding_left(10.)
+                .with_padding_right(6.)
+                .with_background_color(palette.surface_hover.0)
+                .with_border(Border::all(1.).with_border_color(palette.border.0))
+                .with_corner_radius(look.radius(sizes.chip_radius + 2.))
+                .finish(),
+            );
+        }
+        for (index, pasted) in self.pasted.iter().enumerate() {
+            let label = format!(
+                "Texto colado {} · {}",
+                pasted.number,
+                inline::pasted_detail(&pasted.text)
+            );
+            let open = {
+                let look = look.clone();
+                Hoverable::new(pasted.open.clone(), move |state| {
+                    let palette = &look.palette;
+                    let sizes = &look.sizes;
+                    let color = if state.is_hovered() {
+                        palette.text.0
+                    } else {
+                        palette.text_muted.0
+                    };
+                    Flex::row()
+                        .with_main_axis_size(MainAxisSize::Min)
+                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                        .with_spacing(6.)
+                        .with_child(icon(WarpIcon::FileCopy, color, sizes.small_icon_size))
+                        .with_child(look.text(label.clone(), sizes.small_font_size, palette.text.0))
+                        .finish()
+                })
+                .with_cursor(Cursor::PointingHand)
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(ComposerAction::ExpandPasted(index))
+                })
+                .finish()
+            };
+            let content = Flex::row()
+                .with_main_axis_size(MainAxisSize::Min)
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_spacing(6.)
+                .with_child(open)
+                .with_child(self.render_remove_button(
+                    look,
+                    pasted.remove.clone(),
+                    ComposerAction::RemovePasted(index),
+                ))
+                .finish();
+            row.add_child(
+                Container::new(
+                    ConstrainedBox::new(content)
+                        .with_height(sizes.chip_height + 4.)
+                        .finish(),
+                )
+                .with_padding_left(10.)
+                .with_padding_right(6.)
+                .with_background_color(palette.surface_hover.0)
+                .with_border(Border::all(1.).with_border_color(palette.border.0))
+                .with_corner_radius(look.radius(sizes.chip_radius + 2.))
+                .finish(),
+            );
+        }
+        row.finish()
+    }
+
+    fn render_thumbnails(&self, look: &Look) -> Box<dyn Element> {
         let palette = &look.palette;
         let sizes = &look.sizes;
         let mut row = warpui::elements::Wrap::row()
@@ -1845,6 +2620,24 @@ impl ComposerView {
                 .with_width(thumb_size)
                 .with_height(thumb_size)
                 .finish(),
+            );
+            stack.add_positioned_child(
+                Container::new(look.text(
+                    attachment.number.to_string(),
+                    sizes.tiny_font_size,
+                    palette.text.0,
+                ))
+                .with_horizontal_padding(5.)
+                .with_vertical_padding(1.)
+                .with_background_color(with_alpha(palette.page.0, 0xd9))
+                .with_corner_radius(look.radius(6.))
+                .finish(),
+                OffsetPositioning::offset_from_parent(
+                    vec2f(4., -4.),
+                    warpui::elements::ParentOffsetBounds::Unbounded,
+                    warpui::elements::ParentAnchor::BottomLeft,
+                    ChildAnchor::BottomLeft,
+                ),
             );
             stack.add_positioned_child(
                 self.render_remove_button(
@@ -1975,16 +2768,114 @@ impl ComposerView {
             .with_child(self.render_context_ring(look, fraction, ring_label))
             .finish();
 
+        let mut left = Flex::row()
+            .with_main_axis_size(MainAxisSize::Min)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(2.)
+            .with_child(mode_chip);
+        if !self.git.is_empty() {
+            left.add_child(
+                SavePosition::new(self.render_git_chip(look), &self.position_id("git_chip"))
+                    .finish(),
+            );
+        }
+
         Container::new(
             Flex::row()
                 .with_main_axis_size(MainAxisSize::Max)
                 .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
                 .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                .with_child(mode_chip)
+                .with_child(Shrinkable::new(1., left.finish()).finish())
                 .with_child(right)
                 .finish(),
         )
         .with_padding_top(6.)
+        .finish()
+    }
+
+    /// The branch of the chat's folder and the uncommitted changes of every repository it works
+    /// in; a click shows the diff, or lists the repositories when there are several.
+    fn render_git_chip(&self, look: &Look) -> Box<dyn Element> {
+        let look = look.clone();
+        let branch = self
+            .git
+            .first()
+            .map(|status| status.branch.clone())
+            .unwrap_or_default();
+        let other_repos = self.git.len().saturating_sub(1);
+        let (added, removed) = git_status::total_changes(&self.git);
+        let (added, removed) = git_status::diff_parts(added, removed);
+        Hoverable::new(self.mouse.git.clone(), move |state| {
+            let palette = &look.palette;
+            let sizes = &look.sizes;
+            let hovered = state.is_hovered();
+            let mut row = Flex::row()
+                .with_main_axis_size(MainAxisSize::Min)
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_spacing(5.)
+                .with_child(icon(
+                    WarpIcon::GitBranch,
+                    palette.text_faint.0,
+                    sizes.small_icon_size,
+                ))
+                .with_child(
+                    ConstrainedBox::new(look.text(
+                        branch.clone(),
+                        sizes.small_font_size,
+                        if hovered {
+                            palette.text.0
+                        } else {
+                            palette.text_muted.0
+                        },
+                    ))
+                    .with_max_width(GIT_BRANCH_MAX_WIDTH)
+                    .finish(),
+                );
+            if other_repos > 0 {
+                row.add_child(look.text(
+                    format!(
+                        "+{other_repos} {}",
+                        if other_repos == 1 { "repo" } else { "repos" }
+                    ),
+                    sizes.small_font_size,
+                    palette.text_faint.0,
+                ));
+            }
+            if let Some(added) = &added {
+                row.add_child(look.medium_text(
+                    added.clone(),
+                    sizes.small_font_size,
+                    palette.diff_added.0,
+                ));
+            }
+            if let Some(removed) = &removed {
+                row.add_child(look.medium_text(
+                    removed.clone(),
+                    sizes.small_font_size,
+                    palette.diff_removed.0,
+                ));
+            }
+            if other_repos > 0 {
+                row.add_child(icon(
+                    WarpIcon::ChevronDown,
+                    palette.text_faint.0,
+                    sizes.small_icon_size - 3.,
+                ));
+            }
+            let mut container = Container::new(
+                ConstrainedBox::new(row.finish())
+                    .with_height(sizes.chip_height - 2.)
+                    .finish(),
+            )
+            .with_horizontal_padding(8.)
+            .with_corner_radius(look.radius(sizes.chip_radius));
+            if hovered {
+                container = container.with_background_color(palette.surface_hover.0);
+            }
+            container.finish()
+        })
+        .with_cursor(Cursor::PointingHand)
+        .on_click(|ctx, _, _| ctx.dispatch_typed_action(ComposerAction::OpenDiff))
         .finish()
     }
 
@@ -2096,14 +2987,94 @@ fn mode_color(mode: &str, look: &Look) -> ColorU {
     }
 }
 
-fn image_media_type(path: &Path) -> Option<&'static str> {
-    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
-    match extension.as_str() {
-        "png" => Some("image/png"),
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "gif" => Some("image/gif"),
-        "webp" => Some("image/webp"),
-        _ => None,
+/// Reads what an attachment at `path` needs; runs off the main thread.
+fn load_path(path: String) -> Option<LoadedPath> {
+    let metadata = std::fs::metadata(&path).ok()?;
+    let kind = attachments::classify(&path, metadata.is_dir());
+    let is_text = match kind {
+        AttachmentKind::Folder
+        | AttachmentKind::Image
+        | AttachmentKind::Pdf
+        | AttachmentKind::Document
+        | AttachmentKind::Presentation => false,
+        AttachmentKind::Text | AttachmentKind::Spreadsheet => {
+            attachments::has_text_extension(&path)
+        }
+        AttachmentKind::Other => sniffs_as_text(Path::new(&path)),
+    };
+    let delivery = attachments::delivery(kind, metadata.len(), is_text);
+    let document = match delivery {
+        FileDelivery::Image => {
+            let media_type = attachments::image_media_type(&path)?.to_owned();
+            let bytes = std::fs::read(&path).ok()?;
+            return Some(LoadedPath::Image { media_type, bytes });
+        }
+        FileDelivery::Document => {
+            let bytes = std::fs::read(&path).ok()?;
+            Some(OutgoingDocument {
+                media_type: "application/pdf".to_owned(),
+                data_base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                title: file_name(&path),
+            })
+        }
+        FileDelivery::Mention | FileDelivery::Path => None,
+    };
+    Some(LoadedPath::File(FileChip {
+        name: file_name(&path).unwrap_or_else(|| path.clone()),
+        path,
+        kind,
+        number: 0,
+        delivery,
+        document,
+        remove: Default::default(),
+    }))
+}
+
+/// The characters before and after the cursor at `row` and `column` (in characters) of `text`.
+fn chars_around(text: &str, row: usize, column: usize) -> (Option<char>, Option<char>) {
+    let mut lines = text.split('\n').skip(row);
+    let Some(line) = lines.next() else {
+        return (None, None);
+    };
+    let before = column
+        .checked_sub(1)
+        .and_then(|index| line.chars().nth(index));
+    let after = line
+        .chars()
+        .nth(column)
+        .or_else(|| lines.next().map(|_| '\n'));
+    (before, after)
+}
+
+fn file_name(path: &str) -> Option<String> {
+    Path::new(path.trim_end_matches('/'))
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+}
+
+/// Whether the file's first bytes look like text, for files whose extension doesn't say.
+fn sniffs_as_text(path: &Path) -> bool {
+    use std::io::Read as _;
+    let mut head = [0u8; 8192];
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let Ok(read) = file.read(&mut head) else {
+        return false;
+    };
+    attachments::looks_like_text(&head[..read])
+}
+
+fn attachment_icon(kind: AttachmentKind) -> WarpIcon {
+    match kind {
+        AttachmentKind::Image => WarpIcon::Image,
+        AttachmentKind::Pdf | AttachmentKind::Document => WarpIcon::File,
+        AttachmentKind::Text => WarpIcon::Code2,
+        AttachmentKind::Spreadsheet => WarpIcon::Grid,
+        AttachmentKind::Presentation => WarpIcon::LayoutAlt01,
+        AttachmentKind::Folder => WarpIcon::Folder,
+        AttachmentKind::Other => WarpIcon::Paperclip,
     }
 }
 
@@ -2204,6 +3175,18 @@ impl View for ComposerView {
                 ),
             );
         }
+        if self.is_git_menu_open && self.git.len() > 1 {
+            stack.add_positioned_overlay_child(
+                self.render_git_menu(&look),
+                OffsetPositioning::offset_from_save_position_element(
+                    self.position_id("git_chip"),
+                    vec2f(0., -6.),
+                    PositionedElementOffsetBounds::WindowByPosition,
+                    PositionedElementAnchor::TopLeft,
+                    ChildAnchor::BottomLeft,
+                ),
+            );
+        }
         if self.is_mode_menu_open {
             stack.add_positioned_overlay_child(
                 self.render_mode_menu(&look, app),
@@ -2237,17 +3220,92 @@ impl TypedActionView for ComposerView {
                 self.session
                     .update(ctx, |session, ctx| session.interrupt(ctx));
             }
-            ComposerAction::AttachImage => self.pick_images(ctx),
+            ComposerAction::AttachFiles => self.pick_files(ctx),
             ComposerAction::RemoveImage(index) => {
                 if *index < self.images.len() {
-                    self.images.remove(*index);
+                    let image = self.images.remove(*index);
+                    self.remove_tokens(
+                        TokenId {
+                            kind: TokenKind::Image,
+                            number: image.number,
+                        },
+                        ctx,
+                    );
+                    self.renumber(TokenKind::Image, ctx);
                     ctx.notify();
                 }
             }
+            ComposerAction::RemoveFile(index) => {
+                if *index < self.files.len() {
+                    let file = self.files.remove(*index);
+                    self.remove_tokens(
+                        TokenId {
+                            kind: TokenKind::File,
+                            number: file.number,
+                        },
+                        ctx,
+                    );
+                    self.renumber(TokenKind::File, ctx);
+                    ctx.notify();
+                }
+            }
+            ComposerAction::OpenDiff => match self.git.as_slice() {
+                [] => {}
+                [status] => ctx.emit(ComposerEvent::OpenDiff {
+                    repo_root: status.repo_root.clone(),
+                }),
+                [_, _, ..] => {
+                    if self.is_git_menu_open {
+                        self.close_popovers(ctx);
+                    } else if !self.just_closed_popovers() {
+                        self.picker = None;
+                        self.is_mode_menu_open = false;
+                        self.is_artifact_kind_menu_open = false;
+                        self.is_git_menu_open = true;
+                        ctx.notify();
+                    }
+                }
+            },
+            ComposerAction::OpenRepoDiff(index) => {
+                if let Some(status) = self.git.get(*index) {
+                    ctx.emit(ComposerEvent::OpenDiff {
+                        repo_root: status.repo_root.clone(),
+                    });
+                }
+                self.close_popovers(ctx);
+            }
             ComposerAction::RemoveMention(index) => {
                 if *index < self.mentions.len() {
-                    self.mentions.remove(*index);
+                    let mention = self.mentions.remove(*index);
+                    self.remove_tokens(
+                        TokenId {
+                            kind: TokenKind::Mention,
+                            number: mention.number,
+                        },
+                        ctx,
+                    );
+                    self.renumber(TokenKind::Mention, ctx);
                     ctx.notify();
+                }
+            }
+            ComposerAction::RemovePasted(index) => {
+                if *index < self.pasted.len() {
+                    let pasted = self.pasted.remove(*index);
+                    self.remove_tokens(
+                        TokenId {
+                            kind: TokenKind::Pasted,
+                            number: pasted.number,
+                        },
+                        ctx,
+                    );
+                    self.renumber(TokenKind::Pasted, ctx);
+                    ctx.notify();
+                }
+            }
+            ComposerAction::ExpandPasted(index) => {
+                if *index < self.pasted.len() {
+                    let pasted = self.pasted.remove(*index);
+                    self.expand_pasted(pasted, ctx);
                 }
             }
             ComposerAction::ToggleModeMenu => {
