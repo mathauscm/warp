@@ -11,60 +11,6 @@ use warpui::{
 
 use super::*;
 use crate::appearance::Appearance;
-use crate::workspaces::workspace::{BillingMetadata, CustomerType};
-
-fn billing_metadata(customer_type: CustomerType) -> BillingMetadata {
-    BillingMetadata {
-        customer_type,
-        ..Default::default()
-    }
-}
-
-#[test]
-fn paid_workspace_without_team_shows_only_workspace_badge() {
-    let billing_metadata = billing_metadata(CustomerType::Enterprise);
-
-    let presentation = plan_header_presentation(Some(&billing_metadata), false, false);
-
-    assert_eq!(presentation.badge_label.as_deref(), Some("Enterprise"));
-    assert!(!presentation.show_personal_upgrade);
-}
-
-#[test]
-fn free_workspace_without_team_shows_free_badge_once() {
-    let billing_metadata = billing_metadata(CustomerType::Free);
-
-    let presentation = plan_header_presentation(Some(&billing_metadata), false, false);
-
-    assert_eq!(presentation.badge_label.as_deref(), Some("Free"));
-    assert!(presentation.show_personal_upgrade);
-}
-
-#[test]
-fn paid_workspace_with_team_shows_only_workspace_badge() {
-    let billing_metadata = billing_metadata(CustomerType::Enterprise);
-
-    let presentation = plan_header_presentation(Some(&billing_metadata), true, false);
-
-    assert_eq!(presentation.badge_label.as_deref(), Some("Enterprise"));
-    assert!(!presentation.show_personal_upgrade);
-}
-
-#[test]
-fn anonymous_account_shows_free_badge_once() {
-    let presentation = plan_header_presentation(None, false, true);
-
-    assert_eq!(presentation.badge_label.as_deref(), Some("Free"));
-    assert!(presentation.show_personal_upgrade);
-}
-
-#[test]
-fn signed_in_account_without_workspace_shows_free_badge_once() {
-    let presentation = plan_header_presentation(None, false, false);
-
-    assert_eq!(presentation.badge_label.as_deref(), Some("Free"));
-    assert!(presentation.show_personal_upgrade);
-}
 
 // ── MatchData behavior ──────────────────────────────────────────────────────
 
@@ -153,8 +99,10 @@ const ALL_SECTIONS: &[SettingsSection] = &[
 /// Sections whose user-facing Display label has deliberately diverged from the
 /// slug it was seeded from, because the slug is a stored contract that the
 /// rename must not follow.
-const SECTIONS_WITH_RENAMED_DISPLAY_LABELS: &[SettingsSection] =
-    &[SettingsSection::WarpCloudAgentAPIKeys];
+const SECTIONS_WITH_RENAMED_DISPLAY_LABELS: &[SettingsSection] = &[
+    SettingsSection::WarpCloudAgentAPIKeys,
+    SettingsSection::BillingAndUsage,
+];
 
 #[test]
 fn all_sections_list_is_exhaustive() {
@@ -242,6 +190,8 @@ fn renamed_sections_keep_the_slug_they_were_seeded_with() {
         SettingsSection::WarpCloudAgentAPIKeys.slug(),
         "Oz Cloud API Keys"
     );
+    assert_eq!(SettingsSection::BillingAndUsage.to_string(), "Uso");
+    assert_eq!(SettingsSection::BillingAndUsage.slug(), "Billing and usage");
 }
 
 #[test]
@@ -1162,10 +1112,14 @@ fn category_header_with_trailing_element_and_no_subtitle_does_not_panic_flex_lay
 }
 
 #[test]
-fn only_warps_own_agent_pages_are_hidden() {
+fn warps_agent_team_and_sharing_pages_are_hidden() {
     assert!(SettingsSection::WarpAgent.is_hidden());
     assert!(SettingsSection::AgentMCPServers.is_hidden());
     assert!(SettingsSection::WarpCloudAgentAPIKeys.is_hidden());
+    assert!(SettingsSection::Teams.is_hidden());
+    assert!(SettingsSection::Referrals.is_hidden());
+    assert!(SettingsSection::SharedBlocks.is_hidden());
+    assert!(!SettingsSection::BillingAndUsage.is_hidden());
     assert!(!SettingsSection::Appearance.is_hidden());
     assert!(!SettingsSection::Features.is_hidden());
     assert!(!SettingsSection::EditorAndCodeReview.is_hidden());

@@ -44,12 +44,55 @@ fn opens_a_new_tab_when_every_chat_is_busy() {
 
 #[test]
 fn closes_unused_chats_except_the_active_tab() {
-    let chat_tabs = HashMap::from([
-        (id(1), ChatActivity::Unused),
-        (id(2), ChatActivity::Unused),
-        (id(3), ChatActivity::Idle),
-        (id(4), ChatActivity::Drafting),
-        (id(5), ChatActivity::Busy),
-    ]);
-    assert_eq!(unused_chat_tabs_to_close(id(1), &chat_tabs), vec![id(2)]);
+    let panes = [
+        (id(1), Some(ChatActivity::Unused)),
+        (id(2), Some(ChatActivity::Unused)),
+        (id(3), Some(ChatActivity::Idle)),
+        (id(4), Some(ChatActivity::Drafting)),
+        (id(5), Some(ChatActivity::Busy)),
+    ];
+    assert_eq!(unused_chat_tabs_to_close(id(1), &panes), vec![id(2)]);
+}
+
+#[test]
+fn a_new_chat_left_for_another_thread_closes() {
+    // A new chat (tab 2) left for a thread in another tab, then for a terminal tab.
+    let panes = [
+        (id(1), Some(ChatActivity::Idle)),
+        (id(2), Some(ChatActivity::Unused)),
+        (id(3), None),
+    ];
+    assert_eq!(unused_chat_tabs_to_close(id(1), &panes), vec![id(2)]);
+    assert_eq!(unused_chat_tabs_to_close(id(3), &panes), vec![id(2)]);
+}
+
+#[test]
+fn a_new_chat_with_text_typed_stays() {
+    let panes = [
+        (id(1), Some(ChatActivity::Idle)),
+        (id(2), Some(ChatActivity::Drafting)),
+    ];
+    assert!(unused_chat_tabs_to_close(id(1), &panes).is_empty());
+}
+
+#[test]
+fn tabs_of_several_unused_chats_close_whole() {
+    let panes = [
+        (id(1), Some(ChatActivity::Idle)),
+        (id(2), Some(ChatActivity::Unused)),
+        (id(2), Some(ChatActivity::Unused)),
+    ];
+    assert_eq!(unused_chat_tabs_to_close(id(1), &panes), vec![id(2)]);
+}
+
+#[test]
+fn an_unused_chat_sharing_its_tab_stays() {
+    let panes = [
+        (id(1), Some(ChatActivity::Idle)),
+        (id(2), Some(ChatActivity::Unused)),
+        (id(2), None),
+        (id(3), Some(ChatActivity::Unused)),
+        (id(3), Some(ChatActivity::Idle)),
+    ];
+    assert!(unused_chat_tabs_to_close(id(1), &panes).is_empty());
 }

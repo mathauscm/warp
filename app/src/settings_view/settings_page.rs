@@ -32,7 +32,6 @@ use super::SettingsSection;
 use super::about_page::AboutPageView;
 use super::agent_profiles_page::AgentProfilesPageView;
 use super::appearance_page::AppearanceSettingsPageView;
-use super::billing_and_usage_dispatch::BillingAndUsageDispatchView;
 use super::cli_agents_page::CLIAgentsPageView;
 use super::code_editor_review_page::EditorAndCodeReviewPageView;
 use super::code_indexing_page::CodeIndexingPageView;
@@ -47,6 +46,7 @@ use super::referrals_page::ReferralsPageView;
 use super::scripting_page::ScriptingSettingsPageView;
 use super::show_blocks_view::ShowBlocksView;
 use super::teams_page::TeamsPageView;
+use super::usage_page::UsagePageView;
 use super::warp_agent_page::WarpAgentPageView;
 use super::warp_drive_page::WarpDriveSettingsPageView;
 use super::warpify_page::WarpifyPageView;
@@ -127,7 +127,7 @@ pub enum SettingsPageViewHandle {
     Knowledge(ViewHandle<KnowledgePageView>),
     CLIAgents(ViewHandle<CLIAgentsPageView>),
     CloudEnvironments(ViewHandle<EnvironmentsPageView>),
-    BillingAndUsage(ViewHandle<BillingAndUsageDispatchView>),
+    BillingAndUsage(ViewHandle<UsagePageView>),
     MCPServers(ViewHandle<MCPServersSettingsPageView>),
     WarpDrive(ViewHandle<WarpDriveSettingsPageView>),
 }

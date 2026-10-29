@@ -29,7 +29,7 @@ use warpui::color::ColorU;
 use warpui::text::point::Point;
 use warpui::text::words::is_default_word_boundary;
 use warpui::text::{BufferIndex, TextBuffer};
-use warpui::text_layout::TextStyle;
+use warpui::text_layout::{TextBorder, TextStyle};
 use warpui::{Entity, ModelContext};
 /// The public interfaces that we expose to the model.
 /// This should be a very limited set of APIs and should
@@ -335,6 +335,15 @@ pub struct TextStyleOperation {
     syntax_color: StyleOperation,
     background_color: StyleOperation,
     error_underline_color: StyleOperation,
+    border: BorderOperation,
+}
+
+/// How a [`TextStyleOperation`] changes a text's border.
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+enum BorderOperation {
+    Set(TextBorder),
+    Clear,
+    None,
 }
 
 impl Default for TextStyleOperation {
@@ -350,6 +359,7 @@ impl TextStyleOperation {
             syntax_color: StyleOperation::None,
             background_color: StyleOperation::None,
             error_underline_color: StyleOperation::None,
+            border: BorderOperation::None,
         }
     }
 
@@ -388,6 +398,11 @@ impl TextStyleOperation {
         text_style.error_underline_color = text_style_operation
             .error_underline_color
             .get_result_color(text_style.error_underline_color);
+        text_style.border = match text_style_operation.border {
+            BorderOperation::Set(border) => Some(border),
+            BorderOperation::Clear => None,
+            BorderOperation::None => text_style.border,
+        };
         text_style
     }
 
@@ -439,12 +454,23 @@ impl TextStyleOperation {
         self
     }
 
+    pub fn set_border(mut self, border: TextBorder) -> Self {
+        self.border = BorderOperation::Set(border);
+        self
+    }
+
+    pub fn clear_border(mut self) -> Self {
+        self.border = BorderOperation::Clear;
+        self
+    }
+
     pub fn clear_all() -> Self {
         Self {
             foreground_color: StyleOperation::Clear,
             syntax_color: StyleOperation::Clear,
             background_color: StyleOperation::Clear,
             error_underline_color: StyleOperation::Clear,
+            border: BorderOperation::Clear,
         }
     }
 

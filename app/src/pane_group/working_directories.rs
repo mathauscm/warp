@@ -471,6 +471,7 @@ impl WorkingDirectoriesModel {
     }
 
     /// Remove any code review view state that is not active in any of the terminal views that belong to this pane group.
+    /// Repositories of the pane group without a terminal, like a native chat's, keep theirs.
     fn remove_inactive_code_reviews(&mut self, pane_group_id: EntityId) {
         let Some(code_review_views) = self.code_review_views.get_mut(&pane_group_id) else {
             return;
@@ -479,8 +480,12 @@ impl WorkingDirectoriesModel {
         let Some(terminal_mapping) = self.directory_to_terminal.get(&pane_group_id) else {
             return;
         };
+        let repositories = self.repository_roots.get(pane_group_id);
 
-        code_review_views.retain(|path, _| terminal_mapping.contains_key(path));
+        code_review_views.retain(|path, _| {
+            terminal_mapping.contains_key(path)
+                || repositories.is_some_and(|repositories| repositories.contains(path))
+        });
     }
 
     /// Get an existing CodeReviewView for a specific repository in a pane group.

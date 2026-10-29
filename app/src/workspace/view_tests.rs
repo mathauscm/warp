@@ -584,11 +584,10 @@ fn test_theme_chooser_does_not_suppress_tab_bar_traffic_light_padding() {
     });
 }
 
-/// Regression for account-first onboarding users who select Warp Drive and
-/// conversation history, skip signup, and create an account later. The stored
-/// preferences should remain true while unavailable, then take effect
-/// automatically as account and AI availability change—without an off/on
-/// toggle.
+/// Regression for account-first onboarding users who select Warp Drive and conversation history,
+/// skip signup, and create an account later. The stored preferences should remain true while
+/// unavailable, then take effect automatically as account and AI availability change—without an
+/// off/on toggle. Neither view is a tools-panel tab; both are only reachable through their actions.
 #[test]
 fn test_tools_panel_preferences_activate_after_signup_and_ai_enablement() {
     let _skip_anon_guard = FeatureFlag::SkipFirebaseAnonymousUser.override_enabled(true);
@@ -625,16 +624,16 @@ fn test_tools_panel_preferences_activate_after_signup_and_ai_enablement() {
         let workspace = mock_workspace(&mut app);
         workspace.update(&mut app, |workspace, ctx| {
             assert!(
-                workspace
+                !workspace
                     .left_panel_views
                     .contains(&ToolPanelView::WarpDrive),
-                "the stored preference should keep the locked Warp Drive entry visible"
+                "Warp Drive is never a tools-panel tab"
             );
             assert!(
-                workspace
+                !workspace
                     .left_panel_views
                     .contains(&ToolPanelView::ConversationListView),
-                "the stored preference should keep the locked conversations entry visible"
+                "agent conversations are never a tools-panel tab"
             );
             workspace.left_panel_view.update(ctx, |left_panel, ctx| {
                 left_panel.handle_action_with_force_open(&LeftPanelAction::WarpDrive, false, ctx);
@@ -695,18 +694,6 @@ fn test_tools_panel_preferences_activate_after_signup_and_ai_enablement() {
                 &AuthManagerEvent::AuthComplete,
                 ctx,
             );
-            assert!(
-                workspace
-                    .left_panel_views
-                    .contains(&ToolPanelView::WarpDrive),
-                "Drive entry remains visible and unlocks after signup"
-            );
-            assert!(
-                workspace
-                    .left_panel_views
-                    .contains(&ToolPanelView::ConversationListView),
-                "conversation entry remains visible while waiting for AI"
-            );
             assert!(!workspace.auth_state.is_anonymous_or_logged_out());
             assert!(WarpDriveSettings::is_warp_drive_enabled(ctx));
             assert!(!AISettings::as_ref(ctx).is_conversation_history_enabled(ctx));
@@ -741,11 +728,6 @@ fn test_tools_panel_preferences_activate_after_signup_and_ai_enablement() {
             });
         });
         workspace.update(&mut app, |workspace, ctx| {
-            assert!(
-                workspace
-                    .left_panel_views
-                    .contains(&ToolPanelView::ConversationListView)
-            );
             workspace.left_panel_view.update(ctx, |left_panel, ctx| {
                 left_panel.handle_action_with_force_open(
                     &LeftPanelAction::ConversationListView,
@@ -760,23 +742,6 @@ fn test_tools_panel_preferences_activate_after_signup_and_ai_enablement() {
         });
         app.read(|ctx| {
             assert!(AISettings::as_ref(ctx).is_conversation_history_enabled(ctx));
-        });
-
-        // The raw setting still controls whether the toolbelt entry exists.
-        app.update(|ctx| {
-            AISettings::handle(ctx).update(ctx, |settings, ctx| {
-                settings
-                    .show_conversation_history
-                    .set_value(false, ctx)
-                    .expect("hide conversation history");
-            });
-        });
-        workspace.read(&app, |workspace, _| {
-            assert!(
-                !workspace
-                    .left_panel_views
-                    .contains(&ToolPanelView::ConversationListView)
-            );
         });
     });
 }
@@ -5295,95 +5260,6 @@ fn test_pin_tab_on_grouped_tab_extracts_then_pins() {
             assert_eq!(workspace.tabs[2].pane_group.id(), id2);
             assert!(workspace.tabs[2].group_id.is_none());
             assert!(!workspace.tabs[2].pinned);
-        });
-    });
-}
-
-/// Regression for the tools-panel tab visibility toggles surfaced in the
-/// Appearance settings page: toggling a tab's backing setting must add/remove
-/// that tab from the tools panel live, and re-enabling Warp Drive must make it
-/// selectable again (the original report was that Warp Drive could vanish from
-/// the tools panel with no way back).
-#[test]
-fn test_tools_panel_warp_drive_toggle_updates_available_views() {
-    // Force the non-anonymous path so `is_warp_drive_enabled` follows the
-    // `enable_warp_drive` setting rather than the auth state.
-    let _skip_anon_guard = FeatureFlag::SkipFirebaseAnonymousUser.override_enabled(false);
-
-    App::test((), |mut app| async move {
-        initialize_app(&mut app);
-        let workspace = mock_workspace(&mut app);
-
-        // Warp Drive is enabled by default, so it is an available tools-panel
-        // tab and can be made the active view.
-        workspace.update(&mut app, |workspace, ctx| {
-            assert!(
-                workspace
-                    .left_panel_views
-                    .contains(&ToolPanelView::WarpDrive),
-                "Warp Drive should be an available tools-panel tab by default"
-            );
-            workspace.left_panel_view.update(ctx, |lp, ctx| {
-                lp.handle_action_with_force_open(&LeftPanelAction::WarpDrive, false, ctx);
-            });
-            assert_eq!(
-                workspace.left_panel_view.as_ref(ctx).active_view(),
-                ToolPanelView::WarpDrive,
-                "Warp Drive should be selectable as the active view"
-            );
-        });
-
-        // Turning the toggle off (via its backing setting) removes Warp Drive
-        // from the tools panel; if other tabs remain the active view falls back
-        // to one of them.
-        app.update(|ctx| {
-            WarpDriveSettings::handle(ctx).update(ctx, |settings, ctx| {
-                settings
-                    .enable_warp_drive
-                    .set_value(false, ctx)
-                    .expect("disable warp drive");
-            });
-        });
-        workspace.update(&mut app, |workspace, ctx| {
-            assert!(
-                !workspace
-                    .left_panel_views
-                    .contains(&ToolPanelView::WarpDrive),
-                "Disabling the setting should remove Warp Drive from the tools panel"
-            );
-            if !workspace.left_panel_views.is_empty() {
-                assert_ne!(
-                    workspace.left_panel_view.as_ref(ctx).active_view(),
-                    ToolPanelView::WarpDrive,
-                    "Active view should fall back to a remaining tab when Warp Drive is removed"
-                );
-            }
-        });
-
-        // Re-enabling restores Warp Drive as a selectable tab.
-        app.update(|ctx| {
-            WarpDriveSettings::handle(ctx).update(ctx, |settings, ctx| {
-                settings
-                    .enable_warp_drive
-                    .set_value(true, ctx)
-                    .expect("re-enable warp drive");
-            });
-        });
-        workspace.update(&mut app, |workspace, ctx| {
-            assert!(
-                workspace
-                    .left_panel_views
-                    .contains(&ToolPanelView::WarpDrive),
-                "Re-enabling the setting should restore Warp Drive to the tools panel"
-            );
-            workspace.left_panel_view.update(ctx, |lp, ctx| {
-                lp.handle_action_with_force_open(&LeftPanelAction::WarpDrive, false, ctx);
-            });
-            assert_eq!(
-                workspace.left_panel_view.as_ref(ctx).active_view(),
-                ToolPanelView::WarpDrive,
-                "Warp Drive should be selectable again after re-enabling"
-            );
         });
     });
 }

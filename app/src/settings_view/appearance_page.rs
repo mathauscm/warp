@@ -16,6 +16,7 @@ use warpui::elements::{
     Shrinkable, Text, Wrap,
 };
 use warpui::fonts::{FamilyId, FontInfo, Weight};
+use warpui::keymap::macros::id;
 use warpui::keymap::{ContextPredicate, FixedBinding};
 use warpui::platform::{
     Cursor, FilePickerConfiguration, GraphicsBackend, SystemTheme, WindowBackdrop,
@@ -41,13 +42,15 @@ use super::settings_page::{
     ToggleState, build_reset_button, render_body_item, render_body_item_label,
     render_dropdown_item,
 };
-use super::{SettingsAction, SettingsSection, ToggleSettingActionPair, flags};
+use super::{
+    SettingActionPairContexts, SettingActionPairDescriptions, SettingsAction, SettingsSection,
+    ToggleSettingActionPair, flags,
+};
 use crate::appearance::{Appearance, AppearanceEvent};
 use crate::channel::{Channel, ChannelState};
 use crate::context_chips::ChipAvailability;
 use crate::context_chips::prompt::{Prompt, PromptEvent};
 use crate::context_chips::renderer::{ChipDragState, Renderer as ContextChipRenderer};
-use crate::drive::settings::WarpDriveSettings;
 use crate::editor::{
     EditOrigin, EditorView, Event as EditorEvent, InteractionState, SingleLineEditorOptions,
     TextOptions,
@@ -64,8 +67,8 @@ use crate::settings::{
     CursorDisplayType, DEFAULT_MONOSPACE_FONT_NAME, EnforceMinimumContrast, FocusPaneOnHover,
     FontSettings, FontSettingsChangedEvent, GPUSettings, InputBoxType, InputModeSettings,
     InputModeState, InputSettings, InputSettingsChangedEvent, MonospaceFontName, PaneSettings,
-    ShouldDimInactivePanes, ThemeSettings, UseSystemTheme, UseThinStrokes, VoiceInputEnabled,
-    active_theme_kind, respect_system_theme,
+    ShouldDimInactivePanes, ShowChatUsageInTitleBar, ThemeSettings, UseSystemTheme, UseThinStrokes,
+    VoiceInputEnabled, active_theme_kind, respect_system_theme,
 };
 use crate::terminal::block_list_viewport::InputMode;
 use crate::terminal::blockgrid_element::BlockGridElement;
@@ -314,6 +317,21 @@ pub fn init_actions_from_parent_view<T: Action + Clone>(
         flags::OPEN_WINDOWS_AT_CUSTOM_SIZE_FLAG,
     ));
 
+    toggle_binding_pairs.push(ToggleSettingActionPair::custom(
+        SettingActionPairDescriptions::new(
+            "Mostrar uso do chat na barra superior",
+            "Ocultar uso do chat na barra superior",
+        ),
+        builder(SettingsAction::AppearancePageToggle(
+            AppearancePageAction::ToggleChatUsageInTitleBar,
+        )),
+        SettingActionPairContexts::new(
+            context.clone() & !id!(flags::CHAT_USAGE_IN_TITLE_BAR_FLAG),
+            context.clone() & id!(flags::CHAT_USAGE_IN_TITLE_BAR_FLAG),
+        ),
+        None,
+    ));
+
     toggle_binding_pairs.push(ToggleSettingActionPair::new(
         "tools panel visibility across tabs",
         builder(SettingsAction::AppearancePageToggle(
@@ -552,11 +570,10 @@ pub enum AppearancePageAction {
     SetClaudeChatFontSize(ClaudeChatFontSize),
     SetStartupScreen(StartupScreen),
     ToggleVoiceInput,
+    ToggleChatUsageInTitleBar,
     ToggleLeftPanelVisibility,
     ToggleToolsPanelProjectExplorer,
     ToggleToolsPanelGlobalSearch,
-    ToggleToolsPanelWarpDrive,
-    ToggleToolsPanelConversationHistory,
     SetEnforceMinimumContrast(EnforceMinimumContrast),
     OpenUrl(String),
     ToggleFocusPaneOnHover,
@@ -712,6 +729,15 @@ impl TypedActionView for AppearanceSettingsPageView {
                     report_if_error!(settings.startup_screen.set_value(*screen, ctx));
                 });
             }
+            ToggleChatUsageInTitleBar => {
+                ThemeSettings::handle(ctx).update(ctx, |settings, ctx| {
+                    report_if_error!(
+                        settings
+                            .show_chat_usage_in_title_bar
+                            .toggle_and_save_value(ctx)
+                    );
+                });
+            }
             ToggleVoiceInput => {
                 AISettings::handle(ctx).update(ctx, |settings, ctx| {
                     report_if_error!(
@@ -738,22 +764,6 @@ impl TypedActionView for AppearanceSettingsPageView {
             ToggleToolsPanelGlobalSearch => {
                 CodeSettings::handle(ctx).update(ctx, |settings, ctx| {
                     report_if_error!(settings.show_global_search.toggle_and_save_value(ctx));
-                });
-                ctx.notify();
-            }
-            ToggleToolsPanelWarpDrive => {
-                WarpDriveSettings::handle(ctx).update(ctx, |settings, ctx| {
-                    report_if_error!(settings.enable_warp_drive.toggle_and_save_value(ctx));
-                });
-                ctx.notify();
-            }
-            ToggleToolsPanelConversationHistory => {
-                AISettings::handle(ctx).update(ctx, |settings, ctx| {
-                    report_if_error!(
-                        settings
-                            .show_conversation_history
-                            .toggle_and_save_value(ctx)
-                    );
                 });
                 ctx.notify();
             }
@@ -1513,6 +1523,7 @@ impl AppearanceSettingsPageView {
             Box::new(ClaudeChatAccentWidget),
             Box::new(ClaudeChatFontWidget),
             Box::new(ClaudeChatFontSizeWidget),
+            Box::new(ClaudeChatUsageInTitleBarWidget::default()),
         ];
         // The Warp Agent page, where voice input normally lives, is hidden in Picolas Code.
         if cfg!(feature = "voice_input")
@@ -1573,11 +1584,10 @@ impl AppearanceSettingsPageView {
             categories.push(Category::new("Window", window_settings_widgets));
         }
 
-        // Tools panel tab visibility toggles. These control which of the four
-        // tabs appear in the tools panel and mirror the onboarding "Customize
-        // your UI" tools-panel selection (see `crates/onboarding`); each toggle
-        // points at the same backing setting as onboarding so the two surfaces
-        // stay in sync, and the tools panel already recomputes its available
+        // Tools panel tab visibility toggles. These control which tabs appear in the tools panel
+        // and mirror the onboarding "Customize your UI" tools-panel selection (see
+        // `crates/onboarding`); each toggle points at the same backing setting as onboarding so
+        // the two surfaces stay in sync, and the tools panel already recomputes its available
         // views live when these settings change (see `Workspace::new`).
         // Each toggle is gated only on compile-time / feature-flag availability
         // of the corresponding tab (not on transient login/AI state), so the
@@ -1586,13 +1596,9 @@ impl AppearanceSettingsPageView {
         if cfg!(feature = "local_fs") {
             tools_panel_widgets.push(Box::new(ToolsPanelProjectExplorerWidget::default()));
         }
-        if FeatureFlag::AgentViewConversationListView.is_enabled() {
-            tools_panel_widgets.push(Box::new(ToolsPanelConversationHistoryWidget::default()));
-        }
         if cfg!(feature = "local_fs") && FeatureFlag::GlobalSearch.is_enabled() {
             tools_panel_widgets.push(Box::new(ToolsPanelGlobalSearchWidget::default()));
         }
-        tools_panel_widgets.push(Box::new(ToolsPanelWarpDriveWidget::default()));
         if !tools_panel_widgets.is_empty() {
             categories.push(Category::new("Tools panel", tools_panel_widgets));
         }
@@ -3455,6 +3461,53 @@ impl SettingsWidget for ClaudeChatFontSizeWidget {
 }
 
 #[derive(Default)]
+struct ClaudeChatUsageInTitleBarWidget {
+    switch_state: SwitchStateHandle,
+}
+
+impl SettingsWidget for ClaudeChatUsageInTitleBarWidget {
+    type View = AppearanceSettingsPageView;
+
+    fn search_terms(&self) -> &str {
+        "claude chat uso usage plano plan limite limit semana weekly barra superior title bar \
+         top bar mostrar show"
+    }
+
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        render_body_item::<AppearancePageAction>(
+            "Mostrar uso na barra superior".into(),
+            None,
+            LocalOnlyIconState::for_setting(
+                ShowChatUsageInTitleBar::storage_key(),
+                ShowChatUsageInTitleBar::sync_to_cloud(),
+                &mut view.local_only_icon_tooltip_states.borrow_mut(),
+                app,
+            ),
+            ToggleState::Enabled,
+            appearance,
+            appearance
+                .ui_builder()
+                .switch(self.switch_state.clone())
+                .check(*ThemeSettings::as_ref(app).show_chat_usage_in_title_bar)
+                .build()
+                .on_click(|ctx, _, _| {
+                    ctx.dispatch_typed_action(AppearancePageAction::ToggleChatUsageInTitleBar);
+                })
+                .finish(),
+            Some(
+                "Uso dos limites do plano (5 horas e semana), ao lado dos controles da janela."
+                    .into(),
+            ),
+        )
+    }
+}
+
+#[derive(Default)]
 struct ClaudeChatVoiceInputWidget {
     switch_state: SwitchStateHandle,
 }
@@ -4077,46 +4130,6 @@ impl SettingsWidget for ToolsPanelProjectExplorerWidget {
 }
 
 #[derive(Default)]
-struct ToolsPanelConversationHistoryWidget {
-    switch_state: SwitchStateHandle,
-}
-
-impl SettingsWidget for ToolsPanelConversationHistoryWidget {
-    type View = AppearanceSettingsPageView;
-
-    fn search_terms(&self) -> &str {
-        "tools panel tabs conversation history agent conversations left panel visibility"
-    }
-
-    fn render(
-        &self,
-        _view: &Self::View,
-        appearance: &Appearance,
-        app: &AppContext,
-    ) -> Box<dyn Element> {
-        render_body_item::<AppearancePageAction>(
-            "Agent conversations".to_string(),
-            None,
-            LocalOnlyIconState::Hidden,
-            ToggleState::Enabled,
-            appearance,
-            appearance
-                .ui_builder()
-                .switch(self.switch_state.clone())
-                .check(*AISettings::as_ref(app).show_conversation_history)
-                .build()
-                .on_click(|evt_ctx, _app, _v2f| {
-                    evt_ctx.dispatch_typed_action(
-                        AppearancePageAction::ToggleToolsPanelConversationHistory,
-                    );
-                })
-                .finish(),
-            Some("Show the agent conversation history tab in the tools panel.".to_string()),
-        )
-    }
-}
-
-#[derive(Default)]
 struct ToolsPanelGlobalSearchWidget {
     switch_state: SwitchStateHandle,
 }
@@ -4151,44 +4164,6 @@ impl SettingsWidget for ToolsPanelGlobalSearchWidget {
                 })
                 .finish(),
             Some("Show the global file search tab in the tools panel.".to_string()),
-        )
-    }
-}
-
-#[derive(Default)]
-struct ToolsPanelWarpDriveWidget {
-    switch_state: SwitchStateHandle,
-}
-
-impl SettingsWidget for ToolsPanelWarpDriveWidget {
-    type View = AppearanceSettingsPageView;
-
-    fn search_terms(&self) -> &str {
-        "tools panel tabs warp drive left panel visibility"
-    }
-
-    fn render(
-        &self,
-        _view: &Self::View,
-        appearance: &Appearance,
-        app: &AppContext,
-    ) -> Box<dyn Element> {
-        render_body_item::<AppearancePageAction>(
-            "Warp Drive".to_string(),
-            None,
-            LocalOnlyIconState::Hidden,
-            ToggleState::Enabled,
-            appearance,
-            appearance
-                .ui_builder()
-                .switch(self.switch_state.clone())
-                .check(*WarpDriveSettings::as_ref(app).enable_warp_drive)
-                .build()
-                .on_click(|evt_ctx, _app, _v2f| {
-                    evt_ctx.dispatch_typed_action(AppearancePageAction::ToggleToolsPanelWarpDrive);
-                })
-                .finish(),
-            Some("Show the Warp Drive tab in the tools panel.".to_string()),
         )
     }
 }

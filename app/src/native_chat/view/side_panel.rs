@@ -1,13 +1,13 @@
-//! The floating cards beside the conversation: where Claude runs (folder, Remote Control), how
+//! The floating cards beside the conversation: where Claude runs (folder, git, Remote Control), how
 //! full its context is, the plan's usage and the MCP connectors. Dragging a card reorders them.
 
 mod connectors;
 mod context;
 mod environment;
-mod format;
+pub(super) mod format;
 mod order;
 mod usage;
-mod widgets;
+pub(super) mod widgets;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -30,6 +30,7 @@ use warpui::{
 
 use self::widgets::Look;
 use super::SidePanelSection;
+use super::composer::git_status::GitStatus;
 use crate::native_chat::design::{self, ChatDesign, ChatDesignEvent};
 use crate::native_chat::session::{ClaudeChatSession, ClaudeChatSessionEvent};
 
@@ -39,7 +40,10 @@ const SCROLLBAR_WIDTH: f32 = 4.;
 const COPIED_FEEDBACK: Duration = Duration::from_millis(1500);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SidePanelEvent {}
+pub enum SidePanelEvent {
+    /// A repository's git row was clicked: show its changes.
+    OpenDiff { repo_root: PathBuf },
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SidePanelAction {
@@ -48,6 +52,7 @@ pub enum SidePanelAction {
     ToggleMemoryFiles,
     ToggleAllConnectors,
     PickFolder,
+    OpenDiff(PathBuf),
     SetRemoteControl(bool),
     OpenUrl(String),
     Copy(String),
@@ -74,6 +79,8 @@ pub struct SidePanelView {
     show_mcp_tools: bool,
     show_memory_files: bool,
     show_all_connectors: bool,
+    /// The git status of each repository the chat works in, as the composer last read it.
+    git: Vec<GitStatus>,
     /// Whether a copy button just copied, to show its check mark.
     copied: bool,
     scroll_state: ClippedScrollStateHandle,
@@ -100,6 +107,7 @@ impl SidePanelView {
             show_mcp_tools: false,
             show_memory_files: false,
             show_all_connectors: false,
+            git: Vec::new(),
             copied: false,
             scroll_state: ClippedScrollStateHandle::new(),
             mouse_states: Default::default(),
@@ -128,6 +136,13 @@ impl SidePanelView {
             session.refresh_usage(ctx);
             session.refresh_mcp_status(ctx);
         });
+    }
+
+    pub fn set_git(&mut self, git: Vec<GitStatus>, ctx: &mut ViewContext<Self>) {
+        if self.git != git {
+            self.git = git;
+            ctx.notify();
+        }
     }
 
     fn is_expanded(&self, section: SidePanelSection) -> bool {
@@ -348,6 +363,9 @@ impl TypedActionView for SidePanelView {
                 ctx.notify();
             }
             SidePanelAction::PickFolder => self.pick_folder(ctx),
+            SidePanelAction::OpenDiff(repo_root) => ctx.emit(SidePanelEvent::OpenDiff {
+                repo_root: repo_root.clone(),
+            }),
             SidePanelAction::SetRemoteControl(enabled) => {
                 let enabled = *enabled;
                 self.session

@@ -613,3 +613,67 @@ fn loads_real_transcripts() {
     );
     println!("{kinds:?}");
 }
+
+#[test]
+fn keeps_attachments_where_a_message_placed_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("inline.jsonl");
+    let image = |data: &str| {
+        serde_json::json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": data},
+        })
+    };
+    let content = serde_json::json!([
+        {"type": "text", "text": "Compare [Imagem 1]"},
+        image("RED"),
+        {"type": "text", "text": " com [Imagem 2], segundo [Arquivo 1: /tmp/a/paper.pdf]"},
+        image("BLUE"),
+        {
+            "type": "document",
+            "source": {"type": "base64", "media_type": "application/pdf", "data": "PDF"},
+        },
+        {
+            "type": "text",
+            "text": "\n\n<pasted_text label=\"Texto colado 1\" lines=\"2\">\nx\ny\n</pasted_text>",
+        },
+    ]);
+    let line = serde_json::json!({
+        "type": "user",
+        "uuid": "u1",
+        "parentUuid": null,
+        "message": {"role": "user", "content": content},
+    });
+    std::fs::write(&path, format!("{line}\n")).unwrap();
+
+    let transcript = load_transcript(&path).unwrap();
+    let TimelineItem::User(message) = &transcript.items[0] else {
+        panic!("expected the user message");
+    };
+    let data: Vec<_> = message
+        .images
+        .iter()
+        .map(|image| image.data.as_deref())
+        .collect();
+    assert_eq!(data, vec![Some("RED"), Some("BLUE")]);
+    assert_eq!(
+        crate::inline::message_layout(&message.text, message.images.len()).parts,
+        vec![
+            crate::inline::MessagePart::Text("Compare".to_owned()),
+            crate::inline::MessagePart::Image(0),
+            crate::inline::MessagePart::Text("com".to_owned()),
+            crate::inline::MessagePart::Image(1),
+            crate::inline::MessagePart::Text(", segundo".to_owned()),
+            crate::inline::MessagePart::File(crate::attachments::AttachedFile {
+                path: "/tmp/a/paper.pdf".to_owned(),
+                name: "paper.pdf".to_owned(),
+                kind: crate::attachments::AttachmentKind::Pdf,
+            }),
+            crate::inline::MessagePart::Pasted {
+                text: "x\ny".to_owned(),
+                lines: 2,
+            },
+        ]
+    );
+    assert_eq!(transcript.title.as_deref(), Some("Compare [Imagem 1]"));
+}

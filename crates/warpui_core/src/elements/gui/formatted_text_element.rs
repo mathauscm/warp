@@ -2021,15 +2021,13 @@ impl Element for FormattedTextElement {
                             return;
                         }
 
-                        let mut row_index = 0;
-                        let mut glyph_accum = 0;
-                        for row in text_frame.lines() {
-                            if row.end_index() > (pos.glyph_index + glyph_offset) - glyph_accum {
-                                break;
-                            }
-                            row_index += 1;
-                            glyph_accum += row.end_index();
-                        }
+                        // Glyph indices count from the start of the frame, not of each row.
+                        let glyph_index = pos.glyph_index + glyph_offset;
+                        let row_index = text_frame
+                            .lines()
+                            .iter()
+                            .position(|row| row.end_index() > glyph_index)
+                            .unwrap_or(text_frame.lines().len());
 
                         saved_glyph_position.position =
                             SavedGlyphPosition::LaidOutTextFramePosition(
@@ -2141,6 +2139,11 @@ impl Element for FormattedTextElement {
                 .take(pos.frame_index)
                 .map(|frame| frame.calculate_frame_height())
                 .sum::<f32>()
+                + if let LaidOutTextFrame::Indented { top_padding, .. } = laid_out_frame {
+                    *top_padding
+                } else {
+                    0.
+                }
                 + frame
                     .lines()
                     .iter()

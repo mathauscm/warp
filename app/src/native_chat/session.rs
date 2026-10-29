@@ -8,9 +8,11 @@ use std::time::{Duration, SystemTime};
 
 use claude_chat::artifacts::{self, ArtifactContext, ArtifactStore};
 use claude_chat::history::{self, LoadedTranscript};
+use claude_chat::inline::{self, ComposedMessage};
 use claude_chat::process::{self, ClaudeProcess, SpawnConfig};
 use claude_chat::protocol::{
-    self, ControlRequestBody, IncomingControlRequest, IncomingRequest, OutgoingImage, StdoutMessage,
+    self, ControlRequestBody, IncomingControlRequest, IncomingRequest, OutgoingBlock,
+    OutgoingImage, StdoutMessage,
 };
 use claude_chat::reducer::{
     ControlReply, Conversation, ConversationChange, ConversationStatus, ReplyPayload,
@@ -21,6 +23,7 @@ use serde_json::{Value, json};
 use warpui::r#async::Timer;
 use warpui::{Entity, ModelContext, SingletonEntity};
 
+use super::ChatWorkspace;
 use crate::terminal::local_shell::LocalShellState;
 
 /// How often MCP servers are polled while some are still connecting.
@@ -118,6 +121,8 @@ pub enum PlanAnswer {
 
 pub struct ClaudeChatSession {
     cwd: PathBuf,
+    /// The Threads panel workspace the chat is in, whose other folders Claude gets access to.
+    workspace: Option<ChatWorkspace>,
     session_id: String,
     /// Whether `session_id` names a saved conversation to resume, rather than a new one.
     resume: bool,
@@ -139,6 +144,16 @@ pub struct ClaudeChatSession {
 impl ClaudeChatSession {
     /// Opens the conversation `session_id` in `cwd`, or a new one.
     pub fn new(cwd: PathBuf, session_id: Option<String>, ctx: &mut ModelContext<Self>) -> Self {
+        Self::new_in_workspace(cwd, None, session_id, ctx)
+    }
+
+    /// [`Self::new`] for a chat in `workspace`, if any.
+    pub fn new_in_workspace(
+        cwd: PathBuf,
+        workspace: Option<ChatWorkspace>,
+        session_id: Option<String>,
+        ctx: &mut ModelContext<Self>,
+    ) -> Self {
         let transcript = session_id.as_deref().and_then(|session_id| {
             let home = claude_home()?;
             let path = history::transcript_path(&home, &cwd, session_id);
@@ -152,6 +167,7 @@ impl ClaudeChatSession {
         let session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let mut session = Self {
             cwd,
+            workspace,
             session_id: session_id.clone(),
             resume,
             has_sent: false,
@@ -179,6 +195,21 @@ impl ClaudeChatSession {
 
     pub fn cwd(&self) -> &Path {
         &self.cwd
+    }
+
+    pub fn workspace(&self) -> Option<&ChatWorkspace> {
+        self.workspace.as_ref()
+    }
+
+    /// Every folder Claude works in: `cwd` first, then the other folders of the chat's workspace.
+    pub fn dirs(&self) -> Vec<&Path> {
+        let extra = self
+            .workspace
+            .iter()
+            .flat_map(|workspace| &workspace.extra_dirs)
+            .map(PathBuf::as_path)
+            .filter(|dir| *dir != self.cwd);
+        std::iter::once(self.cwd.as_path()).chain(extra).collect()
     }
 
     pub fn session_id(&self) -> &str {
@@ -234,6 +265,9 @@ impl ClaudeChatSession {
         config.path_env = path_env;
         config.model = self.model_override.clone();
         config.effort = self.effort_override.clone();
+        if let Some(workspace) = &self.workspace {
+            config.add_dirs = workspace.extra_dirs.clone();
+        }
         if self.resume {
             config.resume = Some(self.session_id.clone());
         } else {
@@ -262,7 +296,7 @@ impl ClaudeChatSession {
         self.request(
             ControlRequestBody::Initialize {
                 sdk_mcp_servers: vec![artifacts::SERVER_NAME.to_owned()],
-                append_system_prompt: Some(APPEND_SYSTEM_PROMPT.to_owned()),
+                append_system_prompt: Some(self.append_system_prompt()),
             },
             ctx,
         );
@@ -273,6 +307,16 @@ impl ClaudeChatSession {
         self.refresh_usage(ctx);
         self.refresh_context_usage(ctx);
         self.poll_mcp_status(MCP_POLL_ATTEMPTS, ctx);
+    }
+
+    fn append_system_prompt(&self) -> String {
+        match &self.workspace {
+            Some(workspace) => format!(
+                "{APPEND_SYSTEM_PROMPT} {}",
+                workspace.system_prompt(&self.cwd)
+            ),
+            None => APPEND_SYSTEM_PROMPT.to_owned(),
+        }
     }
 
     fn fail_to_start(&mut self, error: String, ctx: &mut ModelContext<Self>) {
@@ -473,7 +517,8 @@ impl ClaudeChatSession {
             .iter()
             .find_map(|item| match item {
                 TimelineItem::User(message) if message.command.is_none() => {
-                    let line = message.text.lines().find(|line| !line.trim().is_empty())?;
+                    let text = inline::display_text(&message.text);
+                    let line = text.lines().find(|line| !line.trim().is_empty())?;
                     let mut title: String = line.trim().chars().take(TITLE_MAX_CHARS).collect();
                     if line.trim().chars().count() > TITLE_MAX_CHARS {
                         title.push('…');
@@ -615,22 +660,60 @@ impl ClaudeChatSession {
         images: Vec<OutgoingImage>,
         ctx: &mut ModelContext<Self>,
     ) -> String {
+        let mut blocks: Vec<OutgoingBlock> =
+            images.iter().cloned().map(OutgoingBlock::Image).collect();
+        blocks.push(OutgoingBlock::Text(text.clone()));
+        self.send_composed(
+            None,
+            ComposedMessage {
+                blocks,
+                text,
+                images,
+            },
+            ctx,
+        )
+    }
+
+    /// Sends a message whose text is interleaved with images and documents (like PDFs). With
+    /// `instructions`, they are sent ahead of it, while the conversation shows only the message's
+    /// text (until it's reloaded from the transcript, which has both). Returns the message's uuid.
+    pub fn send_composed(
+        &mut self,
+        instructions: Option<&str>,
+        message: ComposedMessage,
+        ctx: &mut ModelContext<Self>,
+    ) -> String {
         if self.process.is_none() && matches!(self.state, ProcessState::Exited { .. }) {
             self.restart(ctx);
         }
         let uuid = uuid::Uuid::new_v4().to_string();
+        let ComposedMessage {
+            mut blocks,
+            text,
+            images,
+        } = message;
         let attachments = images
-            .iter()
+            .into_iter()
             .map(|image| ImageAttachment {
-                media_type: image.media_type.clone(),
+                media_type: image.media_type,
                 path: None,
-                data: Some(image.data_base64.clone()),
+                data: Some(image.data_base64),
             })
             .collect();
         let changes =
             self.conversation
                 .push_local_user_message(&uuid, &text, attachments, SystemTime::now());
-        self.write(protocol::user_message_line(&uuid, &text, &images));
+        if let Some(instructions) = instructions {
+            match blocks.first_mut() {
+                Some(OutgoingBlock::Text(first)) => {
+                    first.insert_str(0, &format!("{instructions}\n\n"))
+                }
+                Some(OutgoingBlock::Image(_) | OutgoingBlock::Document(_)) | None => {
+                    blocks.insert(0, OutgoingBlock::Text(instructions.to_owned()))
+                }
+            }
+        }
+        self.write(protocol::user_message_line_with_blocks(&uuid, &blocks));
         self.apply_changes(changes, ctx);
         if !self.has_sent {
             self.has_sent = true;
@@ -891,40 +974,6 @@ impl ClaudeChatSession {
     /// reports again when it restarts.
     pub fn chosen_model(&self) -> Option<&str> {
         self.model_override.as_deref()
-    }
-
-    /// Sends `instructions` followed by `text`, while the conversation shows only `text` (until
-    /// it's reloaded from the transcript, which has both).
-    pub fn send_message_with_instructions(
-        &mut self,
-        instructions: &str,
-        text: String,
-        images: Vec<OutgoingImage>,
-        ctx: &mut ModelContext<Self>,
-    ) -> String {
-        if self.process.is_none() && matches!(self.state, ProcessState::Exited { .. }) {
-            self.restart(ctx);
-        }
-        let uuid = uuid::Uuid::new_v4().to_string();
-        let attachments = images
-            .iter()
-            .map(|image| ImageAttachment {
-                media_type: image.media_type.clone(),
-                path: None,
-                data: Some(image.data_base64.clone()),
-            })
-            .collect();
-        let changes =
-            self.conversation
-                .push_local_user_message(&uuid, &text, attachments, SystemTime::now());
-        let sent = format!("{instructions}\n\n{text}");
-        self.write(protocol::user_message_line(&uuid, &sent, &images));
-        self.apply_changes(changes, ctx);
-        if !self.has_sent {
-            self.has_sent = true;
-            ctx.emit(ClaudeChatSessionEvent::SessionIdAssigned);
-        }
-        uuid
     }
 }
 

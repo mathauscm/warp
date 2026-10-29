@@ -19,13 +19,14 @@ define_settings_group!(GeneralSettings, settings: [
     },
     quit_on_last_window_closed: QuitOnLastWindowClosed {
         type: bool,
-        default: false,
+        // Picolas quits with its last window instead of lingering in the background.
+        default: true,
         supported_platforms: SupportedPlatforms::MAC,
         sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
         surface: settings::SettingSurfaces::GUI,
         private: false,
         toml_path: "general.quit_on_last_window_closed",
-        description: "Whether to quit Warp when the last window is closed.",
+        description: "Whether to quit Picolas Code when the last window is closed.",
     },
     restore_session: RestoreSession {
         type: bool,
@@ -39,7 +40,7 @@ define_settings_group!(GeneralSettings, settings: [
     },
     add_app_as_login_item: LoginItem {
         type: bool,
-        default: true,
+        default: false,
         supported_platforms: SupportedPlatforms::OR(
             Box::new(SupportedPlatforms::MAC),
             Box::new(SupportedPlatforms::WINDOWS),
@@ -48,7 +49,7 @@ define_settings_group!(GeneralSettings, settings: [
         surface: settings::SettingSurfaces::GUI,
         private: false,
         toml_path: "general.login_item",
-        description: "Whether to launch Warp automatically when you log in.",
+        description: "Whether to launch Picolas Code automatically when you log in.",
     },
     // Records whether the app has been added as a login item.
     // If it has, we don't try to add it again unless the user explicitly
@@ -207,10 +208,10 @@ define_settings_group!(GeneralSettings, settings: [
 )]
 pub enum StartupScreen {
     /// A terminal tab.
-    #[default]
     Terminal,
     /// A native Claude chat in the home folder, with the threads list open; restored windows
     /// open the threads list too.
+    #[default]
     Threads,
 }
 

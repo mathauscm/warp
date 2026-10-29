@@ -355,6 +355,96 @@ fn builds_user_messages() {
 }
 
 #[test]
+fn builds_user_message_with_documents() {
+    let line = user_message_line_with_documents(
+        "e7a1",
+        "Resuma\n\n<attached_files>\n/tmp/a/paper.pdf\n</attached_files>",
+        &[OutgoingImage {
+            media_type: "image/png".to_owned(),
+            data_base64: "QUJD".to_owned(),
+        }],
+        &[
+            OutgoingDocument {
+                media_type: "application/pdf".to_owned(),
+                data_base64: "JVBERg==".to_owned(),
+                title: Some("paper.pdf".to_owned()),
+            },
+            OutgoingDocument {
+                media_type: "application/pdf".to_owned(),
+                data_base64: "JVBERg==".to_owned(),
+                title: None,
+            },
+        ],
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&line).unwrap(),
+        json!({
+            "type": "user",
+            "session_id": "",
+            "parent_tool_use_id": null,
+            "uuid": "e7a1",
+            "message": {"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"}},
+                {
+                    "type": "document",
+                    "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERg=="},
+                    "title": "paper.pdf",
+                },
+                {
+                    "type": "document",
+                    "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERg=="},
+                },
+                {"type": "text", "text": "Resuma\n\n<attached_files>\n/tmp/a/paper.pdf\n</attached_files>"},
+            ]},
+        })
+    );
+    assert!(!line.contains('\n'));
+
+    let only_document = user_message_line_with_documents(
+        "f0",
+        "",
+        &[],
+        &[OutgoingDocument {
+            media_type: "application/pdf".to_owned(),
+            data_base64: "JVBERg==".to_owned(),
+            title: None,
+        }],
+    );
+    let content = &serde_json::from_str::<Value>(&only_document).unwrap()["message"]["content"];
+    assert_eq!(content.as_array().map(Vec::len), Some(1));
+}
+
+#[test]
+fn builds_user_message_with_blocks_in_order() {
+    let line = user_message_line_with_blocks(
+        "a1",
+        &[
+            OutgoingBlock::Text("Veja [Imagem 1]".to_owned()),
+            OutgoingBlock::Image(OutgoingImage {
+                media_type: "image/png".to_owned(),
+                data_base64: "QUJD".to_owned(),
+            }),
+            OutgoingBlock::Text(" \n ".to_owned()),
+            OutgoingBlock::Document(OutgoingDocument {
+                media_type: "application/pdf".to_owned(),
+                data_base64: "JVBERg==".to_owned(),
+                title: None,
+            }),
+            OutgoingBlock::Text("e isto".to_owned()),
+        ],
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&line).unwrap()["message"]["content"],
+        json!([
+            {"type": "text", "text": "Veja [Imagem 1]"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"}},
+            {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERg=="}},
+            {"type": "text", "text": "e isto"},
+        ])
+    );
+}
+
+#[test]
 fn builds_control_requests() {
     let cases = [
         (

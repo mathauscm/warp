@@ -13,8 +13,8 @@ use warpui::{AppContext, EntityId, SingletonEntity, ViewContext, ViewHandle};
 
 use super::Workspace;
 use crate::app_state::{ClaudeChatPaneSnapshot, LeafContents, LeafSnapshot, PaneNodeSnapshot};
-use crate::native_chat::ClaudeChatView;
 use crate::native_chat::registry::ChatActivity;
+use crate::native_chat::{ChatWorkspace, ClaudeChatView};
 use crate::pane_group::{ClaudeChatPane, PaneGroup, PaneId, PanesLayout};
 use crate::workspace::WorkspaceRegistry;
 use crate::workspace::util::PaneViewLocator;
@@ -72,7 +72,10 @@ impl Workspace {
         let Some(tab_index) = self.tab_index_of(pane_group_id) else {
             return false;
         };
-        let moves_folder = view.as_ref(ctx).session().as_ref(ctx).cwd() != snapshot.cwd;
+        let session = view.as_ref(ctx).session().as_ref(ctx);
+        let workspace_id = |workspace: Option<&ChatWorkspace>| workspace.map(|w| w.id.clone());
+        let moves_folder = session.cwd() != snapshot.cwd
+            || workspace_id(session.workspace()) != workspace_id(snapshot.workspace.as_ref());
         let pane_group = self.tabs[tab_index].pane_group.clone();
         let pane = ClaudeChatPane::new(snapshot, ctx);
         let replaced = pane_group.update(ctx, |group, ctx| {
@@ -133,10 +136,11 @@ impl Workspace {
     /// Closes the unused chats left behind once the active tab changes. Deferred, since tabs
     /// change while they're being added and removed.
     pub(super) fn schedule_unused_chat_cleanup(&mut self, ctx: &mut ViewContext<Self>) {
-        ctx.spawn(async {}, |me, (), ctx| me.close_unused_chat_tabs(ctx));
+        ctx.spawn(async {}, |me, (), ctx| me.close_unused_chats(ctx));
     }
 
-    fn close_unused_chat_tabs(&mut self, ctx: &mut ViewContext<Self>) {
+    /// Closes the tabs outside the active one that show nothing but never-used chats.
+    fn close_unused_chats(&mut self, ctx: &mut ViewContext<Self>) {
         let Some(active) = self
             .tabs
             .get(self.active_tab_index)
@@ -144,12 +148,7 @@ impl Workspace {
         else {
             return;
         };
-        let activities = self
-            .chat_tabs(ctx)
-            .into_iter()
-            .map(|(id, (_, view))| (id, view.as_ref(ctx).activity(ctx)))
-            .collect();
-        let closing = unused_chat_tabs_to_close(active, &activities);
+        let closing = unused_chat_tabs_to_close(active, &self.panes_on_screen(ctx));
         if closing.is_empty() {
             return;
         }
@@ -159,6 +158,24 @@ impl Workspace {
             }
         }
         ctx.notify();
+    }
+
+    /// Every pane on screen in this window by its tab, with what it holds when it's a native chat.
+    fn panes_on_screen(&self, app: &AppContext) -> Vec<(EntityId, Option<ChatActivity>)> {
+        self.tabs
+            .iter()
+            .flat_map(|tab| {
+                let pane_group = tab.pane_group.as_ref(app);
+                pane_group
+                    .visible_pane_ids()
+                    .into_iter()
+                    .map(move |pane_id| {
+                        let activity = chat_view(pane_group, pane_id, app)
+                            .map(|view| view.as_ref(app).activity(app));
+                        (tab.pane_group.id(), activity)
+                    })
+            })
+            .collect()
     }
 
     /// Closes the native chat showing `session_id`, in whichever window holds it, ending its
@@ -200,10 +217,9 @@ impl Workspace {
         let session = view.as_ref(ctx).session().clone();
         session.as_ref(ctx).kill();
         if is_last_tab {
-            let pane = ClaudeChatPane::new(
-                ClaudeChatPaneSnapshot::new(session.as_ref(ctx).cwd().to_path_buf()),
-                ctx,
-            );
+            let mut snapshot = ClaudeChatPaneSnapshot::new(session.as_ref(ctx).cwd().to_path_buf());
+            snapshot.workspace = session.as_ref(ctx).workspace().cloned();
+            let pane = ClaudeChatPane::new(snapshot, ctx);
             pane_group.update(ctx, |group, ctx| {
                 group.replace_pane(locator.pane_id, pane, false, ctx)
             });
@@ -255,16 +271,28 @@ fn chat_tab_to_reuse(
         .copied()
 }
 
-/// The chat tabs that were never used, other than the active one.
+/// The tabs to close once `active_tab` is shown: the others that show nothing but never-used
+/// chats. `panes` holds every pane on screen by its tab, with what it holds when it's a native
+/// chat. A chat sharing its tab with anything else stays, since closing a pane of a tab in the
+/// background moves that tab's focus around.
 fn unused_chat_tabs_to_close(
-    active: EntityId,
-    chat_tabs: &HashMap<EntityId, ChatActivity>,
+    active_tab: EntityId,
+    panes: &[(EntityId, Option<ChatActivity>)],
 ) -> Vec<EntityId> {
-    chat_tabs
-        .iter()
-        .filter(|(id, activity)| **id != active && **activity == ChatActivity::Unused)
-        .map(|(id, _)| *id)
-        .collect()
+    let mut tabs: Vec<EntityId> = Vec::new();
+    for (tab, _) in panes {
+        if !tabs.contains(tab) {
+            tabs.push(*tab);
+        }
+    }
+    tabs.retain(|tab| {
+        *tab != active_tab
+            && panes
+                .iter()
+                .filter(|(pane_tab, _)| pane_tab == tab)
+                .all(|(_, activity)| *activity == Some(ChatActivity::Unused))
+    });
+    tabs
 }
 
 #[cfg(test)]

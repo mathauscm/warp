@@ -9,7 +9,7 @@ const FREE_SPACE_CATEGORY: &str = "Free space";
 const DEFERRED_SUFFIX: &str = " (deferred)";
 
 /// Token counts the way Claude shows them: `850`, `78.4k`, `120k`, `1M`, `1.5M`.
-pub(super) fn format_tokens(tokens: u64) -> String {
+pub(in crate::native_chat::view) fn format_tokens(tokens: u64) -> String {
     if tokens < 1_000 {
         return tokens.to_string();
     }
@@ -36,7 +36,7 @@ fn trim_decimal(value: f64) -> String {
 }
 
 /// A whole percentage, with `<1%` for a sliver that would otherwise read as empty.
-pub(super) fn format_percent(percent: f64) -> String {
+pub(in crate::native_chat::view) fn format_percent(percent: f64) -> String {
     if percent <= 0. {
         "0%".to_owned()
     } else if percent < 1. {
@@ -60,7 +60,7 @@ pub(super) fn format_share(percent: f64) -> String {
 }
 
 /// When a usage window starts over, like `reinicia em 2h 13m`.
-pub(super) fn format_reset(remaining: Duration) -> String {
+pub(in crate::native_chat::view) fn format_reset(remaining: Duration) -> String {
     let minutes = remaining.as_secs().div_ceil(60);
     if minutes == 0 {
         return "reinicia em instantes".to_owned();
@@ -79,7 +79,7 @@ pub(super) fn format_reset(remaining: Duration) -> String {
 }
 
 /// Dollars in the Brazilian format, like `US$ 0,03`.
-pub(super) fn format_cost(usd: f64) -> String {
+pub(in crate::native_chat::view) fn format_cost(usd: f64) -> String {
     let text = if usd < 0.01 {
         "<0,01".to_owned()
     } else {
@@ -196,14 +196,14 @@ pub(super) struct ContextRow {
 
 /// How full the context window is.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) struct ContextFill {
+pub(in crate::native_chat::view) struct ContextFill {
     pub used: u64,
     pub window: Option<u64>,
     pub percent: Option<f64>,
 }
 
 /// The context fill from the last breakdown, or from the latest API call before there is one.
-pub(super) fn context_fill(
+pub(in crate::native_chat::view) fn context_fill(
     usage: Option<&ContextUsage>,
     live_tokens: Option<u64>,
     live_window: Option<u64>,

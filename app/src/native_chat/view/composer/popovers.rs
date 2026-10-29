@@ -1,5 +1,5 @@
 //! What floats over the composer: the "/" command and "@" file menus, the model and effort
-//! picker and the permission mode menu.
+//! picker, the permission mode menu and the list of a multi-folder chat's repositories.
 
 use warp_core::ui::Icon as WarpIcon;
 use warpui::AppContext;
@@ -13,14 +13,14 @@ use warpui::fonts::{Properties, Weight};
 use warpui::geometry::vector::vec2f;
 use warpui::platform::Cursor;
 
-use super::logic;
 use super::widgets::{Look, icon, svg, with_alpha};
-use super::{ComposerAction, ComposerView, MENU_VISIBLE_ROWS, Menu, PickerPage};
+use super::{ComposerAction, ComposerView, MENU_VISIBLE_ROWS, Menu, PickerPage, git_status, logic};
 
 const PICKER_WIDTH: f32 = 260.;
 const PICKER_PADDING: f32 = 12.;
 const MODELS_MAX_HEIGHT: f32 = 320.;
 const MODE_MENU_WIDTH: f32 = 330.;
+const GIT_MENU_WIDTH: f32 = 300.;
 const SLIDER_HEIGHT: f32 = 18.;
 const SLIDER_WIDTH: f32 = PICKER_WIDTH - 2. * (PICKER_PADDING + 1.);
 const SLIDER_KNOB_SIZE: f32 = 14.;
@@ -623,6 +623,102 @@ impl ComposerView {
         }
         ConstrainedBox::new(self.popover(look, list.finish(), true))
             .with_width(MODE_MENU_WIDTH)
+            .finish()
+    }
+
+    /// The repositories of a chat with several folders, each opening its diff on the right.
+    pub(super) fn render_git_menu(&self, look: &Look) -> Box<dyn Element> {
+        let palette = &look.palette;
+        let sizes = &look.sizes;
+        let mut list = Flex::column()
+            .with_main_axis_size(MainAxisSize::Min)
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_spacing(1.)
+            .with_child(
+                Container::new(look.text(
+                    "Ver alterações de",
+                    sizes.tiny_font_size,
+                    palette.text_faint.0,
+                ))
+                .with_horizontal_padding(8.)
+                .with_vertical_padding(4.)
+                .finish(),
+            );
+        for (index, (status, mouse_state)) in self.git.iter().zip(&self.mouse.git_repos).enumerate()
+        {
+            let row_look = look.clone();
+            let name = status.repo_name();
+            let branch = status.branch.clone();
+            let (added, removed) = git_status::diff_parts(status.lines_added, status.lines_removed);
+            list.add_child(
+                Hoverable::new(mouse_state.clone(), move |state| {
+                    let look = &row_look;
+                    let palette = &look.palette;
+                    let sizes = &look.sizes;
+                    let text = Flex::column()
+                        .with_main_axis_size(MainAxisSize::Min)
+                        .with_cross_axis_alignment(CrossAxisAlignment::Start)
+                        .with_spacing(1.)
+                        .with_child(look.medium_text(
+                            name.clone(),
+                            sizes.small_font_size + 0.5,
+                            palette.text.0,
+                        ))
+                        .with_child(
+                            Flex::row()
+                                .with_main_axis_size(MainAxisSize::Min)
+                                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                                .with_spacing(4.)
+                                .with_child(icon(
+                                    WarpIcon::GitBranch,
+                                    palette.text_faint.0,
+                                    sizes.small_icon_size - 2.,
+                                ))
+                                .with_child(look.text(
+                                    branch.clone(),
+                                    sizes.tiny_font_size,
+                                    palette.text_muted.0,
+                                ))
+                                .finish(),
+                        )
+                        .finish();
+                    let mut row = Flex::row()
+                        .with_main_axis_size(MainAxisSize::Max)
+                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                        .with_spacing(6.)
+                        .with_child(Expanded::new(1., text).finish());
+                    if let Some(added) = &added {
+                        row.add_child(look.medium_text(
+                            added.clone(),
+                            sizes.small_font_size,
+                            palette.diff_added.0,
+                        ));
+                    }
+                    if let Some(removed) = &removed {
+                        row.add_child(look.medium_text(
+                            removed.clone(),
+                            sizes.small_font_size,
+                            palette.diff_removed.0,
+                        ));
+                    }
+                    let mut container = Container::new(row.finish())
+                        .with_horizontal_padding(8.)
+                        .with_vertical_padding(6.)
+                        .with_corner_radius(look.radius(sizes.chip_radius));
+                    if state.is_hovered() {
+                        container = container.with_background_color(palette.surface_hover.0);
+                    }
+                    container.finish()
+                })
+                .with_cursor(Cursor::PointingHand)
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(ComposerAction::OpenRepoDiff(index))
+                })
+                .finish(),
+            );
+        }
+        ConstrainedBox::new(self.popover(look, list.finish(), true))
+            .with_width(GIT_MENU_WIDTH)
             .finish()
     }
 }

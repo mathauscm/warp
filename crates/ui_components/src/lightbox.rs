@@ -181,12 +181,14 @@ impl Component for Lightbox {
                     .finish()
             }
             // No images provided at all.
-            _ if image_count == 0 => Text::new("No images", appearance.ui_font_family(), text_size)
-                .with_color(ColorU::white())
-                .finish(),
+            _ if image_count == 0 => {
+                Text::new("Nenhuma imagem", appearance.ui_font_family(), text_size)
+                    .with_color(ColorU::white())
+                    .finish()
+            }
             // The image bytes failed to load or decode.
             (_, CurrentImageState::Failed) => Text::new(
-                "Failed to load image",
+                "Não foi possível carregar a imagem",
                 appearance.ui_font_family(),
                 text_size,
             )
@@ -309,7 +311,7 @@ impl Component for Lightbox {
 /// and as the `before_load` fallback while the `AssetCache` fetches image bytes.
 fn loading_element(appearance: &Appearance) -> Box<dyn Element> {
     Text::new(
-        "Loading...",
+        "Carregando…",
         appearance.ui_font_family(),
         lightbox_text_size(appearance),
     )

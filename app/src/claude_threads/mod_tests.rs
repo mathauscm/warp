@@ -310,3 +310,174 @@ fn move_to_trash_dir_follows_the_freedesktop_trash_layout() {
     )));
     assert!(trash.join("info/my thread.jsonl.2.trashinfo").is_file());
 }
+
+fn workspace(id: &str, dirs: &[&str]) -> ThreadWorkspace {
+    ThreadWorkspace {
+        id: id.to_owned(),
+        name: id.to_uppercase(),
+        dirs: dirs.iter().map(PathBuf::from).collect(),
+        collapsed: false,
+    }
+}
+
+#[test]
+fn configs_without_workspaces_or_archives_still_load() {
+    let old: ThreadsConfig = toml::from_str(
+        "pinned = [\"a\"]\nrecent_collapsed = true\n\n[[project]]\npath = \"/w/kinbox\"\n\n\
+         [moved]\nb = \"/w/kinbox\"\n",
+    )
+    .unwrap();
+    assert_eq!(old.version, 0);
+    assert!(old.workspaces.is_empty() && old.workspace_threads.is_empty());
+    assert!(old.archived.is_empty() && !old.archived_expanded);
+    assert_eq!(old.pinned, ["a"]);
+    assert_eq!(old.moved[&"b".to_owned()], PathBuf::from("/w/kinbox"));
+}
+
+#[test]
+fn config_with_workspaces_and_archives_round_trips_through_toml() {
+    let config = ThreadsConfig {
+        version: 2,
+        pinned: vec!["a".to_owned()],
+        archived: vec!["old".to_owned()],
+        archived_expanded: true,
+        projects: vec![ThreadProject::new(PathBuf::from("/w/kinbox"))],
+        workspaces: vec![workspace("w1", &["/w/web", "/w/api"])],
+        moved: [("b".to_owned(), PathBuf::from("/w/kinbox"))].into(),
+        workspace_threads: [("c".to_owned(), "w1".to_owned())].into(),
+        ..Default::default()
+    };
+    let text = toml::to_string_pretty(&config).unwrap();
+    assert_eq!(toml::from_str::<ThreadsConfig>(&text).unwrap(), config);
+    // A workspace written without folders yet loads empty.
+    let minimal: ThreadsConfig =
+        toml::from_str("[[workspace]]\nid = \"w1\"\nname = \"Kinbox\"\n").unwrap();
+    assert!(minimal.workspaces[0].dirs.is_empty());
+}
+
+#[test]
+fn archived_threads_are_listed_only_under_archived() {
+    let config = ThreadsConfig {
+        pinned: vec!["pinned".to_owned()],
+        archived: vec!["in-project".to_owned(), "in-workspace".to_owned()],
+        projects: vec![ThreadProject::new(PathBuf::from("/w/kinbox"))],
+        workspaces: vec![workspace("w1", &["/w/web"])],
+        workspace_threads: [("in-workspace".to_owned(), "w1".to_owned())].into(),
+        ..Default::default()
+    };
+    let groups = group_threads(
+        vec![
+            thread("in-project", "/w/kinbox"),
+            thread("in-workspace", "/w/web"),
+            thread("pinned", "/tmp"),
+            thread("recent", "/tmp"),
+        ],
+        &config,
+    );
+    let ids = |threads: &[ClaudeThread]| {
+        threads
+            .iter()
+            .map(|thread| thread.session_id.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&groups.archived), ["in-project", "in-workspace"]);
+    assert_eq!(ids(&groups.pinned), ["pinned"]);
+    assert_eq!(ids(&groups.recent), ["recent"]);
+    assert!(groups.by_project.is_empty() && groups.by_workspace.is_empty());
+}
+
+#[test]
+fn workspace_threads_are_listed_under_their_workspace_before_projects() {
+    let config = ThreadsConfig {
+        projects: vec![ThreadProject::new(PathBuf::from("/w/web"))],
+        workspaces: vec![workspace("w1", &["/w/web", "/w/api"])],
+        workspace_threads: [
+            ("ws".to_owned(), "w1".to_owned()),
+            ("gone".to_owned(), "deleted-workspace".to_owned()),
+        ]
+        .into(),
+        ..Default::default()
+    };
+    let groups = group_threads(
+        vec![
+            thread("ws", "/w/web"),
+            thread("project", "/w/web"),
+            thread("gone", "/w/web/src"),
+        ],
+        &config,
+    );
+    assert_eq!(groups.by_workspace["w1"].len(), 1);
+    assert_eq!(groups.by_workspace["w1"][0].session_id, "ws");
+    let project: Vec<_> = groups.by_project[Path::new("/w/web")]
+        .iter()
+        .map(|thread| thread.session_id.as_str())
+        .collect();
+    assert_eq!(project, ["project", "gone"]);
+}
+
+#[test]
+fn archiving_unpins_and_pinning_unarchives() {
+    let mut config = ThreadsConfig::default();
+    config.toggle_pinned("a");
+    config.toggle_archived("a");
+    assert!(config.is_archived("a") && !config.is_pinned("a"));
+    config.toggle_pinned("a");
+    assert!(config.is_pinned("a") && !config.is_archived("a"));
+    config.toggle_archived("a");
+    config.toggle_archived("a");
+    assert!(!config.is_archived("a") && !config.is_pinned("a"));
+}
+
+#[test]
+fn removing_a_workspace_forgets_its_threads() {
+    let mut config = ThreadsConfig {
+        workspaces: vec![workspace("w1", &["/w/web"]), workspace("w2", &["/w/api"])],
+        ..Default::default()
+    };
+    assert!(config.assign_to_workspace("a", "w1"));
+    assert!(!config.assign_to_workspace("a", "w1"));
+    assert!(!config.assign_to_workspace("b", "missing"));
+    assert!(config.assign_to_workspace("b", "w2"));
+    config.remove_workspace("w1");
+    assert!(config.workspace_of("a").is_none());
+    assert_eq!(config.workspace_of("b").map(|w| w.id.as_str()), Some("w2"));
+    config.forget_thread("b");
+    assert!(config.workspace_threads.is_empty());
+}
+
+#[test]
+fn workspace_chats_get_every_other_folder() {
+    let mut workspace = workspace("w1", &["/w/web"]);
+    assert!(workspace.add_dirs([PathBuf::from("/w/api"), PathBuf::from("/w/web")]));
+    assert!(!workspace.add_dirs([PathBuf::from("/w/api")]));
+    assert_eq!(workspace.primary_dir(), Some(Path::new("/w/web")));
+    let chat = workspace.chat_workspace(Path::new("/w/api"));
+    assert_eq!(chat.id, "w1");
+    assert_eq!(chat.extra_dirs, [PathBuf::from("/w/web")]);
+}
+
+#[test]
+fn git_branch_reads_head_of_repositories_and_worktrees() {
+    let root = tempfile::tempdir().unwrap();
+    let repo = root.path().join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::create_dir_all(repo.join("src/deep")).unwrap();
+    std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/feat/login\n").unwrap();
+    assert_eq!(git_branch(&repo).as_deref(), Some("feat/login"));
+    assert_eq!(
+        git_branch(&repo.join("src/deep")).as_deref(),
+        Some("feat/login")
+    );
+
+    let worktree = root.path().join("worktree");
+    let worktree_git = repo.join(".git/worktrees/wt");
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::create_dir_all(&worktree_git).unwrap();
+    std::fs::write(
+        &worktree.join(".git"),
+        format!("gitdir: {}\n", worktree_git.display()),
+    )
+    .unwrap();
+    std::fs::write(worktree_git.join("HEAD"), "0123456789abcdef\n").unwrap();
+    assert_eq!(git_branch(&worktree).as_deref(), Some("0123456"));
+}

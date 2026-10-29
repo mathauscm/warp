@@ -707,6 +707,8 @@ pub struct ClaudeChatPane {
     pub kind: String,
     pub session_id: Option<String>,
     pub cwd: String,
+    /// The chat's workspace, as JSON.
+    pub workspace: Option<String>,
 }
 
 #[derive(Insertable)]
@@ -715,6 +717,7 @@ pub struct NewClaudeChatPane {
     pub id: i32,
     pub session_id: Option<String>,
     pub cwd: String,
+    pub workspace: Option<String>,
 }
 
 #[derive(Insertable)]

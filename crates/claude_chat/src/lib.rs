@@ -2,7 +2,9 @@
 //! for a native chat UI. Free of UI code so it builds and tests quickly.
 
 pub mod artifacts;
+pub mod attachments;
 pub mod history;
+pub mod inline;
 pub mod presentation;
 pub mod process;
 pub mod protocol;

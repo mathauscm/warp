@@ -1541,24 +1541,77 @@ pub struct OutgoingImage {
     pub data_base64: String,
 }
 
+/// A document, like a PDF, to attach to a user message as a base64 `document` block.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutgoingDocument {
+    pub media_type: String,
+    pub data_base64: String,
+    /// The file name, shown to Claude as the document's title.
+    pub title: Option<String>,
+}
+
 /// A user message. `uuid` becomes the transcript id of the message and is echoed back as
 /// `user_message_uuid` / `command_lifecycle.command_uuid`.
 pub fn user_message_line(uuid: &str, text: &str, images: &[OutgoingImage]) -> String {
-    let mut content: Vec<Value> = images
+    user_message_line_with_documents(uuid, text, images, &[])
+}
+
+/// A user message with images and documents, which come before the text.
+pub fn user_message_line_with_documents(
+    uuid: &str,
+    text: &str,
+    images: &[OutgoingImage],
+    documents: &[OutgoingDocument],
+) -> String {
+    let mut blocks: Vec<OutgoingBlock> = images.iter().cloned().map(OutgoingBlock::Image).collect();
+    blocks.extend(documents.iter().cloned().map(OutgoingBlock::Document));
+    blocks.push(OutgoingBlock::Text(text.to_owned()));
+    user_message_line_with_blocks(uuid, &blocks)
+}
+
+/// One block of a user message's content.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OutgoingBlock {
+    Text(String),
+    Image(OutgoingImage),
+    Document(OutgoingDocument),
+}
+
+/// A user message whose content is `blocks` in order, so attachments can sit between the parts of
+/// the text they belong to. Blank text blocks are left out, since the API rejects them.
+pub fn user_message_line_with_blocks(uuid: &str, blocks: &[OutgoingBlock]) -> String {
+    let mut content: Vec<Value> = blocks
         .iter()
-        .map(|image| {
-            json!({
+        .filter_map(|block| match block {
+            OutgoingBlock::Text(text) => {
+                (!text.trim().is_empty()).then(|| json!({ "type": "text", "text": text }))
+            }
+            OutgoingBlock::Image(image) => Some(json!({
                 "type": "image",
                 "source": {
                     "type": "base64",
                     "media_type": image.media_type,
                     "data": image.data_base64,
                 },
-            })
+            })),
+            OutgoingBlock::Document(document) => {
+                let mut block = json!({
+                    "type": "document",
+                    "source": {
+                        "type": "base64",
+                        "media_type": document.media_type,
+                        "data": document.data_base64,
+                    },
+                });
+                if let Some(title) = &document.title {
+                    block["title"] = json!(title);
+                }
+                Some(block)
+            }
         })
         .collect();
-    if !text.is_empty() || content.is_empty() {
-        content.push(json!({ "type": "text", "text": text }));
+    if content.is_empty() {
+        content.push(json!({ "type": "text", "text": "" }));
     }
     json!({
         "type": "user",

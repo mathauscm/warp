@@ -111,6 +111,8 @@ fn is_executable(path: &Path) -> bool {
 pub struct SpawnConfig {
     pub claude_path: PathBuf,
     pub cwd: PathBuf,
+    /// More folders Claude may read and edit besides `cwd`, whose `CLAUDE.md` files it also loads.
+    pub add_dirs: Vec<PathBuf>,
     /// Continue this saved session.
     pub resume: Option<String>,
     /// With `resume`, branch into a new session id instead of appending.
@@ -138,6 +140,7 @@ impl SpawnConfig {
         Self {
             claude_path: claude_path.into(),
             cwd: cwd.into(),
+            add_dirs: Vec::new(),
             resume: None,
             fork_session: false,
             resume_session_at: None,
@@ -189,8 +192,17 @@ impl SpawnConfig {
             }
             None => flag("--session-id", &self.session_id),
         }
+        for dir in self.extra_dirs() {
+            args.push("--add-dir".to_owned());
+            args.push(dir.to_string_lossy().into_owned());
+        }
         args.extend(self.extra_args.iter().cloned());
         args
+    }
+
+    /// `add_dirs` other than `cwd`.
+    fn extra_dirs(&self) -> impl Iterator<Item = &PathBuf> {
+        self.add_dirs.iter().filter(|dir| **dir != self.cwd)
     }
 
     /// Variables to set on top of the inherited environment.
@@ -210,6 +222,12 @@ impl SpawnConfig {
         }
         if let Some(path) = &self.path_env {
             env.push(("PATH".to_owned(), path.clone()));
+        }
+        if self.extra_dirs().next().is_some() {
+            env.push((
+                "CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD".to_owned(),
+                "1".to_owned(),
+            ));
         }
         env.extend(self.extra_env.iter().cloned());
         env

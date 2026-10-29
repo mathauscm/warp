@@ -11,8 +11,12 @@ use super::details::{
     format_tokens, strip_ansi, todo_lines, tool_diff,
 };
 use super::markdown::{Block, column_weights, language_label, split_blocks};
+use super::paths::{
+    CHIP_LEAD, CHIP_TAIL, PathKind, add_chips, kind_of, path_candidate, resolve, strip_chip_room,
+};
 use super::{
-    MENTION_HEIGHT, MENTION_OFFSET, first_changed_row, mention_placement, row_key, row_last_item,
+    MENTION_HEIGHT, MENTION_OFFSET, first_changed_row, lightbox_description, mention_placement,
+    row_key, row_last_item,
 };
 
 fn tool(name: &str, input: serde_json::Value) -> ToolCall {
@@ -35,7 +39,7 @@ fn split_blocks_separates_prose_code_and_tables() {
         "# Título\n\nUm parágrafo com `código`.\n\n```rust\nfn main() {}\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\nFim.",
     );
     assert_eq!(blocks.len(), 4, "{blocks:#?}");
-    assert!(matches!(blocks[0], Block::Prose(_)));
+    assert!(matches!(blocks[0], Block::Prose(..)));
     assert_eq!(
         blocks[1],
         Block::Code {
@@ -50,7 +54,7 @@ fn split_blocks_separates_prose_code_and_tables() {
         }
         other => panic!("expected a table, got {other:?}"),
     }
-    assert!(matches!(blocks[3], Block::Prose(_)));
+    assert!(matches!(blocks[3], Block::Prose(..)));
 }
 
 #[test]
@@ -336,4 +340,123 @@ fn mention_pill_goes_along_the_line_without_room_above_or_below() {
     let (offset, anchor) = mention_placement(vec2f(300., 10.), true, LINE_HEIGHT, VISIBLE_HEIGHT);
     assert_eq!(offset, vec2f(300. - MENTION_OFFSET, 10.));
     assert!(matches!(anchor, ChildAnchor::MiddleRight));
+}
+
+#[test]
+fn path_candidates_read_like_paths() {
+    assert_eq!(path_candidate("video1.mp4"), Some("video1.mp4"));
+    assert_eq!(path_candidate(" /tmp/pc1/ "), Some("/tmp/pc1/"));
+    assert_eq!(path_candidate("~/Downloads"), Some("~/Downloads"));
+    assert_eq!(path_candidate("src/main.rs:42:7"), Some("src/main.rs"));
+    assert_eq!(path_candidate("file:///tmp/a.txt"), Some("/tmp/a.txt"));
+    assert_eq!(path_candidate("meu vídeo.mov"), Some("meu vídeo.mov"));
+
+    assert_eq!(path_candidate("renders"), Some("renders"));
+    assert_eq!(path_candidate("cargo build"), None);
+    assert_eq!(path_candidate("foo()"), None);
+    assert_eq!(path_candidate("a = b.c"), None);
+    assert_eq!(path_candidate("--release"), None);
+    assert_eq!(path_candidate("https://example.com/a.png"), None);
+    assert_eq!(path_candidate("."), None);
+    assert_eq!(path_candidate(""), None);
+    assert_eq!(path_candidate("$HOME/.zshrc"), None);
+}
+
+#[test]
+fn paths_resolve_from_home_and_cwd() {
+    let cwd = std::path::Path::new("/projeto");
+    let home = std::path::Path::new("/Users/eu");
+    assert_eq!(
+        resolve("src/a.rs", cwd, Some(home)),
+        std::path::PathBuf::from("/projeto/src/a.rs")
+    );
+    assert_eq!(
+        resolve("/tmp/x", cwd, Some(home)),
+        std::path::PathBuf::from("/tmp/x")
+    );
+    assert_eq!(
+        resolve("~/Downloads", cwd, Some(home)),
+        std::path::PathBuf::from("/Users/eu/Downloads")
+    );
+    assert_eq!(
+        resolve("~", cwd, Some(home)),
+        std::path::PathBuf::from("/Users/eu")
+    );
+}
+
+#[test]
+fn path_kinds_follow_the_extension() {
+    let kind = |path: &str| kind_of(std::path::Path::new(path), false);
+    assert_eq!(
+        kind_of(std::path::Path::new("/tmp/pc1"), true),
+        PathKind::Folder
+    );
+    assert_eq!(kind("video1-v12.MP4"), PathKind::Video);
+    assert_eq!(kind("foto.jpeg"), PathKind::Image);
+    assert_eq!(kind("musica.mp3"), PathKind::Audio);
+    assert_eq!(kind("contrato.pdf"), PathKind::Pdf);
+    assert_eq!(kind("src/main.rs"), PathKind::Code);
+    assert_eq!(kind("README.md"), PathKind::Code);
+    assert_eq!(kind(".env"), PathKind::Code);
+    assert_eq!(kind("Makefile"), PathKind::Code);
+    assert_eq!(kind("backup.tar.gz"), PathKind::Archive);
+    assert_eq!(kind("planilha.xlsx"), PathKind::File);
+    assert_eq!(kind("binario"), PathKind::File);
+}
+
+#[test]
+fn existing_paths_in_prose_become_chips() {
+    let mut blocks = split_blocks(
+        "Gerei `video1.mp4` em `/tmp/pc1`; veja [o roteiro](/tmp/pc1/roteiro.md). `nao-existe.txt`, `cargo build` e `foo()` ficam.",
+    );
+    let cwd = std::path::Path::new("/tmp/pc1");
+    let mut looked_up = Vec::new();
+    add_chips(&mut blocks, cwd, None, &mut |path| {
+        looked_up.push(path.to_path_buf());
+        match path.to_str() {
+            Some("/tmp/pc1/video1.mp4" | "/tmp/pc1/roteiro.md") => Some(false),
+            Some("/tmp/pc1") => Some(true),
+            _ => None,
+        }
+    });
+    assert!(
+        !looked_up
+            .iter()
+            .any(|path| path.ends_with("cargo build") || path.ends_with("foo()"))
+    );
+    let Block::Prose(text, chips) = &blocks[0] else {
+        panic!("expected prose, got {blocks:?}");
+    };
+    let kinds: Vec<_> = chips.iter().map(|chip| chip.kind).collect();
+    assert_eq!(kinds, [PathKind::Video, PathKind::Folder, PathKind::Code]);
+    let raw = text.lines[chips[0].line].raw_text();
+    let chip_text = |index: usize| -> String {
+        raw.chars()
+            .skip(chips[index].chars.start)
+            .take(chips[index].chars.len())
+            .collect()
+    };
+    assert_eq!(chip_text(0), format!("{CHIP_LEAD}video1.mp4{CHIP_TAIL}"));
+    assert_eq!(chip_text(1), format!("{CHIP_LEAD}pc1{CHIP_TAIL}"));
+    assert_eq!(chip_text(2), format!("{CHIP_LEAD}o roteiro{CHIP_TAIL}"));
+    assert!(raw.contains("nao-existe.txt"));
+    assert_eq!(
+        strip_chip_room(&chip_text(0)),
+        "video1.mp4",
+        "copied text drops the icon's room"
+    );
+}
+
+#[test]
+fn lightbox_descriptions_name_the_image_and_count_the_message_images() {
+    assert_eq!(lightbox_description(None, 0, 1), None);
+    assert_eq!(lightbox_description(None, 1, 3).as_deref(), Some("2 / 3"));
+    assert_eq!(
+        lightbox_description(Some("tela.png"), 0, 1).as_deref(),
+        Some("tela.png")
+    );
+    assert_eq!(
+        lightbox_description(Some("tela.png"), 2, 3).as_deref(),
+        Some("tela.png  ·  3 / 3")
+    );
 }

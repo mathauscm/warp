@@ -89,6 +89,16 @@ define_settings_group!(ThemeSettings, settings: [
         toml_path: "appearance.themes.claude_chat_font_size",
         description: "The text size of the native Claude chat.",
     },
+    show_chat_usage_in_title_bar: ShowChatUsageInTitleBar {
+        type: bool,
+        default: true,
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Never,
+        surface: settings::SettingSurfaces::GUI,
+        private: false,
+        toml_path: "appearance.themes.show_chat_usage_in_title_bar",
+        description: "Whether the title bar shows how much of the Claude plan's limits is used.",
+    },
 ]);
 
 /// The colors a pane takes while Claude Code runs in it.

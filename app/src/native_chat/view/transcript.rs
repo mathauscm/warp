@@ -2,8 +2,10 @@
 //! from `claude_chat::presentation` and a viewported list lays out only the ones on screen, so
 //! long conversations stay fast.
 
+mod chips;
 mod details;
 mod markdown;
+mod paths;
 mod render;
 mod tools;
 mod viewport;
@@ -13,7 +15,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
@@ -27,6 +29,7 @@ use pathfinder_color::ColorU;
 use pathfinder_geometry::vector::{Vector2F, vec2f};
 use serde_json::Value;
 use syntax_tree::{ColorMap, highlight_snippet};
+use ui_components::lightbox::{LightboxImage, LightboxImageSource};
 use warpui::assets::asset_cache::{AssetCache, AssetSource};
 use warpui::r#async::Timer;
 use warpui::clipboard::ClipboardContent;
@@ -40,9 +43,9 @@ use warpui::elements::{
     Align, Border, ChildAnchor, ChildView, ClippedScrollStateHandle, ConstrainedBox, Container,
     CornerRadius, CrossAxisAlignment, DispatchEventResult, DropShadow, Empty, EventHandler, Fill,
     Flex, Hoverable, Image, ListState, MainAxisSize, MouseStateHandle, NewScrollable,
-    OffsetPositioning, ParentAnchor, ParentElement, ParentOffsetBounds, Radius, SavePosition,
-    ScrollStateHandle, ScrollbarWidth, SelectableArea, SelectionDragEnd, SelectionHandle, Stack,
-    Text,
+    OffsetPositioning, ParentAnchor, ParentElement, ParentOffsetBounds, PositionedElementAnchor,
+    PositionedElementOffsetBounds, Radius, SavePosition, ScrollStateHandle, ScrollbarWidth,
+    SelectableArea, SelectionDragEnd, SelectionHandle, Stack, Text,
 };
 use warpui::fonts::{FamilyId, Properties, Weight};
 use warpui::image_cache::{CacheOption, ImageType};
@@ -55,12 +58,15 @@ use warpui::{
 };
 
 use self::markdown::Block;
+use self::paths::PathKind;
 use self::render::{RowContext, Style, icon};
 use self::viewport::{ScrollFollow, Viewport, ViewportState};
 use crate::menu::{Event as MenuEvent, Menu, MenuItem, MenuItemFields};
 use crate::native_chat::design::{ChatDesign, ChatDesignEvent, Palette};
 use crate::native_chat::session::{ClaudeChatSession, ClaudeChatSessionEvent};
 use crate::util::bindings::CustomAction;
+use crate::util::openable_file_type::is_supported_code_file;
+use crate::workspace::WorkspaceAction;
 
 /// SF Mono under the names macOS knows it by.
 const INLINE_CODE_FONTS: [&str; 3] = [".AppleSystemUIFontMonospaced", ".SF NS Mono", "SF Mono"];
@@ -74,6 +80,8 @@ const ICON_MENTION: &str = "bundled/svg/picolas-mention.svg";
 const MENTION_OFFSET: f32 = 6.;
 const MENTION_HEIGHT: f32 = 26.;
 const CONTEXT_MENU_WIDTH: f32 = 200.;
+/// Space between a path chip and its tooltip.
+const PATH_TOOLTIP_OFFSET: f32 = 6.;
 /// Space between the "↓" button and the bottom of the transcript.
 const SCROLL_BUTTON_MARGIN: f32 = 14.;
 
@@ -82,6 +90,8 @@ pub enum TranscriptEvent {
     /// Text the user selected and wants to mention in the next message.
     Mention(String),
     OpenArtifact(String),
+    /// A text or code file to open in the editor beside the chat.
+    OpenFile(PathBuf),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -99,8 +109,23 @@ pub enum TranscriptAction {
     },
     OpenUrl(String),
     OpenArtifact(String),
-    /// Opens a local file in its default app.
-    OpenFile(String),
+    /// Opens a file or folder named in an answer: text in the editor, images in the lightbox, the
+    /// rest in its default app.
+    OpenPath {
+        path: PathBuf,
+        kind: PathKind,
+    },
+    /// The pointer entered or left a path chip; `id` is the chip's saved position.
+    HoverPath {
+        id: String,
+        path: PathBuf,
+        hovered: bool,
+    },
+    /// Shows an image attached to a message in the lightbox, with the message's other images.
+    OpenImage {
+        message_id: String,
+        position: usize,
+    },
     ScrollToBottom,
     SelectionChanged {
         text: Option<String>,
@@ -135,6 +160,15 @@ struct RenderCache {
     shimmer: HashMap<String, ShimmeringTextStateHandle>,
     blocks: HashMap<String, (u64, Rc<Vec<Block>>)>,
     highlights: HashMap<String, (u64, Highlights)>,
+    /// Whether each path named in an answer is a folder, or `None` when nothing is there.
+    paths: HashMap<PathBuf, Option<bool>>,
+}
+
+/// The path chip under the pointer.
+#[derive(Debug, Clone, PartialEq)]
+struct HoveredPath {
+    position_id: String,
+    path: PathBuf,
 }
 
 pub struct TranscriptView {
@@ -157,6 +191,7 @@ pub struct TranscriptView {
     context_menu: ViewHandle<Menu<TranscriptAction>>,
     /// Where the open context menu is, relative to the transcript.
     context_menu_at: Option<Vector2F>,
+    hovered_path: Option<HoveredPath>,
     copied: Option<String>,
     is_ticking: bool,
     position_id: String,
@@ -213,6 +248,7 @@ impl TranscriptView {
             mention: None,
             context_menu,
             context_menu_at: None,
+            hovered_path: None,
             copied: None,
             is_ticking: false,
             inline_code_font: warpui::fonts::Cache::handle(ctx).update(ctx, |cache, _| {
@@ -272,8 +308,12 @@ impl TranscriptView {
         let mut changed = false;
         for change in changes {
             match change {
-                ConversationChange::ItemInserted { index, .. }
-                | ConversationChange::ItemUpdated { index, .. } => {
+                ConversationChange::ItemInserted { index, .. } => {
+                    self.track_item(*index, ctx);
+                    self.run_dev_hooks(*index, ctx);
+                    dirty_from = Some(dirty_from.map_or(*index, |from| from.min(*index)));
+                }
+                ConversationChange::ItemUpdated { index, .. } => {
                     self.track_item(*index, ctx);
                     dirty_from = Some(dirty_from.map_or(*index, |from| from.min(*index)));
                 }
@@ -352,6 +392,31 @@ impl TranscriptView {
             | TimelineItem::Thinking(_)
             | TimelineItem::Notice(_)
             | TimelineItem::TurnEnd(_) => {}
+        }
+    }
+
+    /// For screenshots, once the first message sent in this run is in: `PICOLAS_CHAT_OPEN_FILE=<path>`
+    /// opens that file beside the chat and `PICOLAS_CHAT_LIGHTBOX=1` shows the message's images in
+    /// the lightbox. Debug builds only.
+    fn run_dev_hooks(&mut self, index: usize, ctx: &mut ViewContext<Self>) {
+        static RAN: AtomicBool = AtomicBool::new(false);
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        let Some(TimelineItem::User(message)) =
+            self.session.as_ref(ctx).conversation().items().get(index)
+        else {
+            return;
+        };
+        let message_id = message.id.clone();
+        if RAN.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        if let Ok(path) = std::env::var("PICOLAS_CHAT_OPEN_FILE") {
+            ctx.emit(TranscriptEvent::OpenFile(PathBuf::from(path)));
+        }
+        if std::env::var_os("PICOLAS_CHAT_LIGHTBOX").is_some() {
+            self.open_image(&message_id, 0, ctx);
         }
     }
 
@@ -488,8 +553,9 @@ impl TranscriptView {
             .clone()
     }
 
-    /// `markdown` split into blocks, parsed again only when it changed.
-    fn blocks(&self, key: &str, markdown: &str) -> Rc<Vec<Block>> {
+    /// `markdown` split into blocks, parsed again only when it changed, with the files and
+    /// folders it names under `cwd` as chips.
+    fn blocks(&self, key: &str, markdown: &str, cwd: &Path) -> Rc<Vec<Block>> {
         let mut hasher = DefaultHasher::new();
         markdown.hash(&mut hasher);
         let hash = hasher.finish();
@@ -499,7 +565,16 @@ impl TranscriptView {
         {
             return blocks.clone();
         }
-        let blocks = Rc::new(markdown::split_blocks(markdown));
+        let mut blocks = markdown::split_blocks(markdown);
+        let paths = &mut cache.paths;
+        paths::add_chips(&mut blocks, cwd, dirs::home_dir().as_deref(), &mut |path| {
+            *paths.entry(path.to_path_buf()).or_insert_with(|| {
+                std::fs::metadata(path)
+                    .ok()
+                    .map(|metadata| metadata.is_dir())
+            })
+        });
+        let blocks = Rc::new(blocks);
         cache.blocks.insert(key.to_owned(), (hash, blocks.clone()));
         blocks
     }
@@ -656,6 +731,111 @@ impl TranscriptView {
         }
     }
 
+    fn open_path(&mut self, path: &Path, kind: PathKind, ctx: &mut ViewContext<Self>) {
+        let opens_in_editor = match kind {
+            PathKind::Code => true,
+            PathKind::File => is_supported_code_file(path),
+            PathKind::Folder
+            | PathKind::Image
+            | PathKind::Video
+            | PathKind::Audio
+            | PathKind::Pdf
+            | PathKind::Archive => false,
+        };
+        if opens_in_editor {
+            ctx.emit(TranscriptEvent::OpenFile(path.to_path_buf()));
+        } else if matches!(kind, PathKind::Image) {
+            let image = LightboxImage {
+                source: LightboxImageSource::Resolved {
+                    asset_source: AssetSource::LocalFile {
+                        path: path.to_string_lossy().into_owned(),
+                        content_version: None,
+                    },
+                },
+                description: path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned()),
+            };
+            open_lightbox(vec![image], 0, ctx);
+        } else {
+            ctx.open_file_path(path);
+        }
+    }
+
+    fn set_hovered_path(
+        &mut self,
+        id: &str,
+        path: &Path,
+        hovered: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let hovered_path = if hovered {
+            Some(HoveredPath {
+                position_id: id.to_owned(),
+                path: path.to_path_buf(),
+            })
+        } else if self
+            .hovered_path
+            .as_ref()
+            .is_some_and(|hovered| hovered.position_id != id)
+        {
+            // Leaving a chip after entering the next one keeps the next one's tooltip.
+            return;
+        } else {
+            None
+        };
+        if self.hovered_path != hovered_path {
+            self.hovered_path = hovered_path;
+            ctx.notify();
+        }
+    }
+
+    /// Shows the images attached to a message in the lightbox, starting at `position`.
+    fn open_image(&mut self, message_id: &str, position: usize, ctx: &mut ViewContext<Self>) {
+        let session = self.session.as_ref(ctx);
+        let Some(message) = session
+            .conversation()
+            .items()
+            .iter()
+            .find_map(|item| match item {
+                TimelineItem::User(message) if message.id == message_id => Some(message),
+                _ => None,
+            })
+        else {
+            return;
+        };
+        let count = message.images.len();
+        let mut images = Vec::new();
+        let mut start = 0;
+        for (index, image) in message.images.iter().enumerate() {
+            let asset_source = match &image.path {
+                Some(path) => AssetSource::LocalFile {
+                    path: path.clone(),
+                    content_version: None,
+                },
+                None => match self.image_asset_id(&message.id, index) {
+                    Some(id) => AssetSource::Raw { id },
+                    None => continue,
+                },
+            };
+            if index == position {
+                start = images.len();
+            }
+            let name = image
+                .path
+                .as_deref()
+                .and_then(|path| Path::new(path).file_name())
+                .map(|name| name.to_string_lossy().into_owned());
+            images.push(LightboxImage {
+                source: LightboxImageSource::Resolved { asset_source },
+                description: lightbox_description(name.as_deref(), index, count),
+            });
+        }
+        if !images.is_empty() {
+            open_lightbox(images, start, ctx);
+        }
+    }
+
     /// Copies the selected text, if any.
     pub fn copy_selection(&mut self, ctx: &mut ViewContext<Self>) {
         if let Some(selection) = self.selection.clone() {
@@ -670,7 +850,9 @@ impl TranscriptView {
         ended_drag: Option<SelectionDragEnd>,
         ctx: &mut ViewContext<Self>,
     ) {
-        self.selection = text.filter(|text| !text.trim().is_empty());
+        self.selection = text
+            .map(|text| paths::strip_chip_room(&text))
+            .filter(|text| !text.trim().is_empty());
         if self.selection.is_none() {
             self.set_mention(None, ctx);
             return;
@@ -921,6 +1103,25 @@ fn image_asset_id(message_id: &str, position: usize) -> String {
     format!("native_chat_image:{message_id}:{position}")
 }
 
+/// Shows `images` in the window's lightbox, starting at `index`.
+fn open_lightbox(images: Vec<LightboxImage>, index: usize, ctx: &mut ViewContext<TranscriptView>) {
+    ctx.dispatch_typed_action_deferred(WorkspaceAction::OpenLightbox {
+        images,
+        initial_index: index,
+    });
+}
+
+/// The line under an image in the lightbox: its file name, if it has one, and where it sits among
+/// the message's images when there are several.
+fn lightbox_description(name: Option<&str>, position: usize, count: usize) -> Option<String> {
+    let counter = (count > 1).then(|| format!("{} / {count}", position + 1));
+    match (name, counter) {
+        (Some(name), Some(counter)) => Some(format!("{name}  ·  {counter}")),
+        (Some(name), None) => Some(name.to_owned()),
+        (None, counter) => counter,
+    }
+}
+
 /// A stable identity for a row, so a row that keeps its key keeps its measured height.
 fn row_key(row: &Row, items: &[TimelineItem]) -> String {
     let id = |index: usize| items.get(index).map_or("", TimelineItem::id);
@@ -1081,6 +1282,18 @@ impl View for TranscriptView {
                 );
             }
         }
+        if let Some(hovered) = &self.hovered_path {
+            stack.add_positioned_overlay_child(
+                chips::path_tooltip(&style, &hovered.path),
+                OffsetPositioning::offset_from_save_position_element(
+                    hovered.position_id.clone(),
+                    vec2f(0., -PATH_TOOLTIP_OFFSET),
+                    PositionedElementOffsetBounds::WindowByPosition,
+                    PositionedElementAnchor::TopLeft,
+                    ChildAnchor::BottomLeft,
+                ),
+            );
+        }
         if let Some(at) = self.context_menu_at {
             stack.add_positioned_overlay_child(
                 ChildView::new(&self.context_menu).finish(),
@@ -1110,7 +1323,14 @@ impl TypedActionView for TranscriptView {
             }
             TranscriptAction::Copy { key, text } => self.copy(key.clone(), text.clone(), ctx),
             TranscriptAction::OpenUrl(url) => ctx.open_url(url),
-            TranscriptAction::OpenFile(path) => ctx.open_file_path(Path::new(path)),
+            TranscriptAction::OpenPath { path, kind } => self.open_path(path, *kind, ctx),
+            TranscriptAction::HoverPath { id, path, hovered } => {
+                self.set_hovered_path(id, path, *hovered, ctx);
+            }
+            TranscriptAction::OpenImage {
+                message_id,
+                position,
+            } => self.open_image(message_id, *position, ctx),
             TranscriptAction::OpenArtifact(id) => {
                 ctx.emit(TranscriptEvent::OpenArtifact(id.clone()));
             }

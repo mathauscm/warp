@@ -2,6 +2,7 @@ pub(crate) mod agent_cli_launch_modal;
 pub(crate) mod auto_handoff_sleep_modal;
 mod build_plan_migration_modal;
 mod chat_tabs;
+mod chat_usage;
 pub(crate) mod chatgpt_plan_modal;
 mod claude_threads;
 pub(crate) mod cloud_agent_capacity_modal;
@@ -68,7 +69,7 @@ use pathfinder_geometry::rect::RectF;
 #[cfg(feature = "local_fs")]
 use repo_metadata::RemoteRepositoryIdentifier;
 #[cfg(feature = "local_fs")]
-use repo_metadata::repositories::DetectedRepositories;
+use repo_metadata::repositories::{DetectedRepositories, RepoDetectionSource};
 #[cfg(all(target_os = "macos", feature = "crash_reporting"))]
 use sentry::protocol::{Attachment, AttachmentType};
 use serde_json;
@@ -709,7 +710,6 @@ pub(crate) const TOGGLE_TAB_CONFIGS_MENU_BINDING_NAME: &str = "workspace:toggle_
 pub(crate) const TOGGLE_CLAUDE_THREADS_BINDING_NAME: &str = "workspace:toggle_claude_threads";
 pub(crate) const TOGGLE_TERMINAL_PANEL_BINDING_NAME: &str = "workspace:toggle_terminal_panel";
 pub(crate) const TOGGLE_PROJECT_MANAGER_BINDING_NAME: &str = "workspace:toggle_project_manager";
-pub(crate) const OPEN_CLAUDE_SESSION_BINDING_NAME: &str = "workspace:open_claude_session";
 
 // Editable left panel toolbelt keybindings.
 pub(crate) const LEFT_PANEL_PROJECT_EXPLORER_BINDING_NAME: &str =
@@ -1119,6 +1119,8 @@ pub struct Workspace {
     thread_split_target: Option<tab_merge::PaneDropTarget>,
     /// Claude Code conversations by project; see `claude_threads`.
     claude_threads_view: ViewHandle<claude_threads::ClaudeThreadsView>,
+    /// The focused native chat's token and plan usage in the top bar; see `chat_usage`.
+    chat_usage_bar: ViewHandle<crate::native_chat::view::ChatUsageBar>,
     /// Saved projects by tag; see `project_manager`.
     project_manager_view: ViewHandle<project_manager::ProjectManagerView>,
     /// What the vertical tabs sidebar shows: the tab list, Threads or Projects.
@@ -2999,6 +3001,7 @@ impl Workspace {
         ) = Self::build_menus(ctx);
         let worktree_selector = Self::build_worktree_selector(ctx);
         let claude_threads_view = ctx.add_typed_action_view(claude_threads::ClaudeThreadsView::new);
+        let chat_usage_bar = ctx.add_typed_action_view(crate::native_chat::view::ChatUsageBar::new);
         let project_manager_view =
             ctx.add_typed_action_view(project_manager::ProjectManagerView::new);
 
@@ -3548,6 +3551,7 @@ impl Workspace {
             tab_merge_target: None,
             thread_split_target: None,
             claude_threads_view,
+            chat_usage_bar,
             project_manager_view,
             vertical_tabs_content: VerticalTabsContent::Tabs,
             changelog_model,
@@ -4514,12 +4518,12 @@ impl Workspace {
         self.left_panel_view.update(ctx, |lp, ctx| {
             // Restore which panel tab was active
             let active_view = match left_panel_snapshot.left_panel_displayed_tab {
-                LeftPanelDisplayedTab::FileTree => ToolPanelView::ProjectExplorer,
+                LeftPanelDisplayedTab::FileTree
+                | LeftPanelDisplayedTab::WarpDrive
+                | LeftPanelDisplayedTab::ConversationListView => ToolPanelView::ProjectExplorer,
                 LeftPanelDisplayedTab::GlobalSearch => ToolPanelView::GlobalSearch {
                     entry_focus: GlobalSearchEntryFocus::Results,
                 },
-                LeftPanelDisplayedTab::WarpDrive => ToolPanelView::WarpDrive,
-                LeftPanelDisplayedTab::ConversationListView => ToolPanelView::ConversationListView,
             };
             lp.restore_active_view_from_snapshot(active_view, ctx);
             lp.set_active_pane_group(pane_group.clone(), &self.working_directories_model, ctx);
@@ -7018,14 +7022,6 @@ impl Workspace {
         ctx.notify();
     }
 
-    fn join_slack(&mut self, ctx: &mut ViewContext<Self>) {
-        ctx.open_url(links::SLACK_URL);
-    }
-
-    fn view_user_docs(&mut self, ctx: &mut ViewContext<Self>) {
-        ctx.open_url(links::USER_DOCS_URL);
-    }
-
     fn view_latest_changelog(&mut self, ctx: &mut ViewContext<Self>) {
         self.update_toast_stack.update(ctx, |stack, ctx| {
             stack.clear_toasts(ctx);
@@ -9093,49 +9089,6 @@ impl Workspace {
         });
     }
 
-    /// Starts a native Claude chat in the active session's folder, or the home folder.
-    fn open_claude_session(&mut self, ctx: &mut ViewContext<Self>) {
-        let cwd = self
-            .active_tab_pane_group()
-            .as_ref(ctx)
-            .active_session_path(ctx)
-            .or_else(dirs::home_dir);
-        let Some(cwd) = cwd else {
-            return;
-        };
-        self.open_claude_chat(ClaudeChatPaneSnapshot::new(cwd), None, ctx);
-    }
-
-    /// Opens a new terminal tab in `directory` (the default one when `None`)
-    /// and runs `command` once its shell is ready. With `hide_command`, the
-    /// block shows only the command's output, not the command line.
-    fn run_command_in_new_tab(
-        &mut self,
-        directory: Option<PathBuf>,
-        command: &str,
-        hide_command: bool,
-        ctx: &mut ViewContext<Self>,
-    ) {
-        let options = NewTerminalOptions::default()
-            .with_initial_directory_opt(directory)
-            .with_homepage_hidden();
-        self.add_tab_with_pane_layout(
-            PanesLayout::SingleTerminal(Box::new(options)),
-            Arc::new(HashMap::new()),
-            None,
-            ctx,
-        );
-        if let Some(terminal) = self.active_session_view(ctx) {
-            terminal.update(ctx, |terminal, ctx| {
-                if hide_command {
-                    terminal.set_hidden_pending_command(command, ctx);
-                } else {
-                    terminal.set_pending_command(command, ctx);
-                }
-            });
-        }
-    }
-
     fn open_directory_in_new_tab(&mut self, path: PathBuf, ctx: &mut ViewContext<Self>) {
         let options = NewTerminalOptions::default().with_initial_directory(path);
         self.add_tab_with_pane_layout(
@@ -10132,6 +10085,43 @@ impl Workspace {
         }
     }
 
+    /// Opens the code review panel on a repository that may have no terminal, like a native
+    /// chat's.
+    #[cfg(feature = "local_fs")]
+    fn open_code_review_for_repo(
+        &mut self,
+        repo_root: PathBuf,
+        pane_group: &ViewHandle<PaneGroup>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.refresh_working_directories_for_pane_group(pane_group, ctx);
+        let repo_path = LocalOrRemotePath::Local(repo_root);
+        let Some(diff_state_model) = self.working_directories_model.update(ctx, |model, ctx| {
+            model.get_or_create_diff_state_model(repo_path.clone(), None, ctx)
+        }) else {
+            return;
+        };
+        let was_open = pane_group.as_ref(ctx).right_panel_open;
+        let context = CodeReviewPaneContext {
+            repo_path: Some(repo_path.clone()),
+            diff_state_model: diff_state_model.clone(),
+        };
+        self.open_right_panel(
+            &context,
+            pane_group,
+            CodeReviewPaneEntrypoint::GitDiffChip,
+            None,
+            ctx,
+        );
+        if was_open {
+            // Selecting the repository only creates its review for a repository with a
+            // terminal.
+            self.right_panel_view.update(ctx, |right_panel, ctx| {
+                right_panel.open_code_review(Some(repo_path), diff_state_model, ctx);
+            });
+        }
+    }
+
     fn update_right_panel_open_state(
         &mut self,
         #[cfg_attr(target_family = "wasm", allow(unused_variables))]
@@ -10392,24 +10382,12 @@ impl Workspace {
                 .with_on_select_action(WorkspaceAction::ToggleKeybindingsPage)
                 .into_item(),
             MenuItem::Separator,
-            MenuItemFields::new("Documentation")
-                .with_on_select_action(WorkspaceAction::ViewUserDocs)
-                .into_item(),
-            MenuItemFields::new("Feedback")
-                .with_on_select_action(WorkspaceAction::SendFeedback)
-                .into_item(),
         ]);
 
         #[cfg(not(target_family = "wasm"))]
-        items.push(
+        items.extend([
             MenuItemFields::new("View Warp logs")
                 .with_on_select_action(WorkspaceAction::ViewLogs)
-                .into_item(),
-        );
-
-        items.extend([
-            MenuItemFields::new("Join our Slack community")
-                .with_on_select_action(WorkspaceAction::JoinSlack)
                 .into_item(),
             MenuItem::Separator,
         ]);
@@ -10421,34 +10399,6 @@ impl Workspace {
                     .into_item(),
             );
         }
-
-        // Check if the user is on any paid plan to determine whether to show "Billing and Usage" or "Upgrade"
-        let is_on_paid_plan = UserWorkspaces::as_ref(app)
-            .current_workspace()
-            .map(|workspace| workspace.billing_metadata.is_user_on_paid_plan())
-            .unwrap_or(false);
-
-        if is_on_paid_plan {
-            items.push(
-                MenuItemFields::new("Billing and usage")
-                    .with_on_select_action(WorkspaceAction::ShowSettingsPage(
-                        SettingsSection::BillingAndUsage,
-                    ))
-                    .into_item(),
-            );
-        } else {
-            items.push(
-                MenuItemFields::new("Upgrade")
-                    .with_on_select_action(WorkspaceAction::ShowUpgrade)
-                    .into_item(),
-            );
-        }
-
-        items.push(
-            MenuItemFields::new("Invite a friend")
-                .with_on_select_action(WorkspaceAction::ShowReferralSettingsPage)
-                .into_item(),
-        );
 
         if !self.auth_state.is_anonymous_or_logged_out() {
             items.push(
@@ -18055,6 +18005,7 @@ impl Workspace {
 
     /// Update the active session model state.
     fn update_active_session(&mut self, ctx: &mut ViewContext<Self>) {
+        self.sync_chat_usage_bar(ctx);
         let pane_group_handle = self.active_tab_pane_group();
         let file_tree_and_global_search_are_enabled = {
             #[cfg(feature = "local_fs")]
@@ -21101,7 +21052,7 @@ impl Workspace {
                         .left_panel_views
                         .first()
                         .copied()
-                        .unwrap_or(ToolPanelView::WarpDrive)
+                        .unwrap_or(ToolPanelView::ProjectExplorer)
                     {
                         ToolPanelView::ProjectExplorer => "Project explorer",
                         ToolPanelView::GlobalSearch { .. } => "Global search",
@@ -21139,27 +21090,6 @@ impl Workspace {
             )
             .finish(),
             save_position_id,
-        )
-        .finish()
-    }
-
-    /// Tab bar button that starts a Claude Code session.
-    fn render_claude_button(&self, appearance: &Appearance, ctx: &AppContext) -> Box<dyn Element> {
-        Container::new(
-            Align::new(
-                self.render_tab_bar_icon_button(
-                    appearance,
-                    icons::Icon::ClaudeLogo,
-                    &self.mouse_states.claude_button,
-                    WorkspaceAction::OpenClaudeSession,
-                    "Novo chat com Claude".to_string(),
-                    keybinding_name_to_display_string(OPEN_CLAUDE_SESSION_BINDING_NAME, ctx),
-                    false,
-                    false,
-                )
-                .finish(),
-            )
-            .finish(),
         )
         .finish()
     }
@@ -21638,7 +21568,6 @@ impl Workspace {
                     left_toolbar_buttons.push(self.render_project_manager_button(appearance, ctx));
                 }
             }
-            left_toolbar_buttons.push(self.render_claude_button(appearance, ctx));
             if let Some(button) = self.render_file_explorer_button(appearance, ctx) {
                 left_toolbar_buttons.push(button);
             }
@@ -21983,6 +21912,7 @@ impl Workspace {
         appearance: &Appearance,
         ctx: &AppContext,
     ) {
+        target.add_child(ChildView::new(&self.chat_usage_bar).finish());
         if let Some(update_pill) = self.render_tab_overflow_menu(ctx, appearance) {
             target.add_child(
                 Container::new(update_pill)
@@ -23645,6 +23575,14 @@ impl Workspace {
             context.set.insert(flags::RESTORE_SESSION_CONTEXT_FLAG);
         }
 
+        if *general_settings.quit_on_last_window_closed {
+            context.set.insert(flags::QUIT_ON_LAST_WINDOW_CLOSED_CONTEXT_FLAG);
+        }
+
+        if *general_settings.add_app_as_login_item {
+            context.set.insert(flags::LOGIN_ITEM_CONTEXT_FLAG);
+        }
+
         if *session_settings.honor_ps1 {
             context.set.insert(flags::HONOR_PS1_CONTEXT_FLAG);
         }
@@ -23817,6 +23755,10 @@ impl Workspace {
             context
                 .set
                 .insert(flags::LEFT_PANEL_VISIBILITY_ACROSS_TABS_FLAG);
+        }
+
+        if *theme_settings.show_chat_usage_in_title_bar {
+            context.set.insert(flags::CHAT_USAGE_IN_TITLE_BAR_FLAG);
         }
 
         if *font_settings.match_ai_font_to_terminal_font {
@@ -24429,11 +24371,6 @@ impl Workspace {
         if cfg!(feature = "local_fs") && *CodeSettings::as_ref(ctx).show_project_explorer.value() {
             views.push(ToolPanelView::ProjectExplorer);
         }
-        if FeatureFlag::AgentViewConversationListView.is_enabled()
-            && *AISettings::as_ref(ctx).show_conversation_history
-        {
-            views.push(ToolPanelView::ConversationListView);
-        }
         if cfg!(feature = "local_fs")
             && FeatureFlag::GlobalSearch.is_enabled()
             && *CodeSettings::as_ref(ctx).show_global_search.value()
@@ -24441,9 +24378,6 @@ impl Workspace {
             views.push(ToolPanelView::GlobalSearch {
                 entry_focus: GlobalSearchEntryFocus::Results,
             });
-        }
-        if *WarpDriveSettings::as_ref(ctx).enable_warp_drive {
-            views.push(ToolPanelView::WarpDrive);
         }
         views
     }
@@ -25020,19 +24954,6 @@ impl TypedActionView for Workspace {
             OpenDirectoryInNewTab { path } => {
                 self.open_directory_in_new_tab(path.clone(), ctx);
             }
-            OpenClaudeSession => self.open_claude_session(ctx),
-            RunCommandInNewTab {
-                directory,
-                command,
-                group,
-            } => {
-                // Threads and Projects open Claude Code without echoing
-                // `claude --resume <session id>` above it.
-                self.run_command_in_new_tab(Some(directory.clone()), command, true, ctx);
-                if let Some(name) = group {
-                    self.move_active_tab_to_named_group(name, ctx);
-                }
-            }
             OpenClaudeChat {
                 cwd,
                 session_id,
@@ -25044,8 +24965,27 @@ impl TypedActionView for Workspace {
                     ClaudeChatPaneSnapshot {
                         session_id: session_id.clone(),
                         cwd: cwd.clone(),
+                        workspace: None,
                         draft: draft.clone(),
                         artifact_kind: artifact_kind.clone(),
+                    },
+                    group.as_deref(),
+                    ctx,
+                );
+            }
+            OpenClaudeWorkspaceChat {
+                cwd,
+                workspace,
+                session_id,
+                group,
+            } => {
+                self.open_claude_chat(
+                    ClaudeChatPaneSnapshot {
+                        session_id: session_id.clone(),
+                        cwd: cwd.clone(),
+                        workspace: Some(workspace.clone()),
+                        draft: None,
+                        artifact_kind: None,
                     },
                     group.as_deref(),
                     ctx,
@@ -25153,11 +25093,6 @@ impl TypedActionView for Workspace {
 
                 ctx.open_url(&upgrade_url);
             }
-            ShowReferralSettingsPage => {
-                self.show_settings_with_section(Some(SettingsSection::Referrals), ctx);
-            }
-            JoinSlack => self.join_slack(ctx),
-            ViewUserDocs => self.view_user_docs(ctx),
             ViewLatestChangelog => self.view_latest_changelog(ctx),
             ViewPrivacyPolicy => self.view_privacy_policy(ctx),
             SendFeedback => self.send_feedback(ctx),
@@ -25472,6 +25407,29 @@ impl TypedActionView for Workspace {
             }
             #[cfg(not(feature = "local_fs"))]
             OpenCodeReviewPanel(_) => {}
+            #[cfg(feature = "local_fs")]
+            OpenCodeReviewForRepo(repo_root) => {
+                let pane_group_handle = self.active_tab_pane_group().clone();
+                // The panel only reviews repositories among the pane group's working
+                // directories, which only lists repositories once they're detected.
+                let detection = DetectedRepositories::handle(ctx).update(ctx, |repos, ctx| {
+                    repos.detect_possible_local_git_repo(
+                        &repo_root.to_string_lossy(),
+                        RepoDetectionSource::CodeReviewInitialization,
+                        ctx,
+                    )
+                });
+                let fallback_root = repo_root.clone();
+                ctx.spawn(detection, move |me, detected_root, ctx| {
+                    me.open_code_review_for_repo(
+                        detected_root.unwrap_or(fallback_root),
+                        &pane_group_handle,
+                        ctx,
+                    );
+                });
+            }
+            #[cfg(not(feature = "local_fs"))]
+            OpenCodeReviewForRepo(_) => {}
             ToggleVerticalTabsPanel => {
                 self.toggle_vertical_tabs_panel(ctx);
             }
