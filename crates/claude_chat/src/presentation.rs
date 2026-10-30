@@ -34,6 +34,11 @@ pub enum Row {
     TurnError {
         index: usize,
     },
+    /// A question Claude asked with AskUserQuestion, once the user answered it: a record of the
+    /// answers, kept out of the work group.
+    QuestionAnswers {
+        index: usize,
+    },
 }
 
 /// A turn's work behind one header: folded once the turn is done, open while it runs.
@@ -286,6 +291,9 @@ fn turn_rows(
         .copied()
         .filter(|&index| Some(index) != answer)
         .partition(|&index| is_pinned(&items[index]));
+    let (answered, folded): (Vec<usize>, Vec<usize>) = folded
+        .into_iter()
+        .partition(|&index| is_answered_question(&items[index]));
 
     if failed || folded.is_empty() {
         rows.extend(work_rows(items, &turn.body));
@@ -318,6 +326,11 @@ fn turn_rows(
         },
         collapsed_by_default: true,
     }));
+    rows.extend(
+        answered
+            .into_iter()
+            .map(|index| Row::QuestionAnswers { index }),
+    );
     rows.extend(pinned.into_iter().map(|index| Row::Notice { index }));
     if let Some(answer) = answer {
         rows.push(Row::AssistantProse { index: answer });
@@ -338,6 +351,17 @@ fn is_made_artifact(item: &TimelineItem) -> bool {
         TimelineItem::Tool(tool) => {
             tool.status == ToolStatus::Done && crate::artifacts::makes_artifact(&tool.name)
         }
+        TimelineItem::User(_)
+        | TimelineItem::Assistant(_)
+        | TimelineItem::Thinking(_)
+        | TimelineItem::Notice(_)
+        | TimelineItem::TurnEnd(_) => false,
+    }
+}
+
+fn is_answered_question(item: &TimelineItem) -> bool {
+    match item {
+        TimelineItem::Tool(tool) => !question_answers(tool).is_empty(),
         TimelineItem::User(_)
         | TimelineItem::Assistant(_)
         | TimelineItem::Thinking(_)
@@ -397,6 +421,9 @@ fn work_rows(items: &[TimelineItem], indices: &[usize]) -> Vec<Row> {
                     TimelineItem::User(_) => Row::UserBubble { index },
                     TimelineItem::Assistant(_) => Row::AssistantProse { index },
                     TimelineItem::Thinking(_) => Row::Thinking { index },
+                    TimelineItem::Tool(_) if is_answered_question(item) => {
+                        Row::QuestionAnswers { index }
+                    }
                     TimelineItem::Tool(_) => Row::Tool { index },
                     TimelineItem::Notice(_) => Row::Notice { index },
                     TimelineItem::TurnEnd(_) => Row::TurnError { index },
@@ -807,6 +834,123 @@ fn edited_path(tool: &ToolCall) -> Option<&str> {
         "NotebookEdit" => tool.input.get("notebook_path")?.as_str(),
         _ => None,
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Question answers
+
+/// What the user answered to one of the questions of an AskUserQuestion call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuestionAnswer {
+    /// The question's short label, like "Stack", when it has one.
+    pub header: Option<String>,
+    pub question: String,
+    /// The picked options' labels joined by ", ", or the user's own text.
+    pub answer: String,
+}
+
+/// The answers to an AskUserQuestion call, in the order of its questions: from its structured
+/// result, else from the text Claude received. Empty while it waits, and when it was dismissed or
+/// failed.
+pub fn question_answers(tool: &ToolCall) -> Vec<QuestionAnswer> {
+    if tool.name != crate::reducer::ASK_USER_QUESTION_TOOL || tool.status != ToolStatus::Done {
+        return Vec::new();
+    }
+    let Some(result) = tool.result.as_ref().filter(|result| !result.is_error) else {
+        return Vec::new();
+    };
+    let mut answers: Vec<(String, String)> = match result
+        .structured
+        .as_ref()
+        .and_then(|structured| structured.get("answers"))
+        .and_then(Value::as_object)
+    {
+        Some(answers) => answers
+            .iter()
+            .filter_map(|(question, answer)| Some((question.clone(), answer_text(answer)?)))
+            .collect(),
+        None => parse_answers_text(&result.text),
+    };
+    let questions = tool
+        .input
+        .get("questions")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut ordered = Vec::new();
+    for question in questions {
+        let Some(text) = question.get("question").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(position) = answers.iter().position(|(asked, _)| asked == text) else {
+            continue;
+        };
+        let (question_text, answer) = answers.remove(position);
+        ordered.push(QuestionAnswer {
+            header: question
+                .get("header")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|header| !header.is_empty())
+                .map(str::to_owned),
+            question: question_text,
+            answer,
+        });
+    }
+    ordered.extend(
+        answers
+            .into_iter()
+            .map(|(question, answer)| QuestionAnswer {
+                header: None,
+                question,
+                answer,
+            }),
+    );
+    ordered.retain(|answer| !answer.answer.trim().is_empty());
+    ordered
+}
+
+/// An answer in a structured result: a string, or a list of picked labels.
+fn answer_text(answer: &Value) -> Option<String> {
+    match answer {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(labels) => Some(
+            labels
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::Object(_) => None,
+    }
+}
+
+/// The `"question"="answer"` pairs of the text Claude receives, like `Your questions have been
+/// answered: "Q1"="A1", "Q2"="A2". You can now continue with these answers in mind.`
+fn parse_answers_text(text: &str) -> Vec<(String, String)> {
+    let Some(start) = text.find(": \"") else {
+        return Vec::new();
+    };
+    let mut rest = &text[start + 2..];
+    let mut pairs = Vec::new();
+    while let Some(body) = rest.strip_prefix('"') {
+        let Some(separator) = body.find("\"=\"") else {
+            break;
+        };
+        let question = &body[..separator];
+        let after = &body[separator + 3..];
+        // Answers can hold quotes, so the closing one is the quote another pair or the end of the
+        // list follows.
+        let Some(end) = after.match_indices('"').map(|(at, _)| at).find(|&at| {
+            let tail = &after[at + 1..];
+            tail.starts_with(", \"") || tail.starts_with('.') || tail.trim().is_empty()
+        }) else {
+            break;
+        };
+        pairs.push((question.to_owned(), after[..end].to_owned()));
+        rest = after[end + 1..].strip_prefix(", ").unwrap_or_default();
+    }
+    pairs
 }
 
 // ---------------------------------------------------------------------------------------------

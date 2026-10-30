@@ -300,13 +300,15 @@ pub fn footer_control(
     .finish()
 }
 
-/// A keyboard key, like the digit next to a question's option.
+pub const KEY_CAP_SIZE: f32 = 16.;
+
+/// A small, faint keyboard key, like the digit next to a question's option.
 pub fn key_cap(look: &Look, label: impl Into<String>, highlighted: bool) -> Box<dyn Element> {
     let palette = &look.palette;
-    let (background, color) = if highlighted {
-        (palette.accent.0, palette.on_accent.0)
+    let (border, color) = if highlighted {
+        (with_alpha(palette.accent.0, 0x80), palette.accent.0)
     } else {
-        (palette.surface_strong.0, palette.text_muted.0)
+        (palette.border.0, palette.text_faint.0)
     };
     ConstrainedBox::new(
         Container::new(
@@ -314,14 +316,14 @@ pub fn key_cap(look: &Look, label: impl Into<String>, highlighted: bool) -> Box<
                 .with_main_axis_size(MainAxisSize::Max)
                 .with_main_axis_alignment(MainAxisAlignment::Center)
                 .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                .with_child(look.medium_text(label, look.sizes.tiny_font_size, color))
+                .with_child(look.text(label, look.sizes.tiny_font_size - 1., color))
                 .finish(),
         )
-        .with_background_color(background)
-        .with_corner_radius(look.radius(5.))
+        .with_border(Border::all(1.).with_border_color(border))
+        .with_corner_radius(look.radius(4.))
         .finish(),
     )
-    .with_width(18.)
-    .with_height(18.)
+    .with_width(KEY_CAP_SIZE)
+    .with_height(KEY_CAP_SIZE)
     .finish()
 }

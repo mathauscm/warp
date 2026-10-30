@@ -503,6 +503,7 @@ impl TranscriptView {
             Row::UserBubble { .. } => 2.,
             Row::AssistantProse { .. } => sizes.message_spacing - 6.,
             Row::WorkGroup(_) => 10.,
+            Row::QuestionAnswers { .. } => 12.,
             Row::Thinking { .. }
             | Row::Tool { .. }
             | Row::ToolBatch(_)
@@ -727,7 +728,8 @@ impl TranscriptView {
             | Row::ToolBatch(_)
             | Row::Notice { .. }
             | Row::WorkGroup(_)
-            | Row::TurnError { .. } => None,
+            | Row::TurnError { .. }
+            | Row::QuestionAnswers { .. } => None,
         }
     }
 
@@ -1134,6 +1136,7 @@ fn row_key(row: &Row, items: &[TimelineItem]) -> String {
         Row::Notice { index } => format!("notice:{}", id(*index)),
         Row::WorkGroup(group) => group.id.clone(),
         Row::TurnError { index } => format!("error:{}", id(*index)),
+        Row::QuestionAnswers { index } => format!("answers:{}", id(*index)),
     }
 }
 
@@ -1145,7 +1148,8 @@ fn row_last_item(row: &Row) -> usize {
         | Row::Thinking { index }
         | Row::Tool { index }
         | Row::Notice { index }
-        | Row::TurnError { index } => *index,
+        | Row::TurnError { index }
+        | Row::QuestionAnswers { index } => *index,
         Row::ToolBatch(batch) => batch.items.iter().copied().max().unwrap_or_default(),
         Row::WorkGroup(group) => group
             .rows

@@ -32,12 +32,13 @@ use warpui::elements::{
     Border, ChildAnchor, ChildView, Clipped, ClippedScrollStateHandle, ConstrainedBox, Container,
     CrossAxisAlignment, DropShadow, Element, Flex, Hoverable, Image, MainAxisAlignment,
     MainAxisSize, MouseStateHandle, OffsetPositioning, ParentElement, PositionedElementAnchor,
-    PositionedElementOffsetBounds, SavePosition, Shrinkable, Stack,
+    PositionedElementOffsetBounds, SavePosition, Shrinkable, Stack, Text,
 };
 use warpui::geometry::vector::vec2f;
 use warpui::image_cache::{CacheOption, ImageType};
 use warpui::keymap::FixedBinding;
 use warpui::platform::{Cursor, FilePickerConfiguration};
+use warpui::text_layout::ClipConfig;
 use warpui::text_layout::TextBorder;
 use warpui::{
     AppContext, Entity, FocusContext, ModelHandle, SingletonEntity, TypedActionView, View,
@@ -101,6 +102,12 @@ const FILE_CHIP_MAX_NAME_WIDTH: f32 = 220.;
 const GIT_BRANCH_MAX_WIDTH: f32 = 180.;
 /// Below this width the footer's chips wrap onto more lines.
 const FOOTER_WRAP_WIDTH: f32 = 420.;
+const CURSOR_WIDTH: f32 = 2.;
+/// A rough average glyph width as a share of the font size, to estimate the footer's width.
+const FOOTER_GLYPH_WIDTH_RATIO: f32 = 0.6;
+const FOOTER_CHIP_PADDING: f32 = 16.;
+const FOOTER_RING_WIDTH: f32 = 28.;
+const FOOTER_SPACING_SLACK: f32 = 24.;
 /// How often the footer's git status is read again between Claude's turns.
 const GIT_POLL_INTERVAL: Duration = Duration::from_secs(15);
 const QUEUED_PREVIEW_CHARS: usize = 160;
@@ -575,6 +582,7 @@ impl ComposerView {
             let mut editor = EditorView::new(options, ctx);
             editor.set_forwards_dropped_files(true);
             editor.set_line_height_ratio(Some(line_height_ratio), ctx);
+            editor.set_beam_cursor_width(CURSOR_WIDTH, ctx);
             editor.set_placeholder_text(PLACEHOLDER, ctx);
             if let Some(draft) = &draft {
                 editor.system_reset_buffer_text(draft, ctx);
@@ -3004,13 +3012,15 @@ impl ComposerView {
             })
         };
 
-        let right = Flex::row()
-            .with_main_axis_size(MainAxisSize::Min)
-            .with_cross_axis_alignment(CrossAxisAlignment::Center)
-            .with_spacing(2.)
-            .with_child(model_chip())
-            .with_child(ring())
-            .finish();
+        let right = || {
+            Flex::row()
+                .with_main_axis_size(MainAxisSize::Min)
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_spacing(2.)
+                .with_child(model_chip())
+                .with_child(ring())
+                .finish()
+        };
         let mut left = Flex::row()
             .with_main_axis_size(MainAxisSize::Min)
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
@@ -3022,8 +3032,27 @@ impl ComposerView {
             .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_child(Shrinkable::new(1., left.finish()).finish())
-            .with_child(right)
+            .with_child(right())
             .finish();
+
+        // When the branch chip doesn't fit beside the others (a long branch, a workspace's
+        // "+N repos"), it moves to its own line under the mode instead of pushing the model past
+        // the pane's edge.
+        let mut stacked = Flex::column()
+            .with_main_axis_size(MainAxisSize::Min)
+            .with_cross_axis_alignment(CrossAxisAlignment::Start)
+            .with_spacing(2.)
+            .with_child(
+                Flex::row()
+                    .with_main_axis_size(MainAxisSize::Max)
+                    .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_child(mode_chip())
+                    .with_child(right())
+                    .finish(),
+            );
+        stacked.extend(git_chip());
+        let inline_width = self.footer_inline_width(look, mode.label, &parts);
 
         // In narrow panes the chips flow onto more lines instead of running over each other.
         let mut wrapped = warpui::elements::Wrap::row()
@@ -3037,17 +3066,64 @@ impl ComposerView {
         );
 
         Container::new(
-            warpui::elements::SizeConstraintSwitch::new(
-                inline,
-                [(
-                    warpui::elements::SizeConstraintCondition::WidthLessThan(FOOTER_WRAP_WIDTH),
-                    wrapped.finish(),
-                )],
+            Clipped::new(
+                warpui::elements::SizeConstraintSwitch::new(
+                    inline,
+                    [
+                        (
+                            warpui::elements::SizeConstraintCondition::WidthLessThan(
+                                FOOTER_WRAP_WIDTH,
+                            ),
+                            wrapped.finish(),
+                        ),
+                        (
+                            warpui::elements::SizeConstraintCondition::WidthLessThan(inline_width),
+                            stacked.finish(),
+                        ),
+                    ],
+                )
+                .finish(),
             )
             .finish(),
         )
         .with_padding_top(6.)
         .finish()
+    }
+
+    /// Roughly how wide the footer's chips are side by side, to tell when the branch chip has to
+    /// move to its own line.
+    fn footer_inline_width(
+        &self,
+        look: &Look,
+        mode: &str,
+        model_parts: &[(String, ColorU)],
+    ) -> f32 {
+        let size = look.sizes.small_font_size;
+        let glyphs = |text: &str| text.chars().count() as f32 * size * FOOTER_GLYPH_WIDTH_RATIO;
+        let icon = look.sizes.small_icon_size + 5.;
+        let mode_width = FOOTER_CHIP_PADDING + icon + glyphs(mode) + icon;
+        let model_width = FOOTER_CHIP_PADDING
+            + model_parts
+                .iter()
+                .map(|(text, _)| glyphs(text) + 5.)
+                .sum::<f32>()
+            + icon
+            + FOOTER_RING_WIDTH;
+        let git_width = self.git.first().map_or(0., |status| {
+            let (added, removed) = git_status::total_changes(&self.git);
+            let (added, removed) = git_status::diff_parts(added, removed);
+            let other_repos = self.git.len().saturating_sub(1);
+            let mut width =
+                FOOTER_CHIP_PADDING + icon + glyphs(&status.branch).min(GIT_BRANCH_MAX_WIDTH);
+            if other_repos > 0 {
+                width += glyphs(&format!("+{other_repos} repos")) + 5. + icon;
+            }
+            for part in added.iter().chain(removed.iter()) {
+                width += glyphs(part) + 5.;
+            }
+            width
+        });
+        mode_width + git_width + model_width + FOOTER_SPACING_SLACK
     }
 
     /// The branch of the chat's folder and the uncommitted changes of every repository it works
@@ -3076,15 +3152,16 @@ impl ComposerView {
                     sizes.small_icon_size,
                 ))
                 .with_child(
-                    ConstrainedBox::new(look.text(
-                        branch.clone(),
-                        sizes.small_font_size,
-                        if hovered {
-                            palette.text.0
-                        } else {
-                            palette.text_muted.0
-                        },
-                    ))
+                    ConstrainedBox::new(
+                        Text::new_inline(branch.clone(), look.ui_font, sizes.small_font_size)
+                            .with_color(if hovered {
+                                palette.text.0
+                            } else {
+                                palette.text_muted.0
+                            })
+                            .with_clip(ClipConfig::ellipsis())
+                            .finish(),
+                    )
                     .with_max_width(GIT_BRANCH_MAX_WIDTH)
                     .finish(),
                 );

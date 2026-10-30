@@ -153,6 +153,10 @@ pub(super) fn render_row(cx: &RowContext, row: &Row, nested: bool) -> Box<dyn El
             }
             _ => Empty::new().finish(),
         },
+        Row::QuestionAnswers { index } => match &cx.items[*index] {
+            TimelineItem::Tool(tool) => tools::render_question_answers(cx, tool),
+            _ => Empty::new().finish(),
+        },
     }
 }
 
@@ -168,7 +172,8 @@ pub(super) fn render_nested_rows(cx: &RowContext, rows: &[Row]) -> Box<dyn Eleme
             | Row::ToolBatch(_)
             | Row::Notice { .. }
             | Row::WorkGroup(_)
-            | Row::TurnError { .. } => NESTED_ROW_SPACING,
+            | Row::TurnError { .. }
+            | Row::QuestionAnswers { .. } => NESTED_ROW_SPACING,
         };
         column.add_child(
             Container::new(render_row(cx, row, true))
@@ -258,6 +263,7 @@ fn render_user_message(cx: &RowContext, message: &UserMessage) -> Box<dyn Elemen
         }
     };
     if let Some(content) = bubble_content {
+        let content = text_cursor_region(cx, &format!("ibeam:{key}"), content);
         let bubble = Container::new(content)
             .with_horizontal_padding(sizes.bubble_padding_x)
             .with_vertical_padding(sizes.bubble_padding_y)
@@ -749,7 +755,9 @@ fn render_blocks(
             Block::Code { language, code } => {
                 render_code_block(cx, &format!("{cache_key}#{position}"), language, code)
             }
-            Block::Table(table) => render_table(cx, table, tone),
+            Block::Table(table) => {
+                render_table(cx, &format!("{cache_key}#{position}"), table, tone)
+            }
             Block::Quote(blocks) => render_quote(cx, &format!("{cache_key}#{position}"), blocks),
         };
         let spacing = if position + 1 == blocks.len() {
@@ -817,7 +825,8 @@ fn render_prose(
     .with_inline_code_border(inline_code_border(cx))
     .with_hyperlink_font_color(palette.link.0)
     .with_selection_color(palette.selection.0)
-    .set_selectable(true);
+    .set_selectable(true)
+    .with_text_cursor(Cursor::IBeam, cx.view.mouse(&format!("ibeam:{key}")));
     chips::prose_with_chips(cx, key, element, &text, path_chips, font_size)
 }
 
@@ -883,7 +892,7 @@ fn render_code_block(cx: &RowContext, key: &str, language: &str, code: &str) -> 
 fn code_text(cx: &RowContext, key: &str, language: &str, code: &str) -> Box<dyn Element> {
     let palette = cx.palette();
     let highlights = cx.view.highlights(key, language, code, palette);
-    Text::new(code.to_owned(), cx.style.mono, cx.sizes().code_font_size)
+    let text = Text::new(code.to_owned(), cx.style.mono, cx.sizes().code_font_size)
         .with_color(palette.text.0)
         .with_line_height_ratio(1.5)
         .with_selection_color(palette.selection.0)
@@ -891,10 +900,24 @@ fn code_text(cx: &RowContext, key: &str, language: &str, code: &str) -> Box<dyn 
             highlight_indices: range.clone().collect(),
             highlight: Highlight::new().with_foreground_color(*color),
         }))
+        .finish();
+    text_cursor_region(cx, &format!("ibeam:{key}"), text)
+}
+
+/// Shows an I-beam over plain selectable text, like the code and the user's bubble.
+fn text_cursor_region(cx: &RowContext, key: &str, text: Box<dyn Element>) -> Box<dyn Element> {
+    Hoverable::new(cx.view.mouse(key), |_| text)
+        .with_cursor(Cursor::IBeam)
+        .with_propagate_drag()
         .finish()
 }
 
-fn render_table(cx: &RowContext, table: &FormattedTable, tone: MarkdownTone) -> Box<dyn Element> {
+fn render_table(
+    cx: &RowContext,
+    key: &str,
+    table: &FormattedTable,
+    tone: MarkdownTone,
+) -> Box<dyn Element> {
     let palette = cx.palette();
     let sizes = cx.sizes();
     let weights = markdown::column_weights(table);
@@ -902,7 +925,10 @@ fn render_table(cx: &RowContext, table: &FormattedTable, tone: MarkdownTone) -> 
         MarkdownTone::Normal => sizes.font_size - 1.,
         MarkdownTone::Muted => sizes.small_font_size,
     };
+    let cell_index = std::cell::Cell::new(0usize);
     let cell = |inline: &markdown_parser::FormattedTextInline, header: bool| {
+        let index = cell_index.get();
+        cell_index.set(index + 1);
         let text = FormattedText::new([FormattedTextLine::Line(inline.clone())]);
         let mut element = FormattedTextElement::new(
             text,
@@ -917,7 +943,11 @@ fn render_table(cx: &RowContext, table: &FormattedTable, tone: MarkdownTone) -> 
         .with_inline_code_border(inline_code_border(cx))
         .with_hyperlink_font_color(palette.link.0)
         .with_selection_color(palette.selection.0)
-        .set_selectable(true);
+        .set_selectable(true)
+        .with_text_cursor(
+            Cursor::IBeam,
+            cx.view.mouse(&format!("ibeam:{key}:{index}")),
+        );
         if header {
             element = element.with_weight(Weight::Semibold);
         }

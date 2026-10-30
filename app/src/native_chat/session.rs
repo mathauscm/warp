@@ -214,7 +214,7 @@ impl ClaudeChatSession {
             effort_override: None,
             artifacts: ArtifactStore::new(artifacts_root()),
         };
-        if let Some(path) = transcript {
+        if let Some(path) = transcript.or_else(|| dev_history(&session.cwd, resume)) {
             session.load_history(path, ctx);
         }
         session.start(ctx);
@@ -1289,6 +1289,23 @@ pub fn saved_provider(cwd: &Path, session_id: &str) -> ChatProvider {
     } else {
         ChatProvider::Claude
     }
+}
+
+/// `PICOLAS_CHAT_HISTORY=<transcript .jsonl>` shows that saved conversation in the new chat
+/// `PICOLAS_OPEN_CHAT` opens, without resuming it, to check how a transcript draws. Debug builds
+/// only.
+fn dev_history(cwd: &Path, resume: bool) -> Option<PathBuf> {
+    if !cfg!(debug_assertions) || resume {
+        return None;
+    }
+    let spec = std::env::var("PICOLAS_OPEN_CHAT").ok()?;
+    let folder = spec
+        .split_once('#')
+        .map_or(spec.as_str(), |(folder, _)| folder);
+    if Path::new(folder) != cwd {
+        return None;
+    }
+    std::env::var_os("PICOLAS_CHAT_HISTORY").map(PathBuf::from)
 }
 
 /// Where the saved conversation `session_id` of `provider` is, when there is one.
