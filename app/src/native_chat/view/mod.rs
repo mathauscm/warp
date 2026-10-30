@@ -1,8 +1,9 @@
-//! The chat pane: the conversation, the composer and the side panel's cards, which float in the
-//! top-right corner when the pane has room for them beside the conversation and open as a popover
-//! otherwise. The pane header only shows when the tab is split.
+//! The chat pane: the conversation, the composer and the side panel's cards, which dock in a column
+//! at the right when the pane has room for them beside the conversation and open as a popover
+//! under the panel toggle otherwise. The pane header only shows when the tab is split.
 
 mod composer;
+mod layout;
 mod side_panel;
 mod transcript;
 mod usage_bar;
@@ -18,10 +19,10 @@ use instant::Instant;
 use pathfinder_geometry::rect::RectF;
 use pathfinder_geometry::vector::vec2f;
 use warpui::elements::{
-    Align, ChildView, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, Dismiss,
-    Element, Expanded, Flex, Hoverable, Icon as SvgIcon, MainAxisAlignment, MainAxisSize,
-    MouseStateHandle, ParentElement, Radius, SavePosition, Shrinkable, SizeConstraintCondition,
-    SizeConstraintSwitch, Stack,
+    Align, Border, ChildView, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, Dismiss,
+    DropShadow, Element, Expanded, Flex, Hoverable, Icon as SvgIcon, MainAxisAlignment,
+    MainAxisSize, MouseStateHandle, ParentElement, Radius, SavePosition, Shrinkable,
+    SizeConstraintCondition, SizeConstraintSwitch, Stack,
 };
 use warpui::platform::Cursor;
 use warpui::text_layout::ClipConfig;
@@ -32,10 +33,16 @@ use warpui::{
 };
 
 use self::composer::{ComposerEvent, ComposerView};
+use self::layout::{
+    CORNER_INSET, LeftInset, MEDIUM_COLUMN_PADDING, NARROW_COLUMN_PADDING, NARROW_PANE_WIDTH,
+    conversation_max_width, docked_cards_width, docked_left_inset, has_room_for_cards,
+    min_width_for_docked_cards,
+};
 use self::side_panel::{SidePanelEvent, SidePanelView};
 use self::transcript::{TranscriptEvent, TranscriptView};
 use super::ClaudeChatPaneSnapshot;
 use super::design::{ChatDesign, ChatDesignEvent, Palette, Sizes};
+use super::provider::ChatProviderSettings;
 use super::registry::{ChatActivity, NativeChatRegistry, NativeChatStatus};
 use super::session::{ClaudeChatSession, ClaudeChatSessionEvent};
 use crate::appearance::Appearance;
@@ -51,10 +58,7 @@ use claude_chat::reducer::ConversationChange;
 const NEW_CHAT_TITLE: &str = "Novo chat";
 const PANEL_TOGGLE_ICON: &str = "bundled/svg/info.svg";
 const PANEL_TOGGLE_TOOLTIP: &str = "Ambiente, contexto e conectores";
-/// Space between the cards and the pane's edge, and between the cards and the conversation.
-const CARD_GAP: f32 = 16.;
-/// The corner layer's own inset; the cards add `side_panel_padding` around themselves.
-const CORNER_INSET: f32 = 4.;
+const POPOVER_RADIUS: f32 = 14.;
 const TOGGLE_PADDING: f32 = 6.;
 const TOGGLE_RADIUS: f32 = 8.;
 /// Keeps the top of the conversation clear of the corner's panel toggle when there's no header.
@@ -79,7 +83,7 @@ pub enum ClaudeChatViewEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClaudeChatViewAction {
-    /// Shows or hides the floating cards, or opens them as a popover when there's no room.
+    /// Shows or hides the docked cards, or opens them as a popover when there's no room.
     ToggleSidePanel,
     DismissSidePanelPopover,
 }
@@ -89,7 +93,7 @@ pub struct ClaudeChatView {
     transcript: ViewHandle<TranscriptView>,
     composer: ViewHandle<ComposerView>,
     side_panel: ViewHandle<SidePanelView>,
-    /// Whether the cards float beside the conversation when the pane has room for them.
+    /// Whether the cards dock beside the conversation when the pane has room for them.
     show_docked_cards: bool,
     is_popover_open: bool,
     popover_dismissed_at: Option<Instant>,
@@ -107,8 +111,11 @@ pub struct ClaudeChatView {
 impl ClaudeChatView {
     pub fn new(snapshot: ClaudeChatPaneSnapshot, ctx: &mut ViewContext<Self>) -> Self {
         let pane_configuration = ctx.add_model(|_| PaneConfiguration::new(NEW_CHAT_TITLE));
+        let provider =
+            snapshot.resolved_provider(*ChatProviderSettings::as_ref(ctx).default_provider);
         let session = ctx.add_model(|ctx| {
-            ClaudeChatSession::new_in_workspace(
+            let mut session = ClaudeChatSession::new_with_provider(
+                provider,
                 snapshot.cwd.clone(),
                 snapshot
                     .workspace
@@ -116,7 +123,11 @@ impl ClaudeChatView {
                     .or_else(|| super::dev_workspace_for(&snapshot.cwd)),
                 snapshot.session_id.clone(),
                 ctx,
-            )
+            );
+            if snapshot.model.is_some() {
+                session.set_model(snapshot.model.clone(), ctx);
+            }
+            session
         });
         let transcript = ctx.add_typed_action_view(|ctx| TranscriptView::new(session.clone(), ctx));
         let send_draft = cfg!(debug_assertions) && std::env::var_os("PICOLAS_CHAT_SEND").is_some();
@@ -195,6 +206,8 @@ impl ClaudeChatView {
                 .then(|| session.session_id().to_owned()),
             cwd: session.cwd().to_path_buf(),
             workspace: session.workspace().cloned(),
+            provider: Some(session.provider()),
+            model: None,
             draft: None,
             artifact_kind: None,
         }
@@ -340,6 +353,23 @@ impl ClaudeChatView {
                 self.transcript
                     .update(ctx, |transcript, ctx| transcript.copy_selection(ctx));
             }
+            ComposerEvent::NewChatWithProvider {
+                provider,
+                model,
+                draft,
+            } => {
+                let session = self.session.as_ref(ctx);
+                let mut snapshot = ClaudeChatPaneSnapshot::new(session.cwd().to_path_buf());
+                snapshot.workspace = session.workspace().cloned();
+                snapshot.provider = Some(*provider);
+                snapshot.model = model.clone();
+                snapshot.draft = draft.clone();
+                // Deferred: opening a chat reads every chat view, this one included.
+                ctx.dispatch_typed_action_deferred(WorkspaceAction::OpenClaudeChatSnapshot {
+                    snapshot: Box::new(snapshot),
+                    group: None,
+                });
+            }
             ComposerEvent::OpenDiff { repo_root } => self.open_diff(repo_root.clone(), ctx),
             ComposerEvent::GitChanged => {
                 let statuses = self.composer.as_ref(ctx).git_statuses().to_vec();
@@ -372,11 +402,7 @@ impl ClaudeChatView {
         let pane_width = ctx
             .element_position_by_id(&self.root_position_id)
             .map_or(0., |rect| rect.width());
-        has_room_for_cards(
-            self.is_in_split_pane(ctx),
-            pane_width,
-            ChatDesign::as_ref(ctx).sizes(),
-        )
+        has_room_for_cards(pane_width, ChatDesign::as_ref(ctx).sizes())
     }
 
     fn toggle_side_panel(&mut self, ctx: &mut ViewContext<Self>) {
@@ -426,9 +452,9 @@ impl ClaudeChatView {
         )
     }
 
-    /// The top-right corner over the conversation: the panel toggle when the pane has no header,
-    /// and the cards when `show_cards`. A popover closes when clicked outside.
-    fn render_corner(
+    /// The panel toggle when the pane has no header, above the cards when `show_cards`; a popover
+    /// gets its own frame.
+    fn render_cards_column(
         &self,
         show_toggle: bool,
         show_cards: bool,
@@ -456,14 +482,35 @@ impl ClaudeChatView {
             );
         }
         if show_cards {
-            column
-                .add_child(Shrinkable::new(1., ChildView::new(&self.side_panel).finish()).finish());
+            let cards = ChildView::new(&self.side_panel).finish();
+            let cards = if is_popover {
+                Container::new(cards)
+                    .with_background_color(palette.page.0)
+                    .with_border(Border::all(1.).with_border_color(palette.border_strong.0))
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(POPOVER_RADIUS)))
+                    .with_drop_shadow(DropShadow {
+                        color: palette.shadow.0,
+                        offset: vec2f(0., 8.),
+                        blur_radius: sizes.shadow_blur * 1.5,
+                        spread_radius: 0.,
+                    })
+                    .finish()
+            } else {
+                cards
+            };
+            column.add_child(Shrinkable::new(1., cards).finish());
         }
-        let mut corner = Container::new(column.finish())
+        Container::new(column.finish())
             .with_padding_top(CORNER_INSET)
             .with_padding_right(CORNER_INSET)
-            .finish();
-        if is_popover && show_cards {
+            .finish()
+    }
+
+    /// The top-right corner over the conversation: the panel toggle when the pane has no header,
+    /// and the cards' popover when it's open, which closes when clicked outside.
+    fn render_corner(&self, show_toggle: bool, app: &AppContext) -> Box<dyn Element> {
+        let mut corner = self.render_cards_column(show_toggle, self.is_popover_open, true, app);
+        if self.is_popover_open {
             corner = Dismiss::new(corner)
                 .on_dismiss(|ctx, _| {
                     ctx.dispatch_typed_action(ClaudeChatViewAction::DismissSidePanelPopover);
@@ -472,16 +519,82 @@ impl ClaudeChatView {
         }
         Align::new(corner).top_right().finish()
     }
-}
 
-/// The narrowest pane that fits the cards beside the centered conversation.
-fn min_width_for_docked_cards(sizes: &Sizes) -> f32 {
-    sizes.column_max_width + 2. * (sizes.side_panel_width + 2. * CARD_GAP)
-}
+    /// The transcript over the composer, centered with at most the column's width; the side
+    /// padding narrows with the space.
+    fn render_conversation(&self, top_padding: f32, sizes: &Sizes) -> Box<dyn Element> {
+        let max_width = sizes.column_max_width + 2. * sizes.column_padding;
+        let padded = |padding: f32| {
+            let column = ConstrainedBox::new(
+                Flex::column()
+                    .with_child(
+                        Expanded::new(1., ChildView::new(&self.transcript).finish()).finish(),
+                    )
+                    .with_child(
+                        Container::new(ChildView::new(&self.composer).finish())
+                            .with_padding_bottom(sizes.composer_bottom_margin)
+                            .finish(),
+                    )
+                    .finish(),
+            )
+            .with_max_width(max_width)
+            .finish();
+            Flex::row()
+                .with_main_axis_alignment(MainAxisAlignment::Center)
+                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                .with_main_axis_size(MainAxisSize::Max)
+                .with_child(
+                    Expanded::new(
+                        1.,
+                        Container::new(column)
+                            .with_horizontal_padding(padding)
+                            .with_padding_top(top_padding)
+                            .finish(),
+                    )
+                    .finish(),
+                )
+                .finish()
+        };
+        SizeConstraintSwitch::new(
+            padded(sizes.column_padding),
+            [
+                (
+                    SizeConstraintCondition::WidthLessThan(NARROW_PANE_WIDTH),
+                    padded(NARROW_COLUMN_PADDING.min(sizes.column_padding)),
+                ),
+                (
+                    SizeConstraintCondition::WidthLessThan(conversation_max_width(sizes)),
+                    padded(MEDIUM_COLUMN_PADDING.min(sizes.column_padding)),
+                ),
+            ],
+        )
+        .finish()
+    }
 
-/// Whether the cards float beside the conversation; otherwise they only open as a popover.
-fn has_room_for_cards(is_in_split_pane: bool, pane_width: f32, sizes: &Sizes) -> bool {
-    !is_in_split_pane && pane_width >= min_width_for_docked_cards(sizes)
+    /// The conversation with the cards docked in a column at its right, kept centered in the
+    /// pane while there's room.
+    fn render_docked(
+        &self,
+        top_padding: f32,
+        show_toggle: bool,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let sizes = ChatDesign::as_ref(app).sizes().clone();
+        let cards = ConstrainedBox::new(
+            Align::new(self.render_cards_column(show_toggle, true, false, app))
+                .top_right()
+                .finish(),
+        )
+        .with_width(docked_cards_width(&sizes))
+        .finish();
+        let row = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_child(Expanded::new(1., self.render_conversation(top_padding, &sizes)).finish())
+            .with_child(cards)
+            .finish();
+        LeftInset::new(move |width| docked_left_inset(width, &sizes), row).finish()
+    }
 }
 
 /// The small button in the corner that shows or hides the cards when the pane has no header.
@@ -612,60 +725,36 @@ impl View for ClaudeChatView {
         let palette = design.palette(app);
         let sizes = design.sizes();
         let is_in_split_pane = self.is_in_split_pane(app);
-
-        let column = ConstrainedBox::new(
-            Flex::column()
-                .with_child(Expanded::new(1., ChildView::new(&self.transcript).finish()).finish())
-                .with_child(
-                    Container::new(ChildView::new(&self.composer).finish())
-                        .with_padding_bottom(sizes.composer_bottom_margin)
-                        .finish(),
-                )
-                .finish(),
-        )
-        .with_max_width(sizes.column_max_width + 2. * sizes.column_padding)
-        .finish();
-
-        let chat = Container::new(
-            Flex::row()
-                .with_main_axis_alignment(MainAxisAlignment::Center)
-                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
-                .with_main_axis_size(MainAxisSize::Max)
-                .with_child(
-                    Expanded::new(
-                        1.,
-                        Container::new(column)
-                            .with_horizontal_padding(sizes.column_padding)
-                            .with_padding_top(if is_in_split_pane {
-                                0.
-                            } else {
-                                HEADERLESS_TOP_PADDING
-                            })
-                            .finish(),
-                    )
-                    .finish(),
-                )
-                .finish(),
-        )
-        .with_background_color(palette.page.0)
-        .finish();
-
-        let corner = if is_in_split_pane {
-            self.render_corner(false, self.is_popover_open, true, app)
+        let show_toggle = !is_in_split_pane;
+        let top_padding = if is_in_split_pane {
+            0.
         } else {
+            HEADERLESS_TOP_PADDING
+        };
+
+        let undocked = Stack::new()
+            .with_child(self.render_conversation(top_padding, sizes))
+            .with_child(self.render_corner(show_toggle, app))
+            .finish();
+        let content = if self.show_docked_cards {
             SizeConstraintSwitch::new(
-                self.render_corner(true, self.show_docked_cards, false, app),
+                self.render_docked(top_padding, show_toggle, app),
                 [(
                     SizeConstraintCondition::WidthLessThan(min_width_for_docked_cards(sizes)),
-                    self.render_corner(true, self.is_popover_open, true, app),
+                    undocked,
                 )],
             )
             .finish()
+        } else {
+            undocked
         };
-        Stack::new()
-            .with_child(SavePosition::new(chat, &self.root_position_id).finish())
-            .with_child(corner)
-            .finish()
+        SavePosition::new(
+            Container::new(content)
+                .with_background_color(palette.page.0)
+                .finish(),
+            &self.root_position_id,
+        )
+        .finish()
     }
 }
 

@@ -3,7 +3,7 @@ use claude_chat::timeline::{TodoItem, TodoStatus};
 use serde_json::json;
 
 use super::logic::*;
-use super::ring_icon;
+use super::{ring_icon, token_height_percent};
 use crate::native_chat::view::SidePanelSection;
 
 fn command(name: &str, description: &str, builtin: bool) -> SlashCommand {
@@ -305,4 +305,18 @@ fn artifact_kinds_have_placeholders_and_instructions() {
     let instructions = artifact_instructions(ArtifactKind::Presentation);
     assert!(instructions.contains("\"presentation\""));
     assert!(instructions.contains("create_artifact"));
+}
+
+#[test]
+fn tokens_fit_in_their_line() {
+    // The text layout pads a bordered run by a fifth of the font size.
+    let pill_height =
+        |line_height_ratio: f32| f32::from(token_height_percent(line_height_ratio)) / 100. + 0.2;
+    for line_height_ratio in [1.5, 1.55, 1.6, 1.7] {
+        assert!(pill_height(line_height_ratio) < line_height_ratio);
+    }
+    assert_eq!(token_height_percent(1.55), 125);
+    // Never shorter than the text it holds, nor taller than a pill needs.
+    assert_eq!(token_height_percent(1.2), 120);
+    assert_eq!(token_height_percent(3.), 140);
 }

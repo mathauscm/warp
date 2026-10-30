@@ -254,8 +254,8 @@ pub(super) fn compacted_label(pre_tokens: Option<u64>, post_tokens: Option<u64>)
 /// Why a turn ended in error, from the `result` subtype.
 pub(super) fn turn_error_label(subtype: &str) -> String {
     match subtype {
-        "error_max_turns" => "Claude parou: limite de turnos atingido.".to_owned(),
-        "error_max_budget_usd" => "Claude parou: limite de custo atingido.".to_owned(),
+        "error_max_turns" => "Parou: limite de turnos atingido.".to_owned(),
+        "error_max_budget_usd" => "Parou: limite de custo atingido.".to_owned(),
         "error_during_execution" => "A resposta foi interrompida por um erro.".to_owned(),
         "" | "success" => "A resposta terminou com um erro.".to_owned(),
         other => format!("A resposta terminou com um erro ({other})."),

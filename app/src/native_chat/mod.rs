@@ -3,7 +3,9 @@
 
 mod artifacts;
 pub mod artifacts_view;
+pub mod claude_update;
 pub mod design;
+pub mod provider;
 pub mod registry;
 pub mod session;
 pub mod view;
@@ -11,6 +13,8 @@ pub mod view;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+pub use self::provider::ChatProvider;
 
 /// The Threads panel workspace a chat belongs to (see `crate::claude_threads::ThreadWorkspace`),
 /// as of when the chat opened.
@@ -46,6 +50,11 @@ pub struct ClaudeChatPaneSnapshot {
     pub cwd: PathBuf,
     /// The workspace whose other folders Claude gets access to, if the chat is in one.
     pub workspace: Option<ChatWorkspace>,
+    /// The CLI the chat drives. `None` picks the CLI whose saved conversation `session_id` is,
+    /// and the default provider of Settings for a new chat.
+    pub provider: Option<ChatProvider>,
+    /// The model a new chat starts with, like one picked for another provider. Not persisted.
+    pub model: Option<String>,
     /// Text to start the composer with, like an artifact's starter prompt. Not persisted.
     pub draft: Option<String>,
     /// The kind of artifact (`ArtifactKind::as_str`) the first message asks for, from a gallery
@@ -60,6 +69,8 @@ impl ClaudeChatPaneSnapshot {
             session_id: None,
             cwd,
             workspace: None,
+            provider: None,
+            model: None,
             draft: None,
             artifact_kind: None,
         }
@@ -71,8 +82,20 @@ impl ClaudeChatPaneSnapshot {
             session_id: Some(session_id),
             cwd,
             workspace: None,
+            provider: None,
+            model: None,
             draft: None,
             artifact_kind: None,
+        }
+    }
+
+    /// The provider the chat opens with: the one it was saved with, else the CLI that saved the
+    /// conversation `session_id`, and `default` for a new chat.
+    pub fn resolved_provider(&self, default: ChatProvider) -> ChatProvider {
+        match (self.provider, &self.session_id) {
+            (Some(provider), _) => provider,
+            (None, Some(session_id)) => session::saved_provider(&self.cwd, session_id),
+            (None, None) => default,
         }
     }
 }
@@ -83,6 +106,7 @@ pub use view::{ClaudeChatView, ClaudeChatViewEvent};
 /// first window opens, `PICOLAS_CHAT_DRAFT=<text>` starts its composer with text,
 /// `PICOLAS_CHAT_ARTIFACT_KIND=motion` starts it as a new artifact of that kind,
 /// `PICOLAS_CHAT_SEND=1` sends that text right away (with `PICOLAS_CHAT_MODEL=haiku`, say),
+/// `PICOLAS_CHAT_PROVIDER=codex` drives Codex instead of Claude,
 /// `PICOLAS_CHAT_PANEL=1` opens its side panel and `PICOLAS_WINDOW_WIDTH=<px>` sizes the window.
 /// `PICOLAS_OPEN_ARTIFACTS=1` opens the artifacts gallery (see
 /// [`take_dev_open_artifacts_action`]), or `=<artifact id>` that artifact. Debug builds only.
@@ -98,6 +122,20 @@ pub fn take_dev_open_chat_action() -> Option<crate::workspace::WorkspaceAction> 
         Some((cwd, session_id)) => (cwd.to_owned(), Some(session_id.to_owned())),
         None => (spec, None),
     };
+    if let Some(provider) = std::env::var("PICOLAS_CHAT_PROVIDER")
+        .ok()
+        .as_deref()
+        .and_then(ChatProvider::parse)
+    {
+        let mut snapshot = ClaudeChatPaneSnapshot::new(PathBuf::from(cwd));
+        snapshot.session_id = session_id;
+        snapshot.provider = Some(provider);
+        snapshot.draft = std::env::var("PICOLAS_CHAT_DRAFT").ok();
+        return Some(crate::workspace::WorkspaceAction::OpenClaudeChatSnapshot {
+            snapshot: Box::new(snapshot),
+            group: None,
+        });
+    }
     Some(crate::workspace::WorkspaceAction::OpenClaudeChat {
         cwd: PathBuf::from(cwd),
         session_id,

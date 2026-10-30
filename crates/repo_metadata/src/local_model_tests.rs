@@ -3685,3 +3685,79 @@ fn lazy_root_created_directory_inserted_as_placeholder() {
         );
     });
 }
+
+/// A lazy root holding another tracked root (a folder of repos) gets the watcher changes made
+/// inside that inner root, not only the inner root itself.
+#[cfg(feature = "local_fs")]
+#[test]
+fn watcher_changes_inside_a_nested_root_reach_the_enclosing_lazy_root() {
+    VirtualFS::test(
+        "watcher_changes_reach_enclosing_lazy_root",
+        |dirs, mut vfs| {
+            vfs.mkdir("workspace/repo/src")
+                .with_files(vec![Stub::FileWithContent("workspace/repo/README.md", "x")]);
+            let workspace =
+                StandardizedPath::from_local_canonicalized(&dirs.tests().join("workspace"))
+                    .unwrap();
+            let repo =
+                StandardizedPath::from_local_canonicalized(&dirs.tests().join("workspace/repo"))
+                    .unwrap();
+
+            App::test((), |mut app| async move {
+                app.add_singleton_model(DirectoryWatcher::new_for_testing);
+                let model_handle = app.add_model(|_| LocalRepoMetadataModel::new_for_test());
+                for root in [&workspace, &repo] {
+                    model_handle.update(&mut app, |model, ctx| {
+                        model.index_lazy_loaded_path(root, ctx).unwrap();
+                    });
+                    await_build_tasks_for_repo(&mut app, &model_handle, root).await;
+                }
+                model_handle.update(&mut app, |model, ctx| {
+                    model.load_directory(&workspace, &repo, ctx).unwrap();
+                });
+                await_build_tasks_for_repo(&mut app, &model_handle, &workspace).await;
+
+                let (tx, rx) = oneshot::channel();
+                let sender = Rc::new(RefCell::new(Some(tx)));
+                let workspace_for_event = workspace.clone();
+                app.update(|ctx| {
+                    ctx.subscribe_to_model(&model_handle, move |_, event, _ctx| {
+                        if let RepositoryMetadataEvent::FileTreeEntryUpdated { path, .. } = event
+                            && path == &workspace_for_event
+                            && let Some(tx) = sender.borrow_mut().take()
+                        {
+                            let _ = tx.send(());
+                        }
+                    });
+                });
+
+                let env_file = repo.to_local_path().unwrap().join(".env");
+                std::fs::write(&env_file, "KEY=value").unwrap();
+                model_handle.update(&mut app, |model, ctx| {
+                    model.handle_watcher_event(
+                        &BulkFilesystemWatcherEvent {
+                            added: std::collections::HashSet::from([env_file.clone()]),
+                            ..Default::default()
+                        },
+                        ctx,
+                    );
+                });
+                rx.with_timeout(Duration::from_secs(5))
+                    .await
+                    .expect("timed out waiting for the enclosing lazy root update")
+                    .expect("update sender dropped");
+
+                let env_path = StandardizedPath::from_local_canonicalized(&env_file).unwrap();
+                model_handle.read(&app, |model, _ctx| {
+                    for root in [&workspace, &repo] {
+                        let Some(IndexedRepoState::Indexed(state)) = model.repository_state(root)
+                        else {
+                            panic!("expected {root} to be indexed");
+                        };
+                        assert!(state.entry.contains(&env_path), "{root} should list .env");
+                    }
+                });
+            });
+        },
+    );
+}

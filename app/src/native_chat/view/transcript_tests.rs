@@ -460,3 +460,17 @@ fn lightbox_descriptions_name_the_image_and_count_the_message_images() {
         Some("tela.png  ·  3 / 3")
     );
 }
+
+#[test]
+fn paste_previews_keep_a_few_short_lines() {
+    let text = (1..=30)
+        .map(|n| format!("linha {n}: {}", "x".repeat(80)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let preview = super::chips::paste_preview(&text, 30);
+    let lines: Vec<&str> = preview.lines().collect();
+    assert_eq!(lines.len(), 7);
+    assert!(lines[0].ends_with('…'));
+    assert_eq!(lines[6], "… mais 24 linhas");
+    assert_eq!(super::chips::paste_preview("curto", 1), "curto");
+}

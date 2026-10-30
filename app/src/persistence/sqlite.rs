@@ -1420,6 +1420,9 @@ fn save_pane_state(
                     .workspace
                     .as_ref()
                     .and_then(|workspace| serde_json::to_string(workspace).ok()),
+                provider: snapshot
+                    .provider
+                    .map(|provider| provider.as_str().to_owned()),
             };
             diesel::insert_into(schema::claude_chat_panes::dsl::claude_chat_panes)
                 .values(claude_chat_pane)
@@ -2421,6 +2424,11 @@ fn read_node(conn: &mut SqliteConnection, node: model::PaneNode) -> Result<PaneN
                         workspace: pane
                             .workspace
                             .and_then(|json| serde_json::from_str(&json).ok()),
+                        provider: pane
+                            .provider
+                            .as_deref()
+                            .and_then(crate::native_chat::ChatProvider::parse),
+                        model: None,
                         draft: None,
                         artifact_kind: None,
                     })

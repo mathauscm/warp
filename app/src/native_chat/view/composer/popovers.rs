@@ -1,8 +1,10 @@
 //! What floats over the composer: the "/" command and "@" file menus, the model and effort
-//! picker, the permission mode menu and the list of a multi-folder chat's repositories.
+//! picker (with its Claude / Codex switch), the permission mode menu and the list of a
+//! multi-folder chat's repositories.
 
+use claude_chat::codex::INSTALL_HINT as CODEX_INSTALL_HINT;
 use warp_core::ui::Icon as WarpIcon;
-use warpui::AppContext;
+use warpui::elements::MouseStateHandle;
 use warpui::elements::{
     Align, Border, ChildAnchor, ClippedScrollable, ConstrainedBox, Container, CrossAxisAlignment,
     Dismiss, DropShadow, Element, Expanded, Fill as ElementFill, Flex, Hoverable,
@@ -12,9 +14,14 @@ use warpui::elements::{
 use warpui::fonts::{Properties, Weight};
 use warpui::geometry::vector::vec2f;
 use warpui::platform::Cursor;
+use warpui::{AppContext, ViewContext};
 
 use super::widgets::{Look, icon, svg, with_alpha};
-use super::{ComposerAction, ComposerView, MENU_VISIBLE_ROWS, Menu, PickerPage, git_status, logic};
+use super::{
+    ComposerAction, ComposerEvent, ComposerView, MENU_VISIBLE_ROWS, Menu, PickerPage, git_status,
+    logic,
+};
+use crate::native_chat::provider::{self, ChatProvider};
 
 const PICKER_WIDTH: f32 = 260.;
 const PICKER_PADDING: f32 = 12.;
@@ -29,6 +36,86 @@ const SLIDER_INSET: f32 = SLIDER_HEIGHT / 2.;
 const RESET_ICON: &str = "bundled/svg/picolas-reset.svg";
 const CHEVRON_RIGHT_ICON: &str = "bundled/svg/picolas-chevron-right.svg";
 const CHECK_ICON: &str = "bundled/svg/picolas-check.svg";
+/// Claude Code's model aliases, offered from a Codex chat before any Claude chat reported its list.
+const CLAUDE_FALLBACK_MODELS: [(&str, &str, &str); 4] = [
+    ("default", "Default", "O modelo padrão do Claude Code"),
+    ("opus", "Opus", "O mais capaz, para tarefas complexas"),
+    (
+        "sonnet",
+        "Sonnet",
+        "Equilíbrio entre capacidade e velocidade",
+    ),
+    ("haiku", "Haiku", "O mais rápido"),
+];
+
+/// The model picker's Claude / Codex switch.
+#[derive(Default)]
+pub(super) struct ProviderPicker {
+    /// The provider whose models the picker lists, when it isn't the chat's own.
+    browsing: Option<ChatProvider>,
+    tabs: [MouseStateHandle; 2],
+}
+
+impl ProviderPicker {
+    pub(super) fn reset(&mut self) {
+        self.browsing = None;
+    }
+}
+
+/// A model the picker lists for a provider other than the chat's.
+struct ModelChoice {
+    /// `None` for the provider's default model.
+    value: Option<String>,
+    name: String,
+    description: String,
+}
+
+/// The models of `provider` the picker offers from a chat of the other provider.
+fn model_choices(provider: ChatProvider) -> Vec<ModelChoice> {
+    match provider {
+        ChatProvider::Claude => {
+            let known = provider::claude_models();
+            if known.is_empty() {
+                CLAUDE_FALLBACK_MODELS
+                    .iter()
+                    .map(|(value, name, description)| ModelChoice {
+                        value: Some((*value).to_owned()),
+                        name: (*name).to_owned(),
+                        description: (*description).to_owned(),
+                    })
+                    .collect()
+            } else {
+                known
+                    .into_iter()
+                    .map(|model| ModelChoice {
+                        name: if model.display_name.is_empty() {
+                            model.value.clone()
+                        } else {
+                            model.display_name.clone()
+                        },
+                        description: model.description,
+                        value: Some(model.value),
+                    })
+                    .collect()
+            }
+        }
+        ChatProvider::Codex => std::iter::once(ModelChoice {
+            value: None,
+            name: "Padrão".to_owned(),
+            description: "O modelo configurado no Codex CLI".to_owned(),
+        })
+        .chain(
+            provider::codex_models()
+                .into_iter()
+                .map(|model| ModelChoice {
+                    value: Some(model.id),
+                    name: model.display_name,
+                    description: model.description,
+                }),
+        )
+        .collect(),
+    }
+}
 
 impl ComposerView {
     /// A floating surface with a soft shadow; clicking outside it closes the popovers.
@@ -435,10 +522,237 @@ impl ComposerView {
         self.popover(look, row, true)
     }
 
+    /// Lists the models of `provider` in the picker.
+    pub(super) fn browse_provider(&mut self, provider: ChatProvider, ctx: &mut ViewContext<Self>) {
+        let own = self.session.as_ref(ctx).provider();
+        self.provider_picker.browsing = (provider != own).then_some(provider);
+        ctx.notify();
+    }
+
+    /// Switches to the model at `index` of another provider's list: in place for a chat that
+    /// hasn't started its conversation, else in a new chat that takes the draft along.
+    pub(super) fn choose_provider_model(
+        &mut self,
+        provider: ChatProvider,
+        index: usize,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(choice) = model_choices(provider).into_iter().nth(index) else {
+            return;
+        };
+        self.provider_picker.reset();
+        let model = choice.value;
+        let switched = self.session.update(ctx, |session, ctx| {
+            session.switch_provider(provider, model.clone(), ctx)
+        });
+        if !switched {
+            let draft = self.buffer_text(ctx);
+            let draft = (!draft.trim().is_empty()).then_some(draft);
+            if draft.is_some() {
+                self.set_text("", ctx);
+            }
+            ctx.emit(ComposerEvent::NewChatWithProvider {
+                provider,
+                model,
+                draft,
+            });
+        }
+        self.close_popovers(ctx);
+    }
+
+    /// The Claude / Codex switch above the model list.
+    fn render_provider_tabs(&self, look: &Look, shown: ChatProvider) -> Box<dyn Element> {
+        let mut row = Flex::row()
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(4.);
+        for (provider, mouse_state) in ChatProvider::ALL
+            .into_iter()
+            .zip(&self.provider_picker.tabs)
+        {
+            let is_shown = provider == shown;
+            let tab_look = look.clone();
+            row.add_child(
+                Expanded::new(
+                    1.,
+                    Hoverable::new(mouse_state.clone(), move |state| {
+                        let look = &tab_look;
+                        let palette = &look.palette;
+                        let sizes = &look.sizes;
+                        let color = if is_shown {
+                            palette.text.0
+                        } else {
+                            palette.text_muted.0
+                        };
+                        let mut tab = Container::new(
+                            Align::new(look.medium_text(
+                                provider.label(),
+                                sizes.small_font_size,
+                                color,
+                            ))
+                            .finish(),
+                        )
+                        .with_vertical_padding(4.)
+                        .with_corner_radius(look.radius(sizes.chip_radius));
+                        if is_shown {
+                            tab = tab.with_background_color(palette.surface_strong.0);
+                        } else if state.is_hovered() {
+                            tab = tab.with_background_color(palette.surface_hover.0);
+                        }
+                        tab.finish()
+                    })
+                    .with_cursor(Cursor::PointingHand)
+                    .on_click(move |ctx, _, _| {
+                        ctx.dispatch_typed_action(ComposerAction::BrowseProvider(provider))
+                    })
+                    .finish(),
+                )
+                .finish(),
+            );
+        }
+        Container::new(row.finish())
+            .with_padding_bottom(4.)
+            .finish()
+    }
+
+    /// The models of a provider other than the chat's.
+    fn render_other_provider_models(
+        &self,
+        provider: ChatProvider,
+        look: &Look,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let palette = &look.palette;
+        let sizes = &look.sizes;
+        let mut list = Flex::column()
+            .with_main_axis_size(MainAxisSize::Min)
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_spacing(1.);
+        let codex_missing = provider == ChatProvider::Codex && provider::codex_cli_path().is_none();
+        let hint = if codex_missing {
+            format!("Codex CLI não encontrado — instale com {CODEX_INSTALL_HINT}")
+        } else if self.session.as_ref(app).has_transcript() {
+            format!("Abre um novo chat com o {}", provider.label())
+        } else {
+            format!("Este chat passa a usar o {}", provider.label())
+        };
+        list.add_child(
+            Container::new(look.paragraph(hint, sizes.tiny_font_size, palette.text_muted.0))
+                .with_horizontal_padding(8.)
+                .with_padding_bottom(4.)
+                .finish(),
+        );
+        if !codex_missing {
+            for (index, choice) in model_choices(provider)
+                .into_iter()
+                .enumerate()
+                .take(self.mouse.models.len())
+            {
+                list.add_child(self.render_model_row(
+                    look,
+                    index,
+                    choice.name,
+                    choice.description,
+                    false,
+                    ComposerAction::ChooseProviderModel { provider, index },
+                ));
+            }
+        }
+        list.finish()
+    }
+
+    /// One row of the model list.
+    fn render_model_row(
+        &self,
+        look: &Look,
+        index: usize,
+        name: String,
+        description: String,
+        is_current: bool,
+        action: ComposerAction,
+    ) -> Box<dyn Element> {
+        let row_look = look.clone();
+        Hoverable::new(self.mouse.models[index].clone(), move |state| {
+            let look = &row_look;
+            let palette = &look.palette;
+            let sizes = &look.sizes;
+            let mut text = Flex::column()
+                .with_main_axis_size(MainAxisSize::Min)
+                .with_cross_axis_alignment(CrossAxisAlignment::Start)
+                .with_spacing(1.)
+                .with_child(look.medium_text(
+                    name.clone(),
+                    sizes.small_font_size + 0.5,
+                    palette.text.0,
+                ));
+            if !description.is_empty() {
+                text.add_child(look.text(
+                    description.clone(),
+                    sizes.tiny_font_size,
+                    palette.text_muted.0,
+                ));
+            }
+            let mut row = Flex::row()
+                .with_main_axis_size(MainAxisSize::Max)
+                .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_spacing(8.)
+                .with_child(Expanded::new(1., text.finish()).finish());
+            if is_current {
+                row.add_child(svg(CHECK_ICON, palette.accent.0, sizes.small_icon_size));
+            }
+            let mut container = Container::new(row.finish())
+                .with_horizontal_padding(8.)
+                .with_vertical_padding(6.)
+                .with_corner_radius(look.radius(sizes.chip_radius));
+            if state.is_hovered() {
+                container = container.with_background_color(palette.surface_hover.0);
+            }
+            container.finish()
+        })
+        .with_cursor(Cursor::PointingHand)
+        .on_click(move |ctx, _, _| ctx.dispatch_typed_action(action.clone()))
+        .finish()
+    }
+
     fn render_models_page(&self, look: &Look, app: &AppContext) -> Box<dyn Element> {
         let palette = &look.palette;
         let sizes = &look.sizes;
         let session = self.session.as_ref(app);
+        let own_provider = session.provider();
+        let shown_provider = self.provider_picker.browsing.unwrap_or(own_provider);
+        if shown_provider != own_provider {
+            let scroll = ConstrainedBox::new(
+                ClippedScrollable::vertical(
+                    self.models_scroll.clone(),
+                    self.render_other_provider_models(shown_provider, look, app),
+                    ScrollbarWidth::Custom(4.),
+                    palette.border_strong.0.into(),
+                    palette.text_faint.0.into(),
+                    ElementFill::None,
+                )
+                .finish(),
+            )
+            .with_max_height(MODELS_MAX_HEIGHT)
+            .finish();
+            return Flex::column()
+                .with_main_axis_size(MainAxisSize::Min)
+                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                .with_spacing(4.)
+                .with_child(self.render_provider_tabs(look, shown_provider))
+                .with_child(
+                    Container::new(look.text(
+                        "Selecionar modelo",
+                        sizes.tiny_font_size,
+                        palette.text_faint.0,
+                    ))
+                    .with_horizontal_padding(8.)
+                    .with_padding_bottom(2.)
+                    .finish(),
+                )
+                .with_child(scroll)
+                .finish();
+        }
         let conversation = session.conversation();
         let models = conversation.models();
         let current = logic::current_model(
@@ -470,53 +784,14 @@ impl ComposerView {
             } else {
                 model.display_name.clone()
             };
-            let description = model.description.clone();
-            let row_look = look.clone();
-            list.add_child(
-                Hoverable::new(self.mouse.models[index].clone(), move |state| {
-                    let look = &row_look;
-                    let palette = &look.palette;
-                    let sizes = &look.sizes;
-                    let mut text = Flex::column()
-                        .with_main_axis_size(MainAxisSize::Min)
-                        .with_cross_axis_alignment(CrossAxisAlignment::Start)
-                        .with_spacing(1.)
-                        .with_child(look.medium_text(
-                            name.clone(),
-                            sizes.small_font_size + 0.5,
-                            palette.text.0,
-                        ));
-                    if !description.is_empty() {
-                        text.add_child(look.text(
-                            description.clone(),
-                            sizes.tiny_font_size,
-                            palette.text_muted.0,
-                        ));
-                    }
-                    let mut row = Flex::row()
-                        .with_main_axis_size(MainAxisSize::Max)
-                        .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
-                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                        .with_spacing(8.)
-                        .with_child(Expanded::new(1., text.finish()).finish());
-                    if is_current {
-                        row.add_child(svg(CHECK_ICON, palette.accent.0, sizes.small_icon_size));
-                    }
-                    let mut container = Container::new(row.finish())
-                        .with_horizontal_padding(8.)
-                        .with_vertical_padding(6.)
-                        .with_corner_radius(look.radius(sizes.chip_radius));
-                    if state.is_hovered() {
-                        container = container.with_background_color(palette.surface_hover.0);
-                    }
-                    container.finish()
-                })
-                .with_cursor(Cursor::PointingHand)
-                .on_click(move |ctx, _, _| {
-                    ctx.dispatch_typed_action(ComposerAction::ChooseModel(index))
-                })
-                .finish(),
-            );
+            list.add_child(self.render_model_row(
+                look,
+                index,
+                name,
+                model.description.clone(),
+                is_current,
+                ComposerAction::ChooseModel(index),
+            ));
         }
         let scroll = ConstrainedBox::new(
             ClippedScrollable::vertical(
@@ -535,6 +810,7 @@ impl ComposerView {
             .with_main_axis_size(MainAxisSize::Min)
             .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
             .with_spacing(4.)
+            .with_child(self.render_provider_tabs(look, own_provider))
             .with_child(
                 Container::new(look.text(
                     "Selecionar modelo",

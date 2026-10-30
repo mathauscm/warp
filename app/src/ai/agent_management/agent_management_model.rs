@@ -7,8 +7,8 @@ use crate::BlocklistAIHistoryModel;
 use crate::ai::active_agent_views_model::{ActiveAgentViewsEvent, ActiveAgentViewsModel};
 use crate::ai::agent::conversation::{AIConversationId, ConversationStatus};
 use crate::ai::agent_management::notifications::{
-    NotificationCategory, NotificationId, NotificationItem, NotificationItems, NotificationOrigin,
-    NotificationSourceAgent,
+    ClaudeCodeUpdateNotice, NotificationCategory, NotificationFilter, NotificationId,
+    NotificationItem, NotificationItems, NotificationOrigin, NotificationSourceAgent,
 };
 use crate::ai::artifacts::Artifact;
 use crate::ai::blocklist::{BlocklistAIHistoryEvent, ConversationStatusUpdate, QueuedQueryModel};
@@ -25,6 +25,7 @@ use crate::workspace::{Workspace, WorkspaceRegistry};
 /// cli agent sessions.
 pub struct AgentNotificationsModel {
     notifications: NotificationItems,
+    claude_code_update: Option<ClaudeCodeUpdateNotice>,
     /// Artifacts accumulated during the current turn for each conversation.
     /// Drained into the notification when a terminal state fires, cleared on InProgress.
     pub(crate) pending_artifacts: HashMap<AIConversationId, Vec<Artifact>>,
@@ -55,12 +56,57 @@ impl AgentNotificationsModel {
 
         Self {
             notifications: NotificationItems::default(),
+            claude_code_update: None,
             pending_artifacts: HashMap::new(),
         }
     }
 
     pub(crate) fn notifications(&self) -> &NotificationItems {
         &self.notifications
+    }
+
+    pub(crate) fn claude_code_update(&self) -> Option<&ClaudeCodeUpdateNotice> {
+        self.claude_code_update.as_ref()
+    }
+
+    /// Shows, changes or, with `None`, removes the Claude Code update notice. A notice for the
+    /// version the user already saw stays read.
+    pub(crate) fn set_claude_code_update(
+        &mut self,
+        notice: Option<ClaudeCodeUpdateNotice>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let notice = notice.map(|mut notice| {
+            notice.is_read |= self
+                .claude_code_update
+                .as_ref()
+                .is_some_and(|current| current.is_read && current.latest == notice.latest);
+            notice
+        });
+        if self.claude_code_update != notice {
+            self.claude_code_update = notice;
+            ctx.emit(AgentManagementEvent::NotificationUpdated);
+        }
+    }
+
+    pub(crate) fn mark_claude_code_update_read(&mut self, ctx: &mut ModelContext<Self>) {
+        if let Some(notice) = &mut self.claude_code_update
+            && !notice.is_read
+        {
+            notice.is_read = true;
+            ctx.emit(AgentManagementEvent::NotificationUpdated);
+        }
+    }
+
+    /// The agents' unread notifications plus an unread Claude Code update notice.
+    pub(crate) fn unread_count(&self) -> usize {
+        self.notifications
+            .filtered_count(NotificationFilter::Unread)
+            + usize::from(
+                self.claude_code_update
+                    .as_ref()
+                    .is_some_and(|notice| !notice.is_read),
+            )
     }
 
     pub(crate) fn mark_item_read(&mut self, id: NotificationId, ctx: &mut ModelContext<Self>) {
@@ -70,6 +116,7 @@ impl AgentNotificationsModel {
     }
 
     pub(crate) fn mark_all_items_read(&mut self, ctx: &mut ModelContext<Self>) {
+        self.mark_claude_code_update_read(ctx);
         if self.notifications.mark_all_items_read() {
             ctx.emit(AgentManagementEvent::AllNotificationsMarkedRead);
         }

@@ -1,4 +1,5 @@
-//! One native chat's connection to Claude Code: the `claude` process driven over stream-json, the
+//! One native chat's connection to its CLI: Claude Code driven over stream-json, or Codex through
+//! `codex app-server` (translated into the same messages, see `claude_chat::codex`), the
 //! conversation it builds, and the requests the UI answers. Views observe it through
 //! [`ClaudeChatSessionEvent`]s.
 
@@ -7,6 +8,8 @@ use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
 use claude_chat::artifacts::{self, ArtifactContext, ArtifactStore};
+use claude_chat::codex::{self, CodexClient, CodexConfig, CodexEvent, CodexProcess};
+use claude_chat::codex_history;
 use claude_chat::history::{self, LoadedTranscript};
 use claude_chat::inline::{self, ComposedMessage};
 use claude_chat::process::{self, ClaudeProcess, SpawnConfig};
@@ -24,6 +27,7 @@ use warpui::r#async::Timer;
 use warpui::{Entity, ModelContext, SingletonEntity};
 
 use super::ChatWorkspace;
+use super::provider::{self, ChatProvider, ChatProviderSettings};
 use crate::terminal::local_shell::LocalShellState;
 
 /// How often MCP servers are polled while some are still connecting.
@@ -36,6 +40,9 @@ const TITLE_MAX_CHARS: usize = 60;
 /// prompt, a headless CLI introduces itself as a generic "Claude agent" instead of Claude Code.
 const APPEND_SYSTEM_PROMPT: &str =
     "You are running inside Picolas Code, a desktop app with a native chat UI for Claude Code.";
+/// Codex's counterpart of [`APPEND_SYSTEM_PROMPT`], sent as developer instructions.
+const CODEX_INSTRUCTIONS: &str =
+    "You are running inside Picolas Code, a desktop app with a native chat UI for Codex.";
 
 /// Where the native chat keeps its artifacts.
 pub fn artifacts_root() -> PathBuf {
@@ -120,6 +127,7 @@ pub enum PlanAnswer {
 }
 
 pub struct ClaudeChatSession {
+    provider: ChatProvider,
     cwd: PathBuf,
     /// The Threads panel workspace the chat is in, whose other folders Claude gets access to.
     workspace: Option<ChatWorkspace>,
@@ -132,6 +140,11 @@ pub struct ClaudeChatSession {
     conversation: Conversation,
     tracker: claude_chat::reducer::RequestTracker,
     process: Option<ClaudeProcess>,
+    /// The app server of a Codex chat, and the client translating its messages.
+    codex_process: Option<CodexProcess>,
+    codex: Option<CodexClient>,
+    /// Counts starts, so a start superseded before its process spawned doesn't spawn one.
+    start_generation: u64,
     state: ProcessState,
     /// Lines written before the process started, sent once it's up.
     queued_lines: Vec<String>,
@@ -154,18 +167,34 @@ impl ClaudeChatSession {
         session_id: Option<String>,
         ctx: &mut ModelContext<Self>,
     ) -> Self {
-        let transcript = session_id.as_deref().and_then(|session_id| {
-            let home = claude_home()?;
-            let path = history::transcript_path(&home, &cwd, session_id);
-            if path.exists() {
-                Some(path)
-            } else {
-                history::find_transcript(&home, session_id)
-            }
-        });
+        Self::new_with_provider(ChatProvider::Claude, cwd, workspace, session_id, ctx)
+    }
+
+    /// [`Self::new_in_workspace`] driving `provider`'s CLI. A Codex `session_id` is its thread id.
+    pub fn new_with_provider(
+        provider: ChatProvider,
+        cwd: PathBuf,
+        workspace: Option<ChatWorkspace>,
+        session_id: Option<String>,
+        ctx: &mut ModelContext<Self>,
+    ) -> Self {
+        let transcript = session_id
+            .as_deref()
+            .and_then(|session_id| transcript_path(provider, &cwd, session_id));
         let resume = transcript.is_some();
         let session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let model_override = match provider {
+            ChatProvider::Claude => None,
+            ChatProvider::Codex => Some(
+                ChatProviderSettings::as_ref(ctx)
+                    .codex_default_model
+                    .trim()
+                    .to_owned(),
+            )
+            .filter(|model| !model.is_empty()),
+        };
         let mut session = Self {
+            provider,
             cwd,
             workspace,
             session_id: session_id.clone(),
@@ -175,10 +204,13 @@ impl ClaudeChatSession {
             conversation: Conversation::new(Some(session_id)),
             tracker: Default::default(),
             process: None,
+            codex_process: None,
+            codex: None,
+            start_generation: 0,
             state: ProcessState::Starting,
             queued_lines: Vec::new(),
             history_loaded: transcript.is_none(),
-            model_override: None,
+            model_override,
             effort_override: None,
             artifacts: ArtifactStore::new(artifacts_root()),
         };
@@ -191,6 +223,15 @@ impl ClaudeChatSession {
 
     pub fn conversation(&self) -> &Conversation {
         &self.conversation
+    }
+
+    pub fn provider(&self) -> ChatProvider {
+        self.provider
+    }
+
+    /// Whether the CLI's process is up.
+    fn has_process(&self) -> bool {
+        self.process.is_some() || self.codex_process.is_some()
     }
 
     pub fn cwd(&self) -> &Path {
@@ -243,15 +284,28 @@ impl ClaudeChatSession {
     fn start(&mut self, ctx: &mut ModelContext<Self>) {
         self.state = ProcessState::Starting;
         ctx.emit(ClaudeChatSessionEvent::ProcessStateChanged);
+        if self.provider == ChatProvider::Codex {
+            // Created right away so messages sent while the app server starts wait in it; its
+            // handshake waits in `queued_lines` until the process is up.
+            self.start_codex_client(ctx);
+        }
+        self.start_generation += 1;
+        let generation = self.start_generation;
         let path_future = LocalShellState::handle(ctx)
             .update(ctx, |shell, ctx| shell.get_interactive_path_env_var(ctx));
-        ctx.spawn(path_future, |me, path_env, ctx| {
-            me.spawn_process(path_env, ctx)
+        ctx.spawn(path_future, move |me, path_env, ctx| {
+            if me.start_generation == generation {
+                me.spawn_process(path_env, ctx)
+            }
         });
     }
 
     fn spawn_process(&mut self, path_env: Option<String>, ctx: &mut ModelContext<Self>) {
         let path_env = path_env.or_else(|| std::env::var("PATH").ok());
+        if self.provider == ChatProvider::Codex {
+            self.spawn_codex(path_env, ctx);
+            return;
+        }
         let Some(claude_path) = process::find_claude(path_env.as_deref()) else {
             self.fail_to_start(
                 "O Claude Code não foi encontrado. Instale com `npm install -g \
@@ -309,6 +363,145 @@ impl ClaudeChatSession {
         self.poll_mcp_status(MCP_POLL_ATTEMPTS, ctx);
     }
 
+    fn spawn_codex(&mut self, path_env: Option<String>, ctx: &mut ModelContext<Self>) {
+        let Some(codex_path) = provider::find_codex(path_env.as_deref()) else {
+            self.fail_to_start(
+                format!(
+                    "O Codex CLI não foi encontrado. Instale com `{}` e faça login com `codex`.",
+                    codex::INSTALL_HINT
+                ),
+                ctx,
+            );
+            return;
+        };
+        let mut spawn_config = codex::SpawnConfig::new(codex_path, self.cwd.clone());
+        spawn_config.path_env = path_env;
+        let (process, driver) = match codex::spawn(&spawn_config) {
+            Ok(spawned) => spawned,
+            Err(err) => {
+                self.fail_to_start(format!("Não foi possível iniciar o Codex: {err}"), ctx);
+                return;
+            }
+        };
+        ctx.spawn_stream_local(
+            process.messages(),
+            |me, message, ctx| me.on_codex_message(message, ctx),
+            |_, _| {},
+        );
+        ctx.spawn(driver, |me, status, ctx| me.on_process_exit(status, ctx));
+        self.codex_process = Some(process);
+        self.state = ProcessState::Running;
+        ctx.emit(ClaudeChatSessionEvent::ProcessStateChanged);
+        for line in std::mem::take(&mut self.queued_lines) {
+            self.write(line);
+        }
+    }
+
+    fn start_codex_client(&mut self, ctx: &mut ModelContext<Self>) {
+        // Lines of a previous client that never reached a process.
+        self.queued_lines.clear();
+        let mut config = CodexConfig::new(self.cwd.clone());
+        if let Some(workspace) = &self.workspace {
+            config.extra_dirs = workspace
+                .extra_dirs
+                .iter()
+                .filter(|dir| **dir != self.cwd)
+                .cloned()
+                .collect();
+        }
+        config.resume_thread_id = self.resume.then(|| self.session_id.clone());
+        config.model = self.model_override.clone();
+        config.effort = self.effort_override.clone();
+        config.permission_mode = self
+            .conversation
+            .session()
+            .permission_mode
+            .clone()
+            .unwrap_or_else(|| "default".to_owned());
+        config.developer_instructions = Some(match &self.workspace {
+            Some(workspace) => format!(
+                "{CODEX_INSTRUCTIONS} {}",
+                workspace.system_prompt(&self.cwd)
+            ),
+            None => CODEX_INSTRUCTIONS.to_owned(),
+        });
+        let mut client = CodexClient::new(config);
+        let handshake = client.start();
+        self.codex = Some(client);
+        self.apply_codex_events(handshake, ctx);
+    }
+
+    fn on_codex_message(&mut self, message: Value, ctx: &mut ModelContext<Self>) {
+        let Some(client) = &mut self.codex else {
+            return;
+        };
+        let events = client.handle(message);
+        self.apply_codex_events(events, ctx);
+    }
+
+    fn apply_codex_events(&mut self, events: Vec<CodexEvent>, ctx: &mut ModelContext<Self>) {
+        for event in events {
+            match event {
+                CodexEvent::Write(line) => self.write(line),
+                CodexEvent::Message(message) => {
+                    let finished_turn = matches!(message, StdoutMessage::Result(_));
+                    let changes = self.conversation.apply(message, SystemTime::now());
+                    self.apply_changes(changes, ctx);
+                    if finished_turn {
+                        self.on_turn_finished(ctx);
+                    }
+                }
+                CodexEvent::ThreadStarted { thread_id } => {
+                    if thread_id != self.session_id {
+                        self.session_id = thread_id;
+                        ctx.emit(ClaudeChatSessionEvent::SessionIdAssigned);
+                    }
+                }
+                CodexEvent::Models(models) => {
+                    provider::remember_codex_models(&models);
+                    let mode = self
+                        .codex
+                        .as_ref()
+                        .map(|client| client.permission_mode().to_owned())
+                        .unwrap_or_else(|| "default".to_owned());
+                    let changes = self.conversation.apply_initialize_response(
+                        &CodexClient::initialize_response(&models, &mode),
+                    );
+                    self.apply_changes(changes, ctx);
+                }
+                CodexEvent::ContextTokens { tokens, window } => {
+                    let changes = self.conversation.apply_context_tokens(tokens, window);
+                    self.apply_changes(changes, ctx);
+                }
+                CodexEvent::TitleChanged(title) => {
+                    if self.title.as_deref() != Some(title.as_str()) {
+                        self.title = Some(title);
+                        ctx.emit(ClaudeChatSessionEvent::TitleChanged);
+                    }
+                }
+                CodexEvent::FileSuggestions { query, paths } => {
+                    ctx.emit(ClaudeChatSessionEvent::FileSuggestions { query, paths });
+                }
+                CodexEvent::Error(error) => {
+                    log::warn!("Native chat (Codex): {error}");
+                    ctx.emit(ClaudeChatSessionEvent::Error(error));
+                }
+            }
+        }
+    }
+
+    /// Runs `update` on the Codex client, if this is a Codex chat, and carries out its events.
+    fn with_codex(
+        &mut self,
+        ctx: &mut ModelContext<Self>,
+        update: impl FnOnce(&mut CodexClient) -> Vec<CodexEvent>,
+    ) {
+        if let Some(client) = &mut self.codex {
+            let events = update(client);
+            self.apply_codex_events(events, ctx);
+        }
+    }
+
     fn append_system_prompt(&self) -> String {
         match &self.workspace {
             Some(workspace) => format!(
@@ -336,12 +529,17 @@ impl ClaudeChatSession {
         status: std::io::Result<std::process::ExitStatus>,
         ctx: &mut ModelContext<Self>,
     ) {
+        let name = match self.provider {
+            ChatProvider::Claude => "O Claude Code",
+            ChatProvider::Codex => "O Codex",
+        };
         let error = match status {
             Ok(status) if status.success() => None,
-            Ok(status) => Some(format!("O Claude Code terminou ({status}).")),
-            Err(err) => Some(format!("O Claude Code terminou com erro: {err}")),
+            Ok(status) => Some(format!("{name} terminou ({status}).")),
+            Err(err) => Some(format!("{name} terminou com erro: {err}")),
         };
         self.process = None;
+        self.codex_process = None;
         self.state = ProcessState::Exited {
             error: error.clone(),
         };
@@ -356,23 +554,23 @@ impl ClaudeChatSession {
         if let Some(process) = &self.process {
             process.kill();
         }
+        if let Some(process) = &self.codex_process {
+            process.kill();
+        }
     }
 
     /// Starts Claude again after it exited, resuming the same conversation.
     pub fn restart(&mut self, ctx: &mut ModelContext<Self>) {
-        if self.process.is_some() {
+        if self.has_process() {
             return;
         }
         self.resume = self.has_transcript();
         self.conversation = Conversation::new(Some(self.session_id.clone()));
         self.history_loaded = !self.resume;
         if self.resume
-            && let Some(home) = claude_home()
+            && let Some(path) = transcript_path(self.provider, &self.cwd, &self.session_id)
         {
-            self.load_history(
-                history::transcript_path(&home, &self.cwd, &self.session_id),
-                ctx,
-            );
+            self.load_history(path, ctx);
         }
         ctx.emit(ClaudeChatSessionEvent::Changed(Vec::new()));
         self.start(ctx);
@@ -390,17 +588,58 @@ impl ClaudeChatSession {
         self.start(ctx);
     }
 
-    /// Ends the process gracefully: Claude exits when its stdin closes.
+    /// Ends the process gracefully: the CLI exits when its stdin closes.
     fn stop(&mut self) {
         if let Some(process) = self.process.take() {
             process.close_stdin();
         }
+        if let Some(process) = self.codex_process.take() {
+            process.close_stdin();
+        }
+        self.codex = None;
+    }
+
+    /// Switches a chat that hasn't started its conversation to another CLI, keeping its folder.
+    /// Returns false when the conversation already started, which has to stay with its CLI.
+    pub fn switch_provider(
+        &mut self,
+        provider: ChatProvider,
+        model: Option<String>,
+        ctx: &mut ModelContext<Self>,
+    ) -> bool {
+        if self.has_transcript() {
+            return false;
+        }
+        if provider == self.provider {
+            if model.is_some() {
+                self.set_model(model, ctx);
+            }
+            return true;
+        }
+        self.stop();
+        self.provider = provider;
+        self.session_id = uuid::Uuid::new_v4().to_string();
+        self.model_override = model;
+        self.effort_override = None;
+        self.title = None;
+        self.queued_lines.clear();
+        self.conversation = Conversation::new(Some(self.session_id.clone()));
+        ctx.emit(ClaudeChatSessionEvent::Changed(Vec::new()));
+        ctx.emit(ClaudeChatSessionEvent::SessionIdAssigned);
+        self.start(ctx);
+        true
     }
 
     fn load_history(&mut self, path: PathBuf, ctx: &mut ModelContext<Self>) {
         self.history_loaded = false;
+        let provider = self.provider;
         ctx.spawn(
-            async move { history::load_transcript(&path) },
+            async move {
+                match provider {
+                    ChatProvider::Claude => history::load_transcript(&path),
+                    ChatProvider::Codex => codex_history::load_session(&path),
+                }
+            },
             |me, loaded, ctx| me.on_history_loaded(loaded, ctx),
         );
     }
@@ -454,17 +693,29 @@ impl ClaudeChatSession {
     // --- IO ---------------------------------------------------------------------------------
 
     fn write(&mut self, line: String) {
-        match &self.process {
-            Some(process) if self.state == ProcessState::Running => {
-                if !process.send_line(line) {
-                    log::warn!("Native chat: Claude's stdin is closed");
-                }
+        if self.state != ProcessState::Running {
+            self.queued_lines.push(line);
+            return;
+        }
+        let sent = match (&self.process, &self.codex_process) {
+            (Some(process), _) => process.send_line(line),
+            (None, Some(process)) => process.send_line(line),
+            (None, None) => {
+                self.queued_lines.push(line);
+                return;
             }
-            _ => self.queued_lines.push(line),
+        };
+        if !sent {
+            log::warn!("Native chat: the CLI's stdin is closed");
         }
     }
 
+    /// Sends a control request to Claude Code. Codex chats have no such requests, so it's dropped
+    /// for them.
     fn request(&mut self, request: ControlRequestBody, _ctx: &mut ModelContext<Self>) {
+        if self.provider == ChatProvider::Codex {
+            return;
+        }
         let (_, line) = self.tracker.issue(request);
         self.write(line);
     }
@@ -501,8 +752,10 @@ impl ClaudeChatSession {
     }
 
     fn on_turn_finished(&mut self, ctx: &mut ModelContext<Self>) {
-        self.refresh_context_usage(ctx);
-        self.refresh_usage(ctx);
+        if self.provider == ChatProvider::Claude {
+            self.refresh_context_usage(ctx);
+            self.refresh_usage(ctx);
+        }
         if self.title.is_none()
             && let Some(title) = self.first_prompt_title()
         {
@@ -586,6 +839,9 @@ impl ClaudeChatSession {
 
     fn on_control_reply(&mut self, reply: ControlReply, ctx: &mut ModelContext<Self>) {
         let changes = self.conversation.apply_control_reply(&reply);
+        if changes.contains(&ConversationChange::Models) {
+            provider::remember_claude_models(self.conversation.models());
+        }
         self.apply_changes(changes, ctx);
         match &reply.outcome {
             Ok(ReplyPayload::McpAuthenticate(response)) => {
@@ -683,7 +939,7 @@ impl ClaudeChatSession {
         message: ComposedMessage,
         ctx: &mut ModelContext<Self>,
     ) -> String {
-        if self.process.is_none() && matches!(self.state, ProcessState::Exited { .. }) {
+        if !self.has_process() && matches!(self.state, ProcessState::Exited { .. }) {
             self.restart(ctx);
         }
         let uuid = uuid::Uuid::new_v4().to_string();
@@ -713,7 +969,18 @@ impl ClaudeChatSession {
                 }
             }
         }
-        self.write(protocol::user_message_line_with_blocks(&uuid, &blocks));
+        match self.provider {
+            ChatProvider::Claude => {
+                self.write(protocol::user_message_line_with_blocks(&uuid, &blocks));
+            }
+            ChatProvider::Codex => {
+                let (text, images) = codex_input(&blocks);
+                let message_uuid = uuid.clone();
+                self.with_codex(ctx, |client| {
+                    client.send_message(&message_uuid, &text, &images)
+                });
+            }
+        }
         self.apply_changes(changes, ctx);
         if !self.has_sent {
             self.has_sent = true;
@@ -755,7 +1022,10 @@ impl ClaudeChatSession {
             self.conversation.status(),
             ConversationStatus::Working { .. } | ConversationStatus::AwaitingUser
         ) {
-            self.request(ControlRequestBody::Interrupt, ctx);
+            match self.provider {
+                ChatProvider::Claude => self.request(ControlRequestBody::Interrupt, ctx),
+                ChatProvider::Codex => self.with_codex(ctx, CodexClient::interrupt),
+            }
         }
     }
 
@@ -784,6 +1054,24 @@ impl ClaudeChatSession {
         answer: PermissionAnswer,
         ctx: &mut ModelContext<Self>,
     ) {
+        if self.provider == ChatProvider::Codex {
+            if self.pending_request(request_id).is_none() {
+                return;
+            }
+            let (decision, outcome) = match &answer {
+                PermissionAnswer::AllowOnce => ("accept", RequestDecision::Allowed),
+                PermissionAnswer::AllowAlways { suggestion } => (
+                    CodexClient::suggestion_decision(suggestion).unwrap_or("accept"),
+                    RequestDecision::Allowed,
+                ),
+                PermissionAnswer::Deny { .. } => ("decline", RequestDecision::Denied),
+            };
+            let request_id = request_id.to_owned();
+            self.with_codex(ctx, |client| client.answer_approval(&request_id, decision));
+            let changes = self.conversation.resolve_request(&request_id, outcome);
+            self.apply_changes(changes, ctx);
+            return;
+        }
         let Some(request) = self.pending_request(request_id) else {
             return;
         };
@@ -864,17 +1152,37 @@ impl ClaudeChatSession {
     /// `None` goes back to the default model.
     pub fn set_model(&mut self, model: Option<String>, ctx: &mut ModelContext<Self>) {
         self.model_override = model.clone();
-        self.request(ControlRequestBody::SetModel { model }, ctx);
+        match self.provider {
+            ChatProvider::Claude => self.request(ControlRequestBody::SetModel { model }, ctx),
+            ChatProvider::Codex => self.with_codex(ctx, |client| client.set_model(model)),
+        }
     }
 
     pub fn set_effort(&mut self, effort: String, ctx: &mut ModelContext<Self>) {
         self.effort_override = Some(effort.clone());
-        self.send_hidden_command(format!("/effort {effort}"), ctx);
+        match self.provider {
+            ChatProvider::Claude => self.send_hidden_command(format!("/effort {effort}"), ctx),
+            ChatProvider::Codex => {
+                if let Some(client) = &mut self.codex {
+                    client.set_effort(Some(effort));
+                }
+                ctx.emit(ClaudeChatSessionEvent::Changed(Vec::new()));
+            }
+        }
     }
 
     /// Goes back to the effort configured in Claude Code's settings. `/effort auto` would drop to
-    /// the API default instead, below what the user configured.
+    /// the API default instead, below what the user configured. Codex goes back to the model's
+    /// default effort.
     pub fn reset_effort(&mut self, ctx: &mut ModelContext<Self>) {
+        if self.provider == ChatProvider::Codex {
+            self.effort_override = None;
+            if let Some(client) = &mut self.codex {
+                client.set_effort(None);
+            }
+            ctx.emit(ClaudeChatSessionEvent::Changed(Vec::new()));
+            return;
+        }
         match configured_effort(&self.cwd) {
             Some(effort) => self.set_effort(effort, ctx),
             None => self.effort_override = None,
@@ -889,6 +1197,10 @@ impl ClaudeChatSession {
     }
 
     pub fn set_permission_mode(&mut self, mode: &str, ctx: &mut ModelContext<Self>) {
+        if self.provider == ChatProvider::Codex {
+            self.with_codex(ctx, |client| client.set_permission_mode(mode));
+            return;
+        }
         self.request(
             ControlRequestBody::SetPermissionMode {
                 mode: mode.to_owned(),
@@ -950,12 +1262,69 @@ impl ClaudeChatSession {
 
     /// Summarizes the conversation so far to free up context.
     pub fn compact(&mut self, ctx: &mut ModelContext<Self>) {
-        self.send_message("/compact".to_owned(), Vec::new(), ctx);
+        match self.provider {
+            ChatProvider::Claude => {
+                self.send_message("/compact".to_owned(), Vec::new(), ctx);
+            }
+            ChatProvider::Codex => self.with_codex(ctx, CodexClient::compact),
+        }
     }
 
     pub fn request_file_suggestions(&mut self, query: String, ctx: &mut ModelContext<Self>) {
-        self.request(ControlRequestBody::FileSuggestions { query }, ctx);
+        match self.provider {
+            ChatProvider::Claude => {
+                self.request(ControlRequestBody::FileSuggestions { query }, ctx)
+            }
+            ChatProvider::Codex => self.with_codex(ctx, |client| client.file_suggestions(&query)),
+        }
     }
+}
+
+/// The CLI that saved the conversation `session_id`: Codex when only Codex has it, else Claude.
+pub fn saved_provider(cwd: &Path, session_id: &str) -> ChatProvider {
+    let is_codex = transcript_path(ChatProvider::Claude, cwd, session_id).is_none()
+        && transcript_path(ChatProvider::Codex, cwd, session_id).is_some();
+    if is_codex {
+        ChatProvider::Codex
+    } else {
+        ChatProvider::Claude
+    }
+}
+
+/// Where the saved conversation `session_id` of `provider` is, when there is one.
+fn transcript_path(provider: ChatProvider, cwd: &Path, session_id: &str) -> Option<PathBuf> {
+    match provider {
+        ChatProvider::Claude => {
+            let home = claude_home()?;
+            let path = history::transcript_path(&home, cwd, session_id);
+            if path.exists() {
+                Some(path)
+            } else {
+                history::find_transcript(&home, session_id)
+            }
+        }
+        ChatProvider::Codex => codex_history::find_session(&codex::codex_home()?, session_id),
+    }
+}
+
+/// A composed message as Codex input: its text parts, and its images as `(media type, base64)`.
+/// Codex takes no documents, so they're named in the text instead.
+fn codex_input(blocks: &[OutgoingBlock]) -> (String, Vec<(String, String)>) {
+    let mut texts = Vec::new();
+    let mut images = Vec::new();
+    for block in blocks {
+        match block {
+            OutgoingBlock::Text(text) => texts.push(text.clone()),
+            OutgoingBlock::Image(image) => {
+                images.push((image.media_type.clone(), image.data_base64.clone()))
+            }
+            OutgoingBlock::Document(document) => texts.push(format!(
+                "[Documento anexado que o Codex não recebe: {}]",
+                document.title.as_deref().unwrap_or(&document.media_type)
+            )),
+        }
+    }
+    (texts.join("\n\n"), images)
 }
 
 impl Drop for ClaudeChatSession {
@@ -983,6 +1352,12 @@ impl ClaudeChatSession {
     /// Names the conversation, the way Claude Code's `/rename` does, so Threads and `claude
     /// --resume` show it too.
     pub fn rename(&mut self, title: String, ctx: &mut ModelContext<Self>) {
+        if self.provider == ChatProvider::Codex {
+            self.with_codex(ctx, |client| client.rename(&title));
+            self.title = Some(title);
+            ctx.emit(ClaudeChatSessionEvent::TitleChanged);
+            return;
+        }
         if self.has_transcript()
             && let Some(home) = claude_home()
         {

@@ -349,6 +349,8 @@ void init_warp_nswindow(NSWindow<WarpWindowProtocol> *window, bool testMode, boo
 @interface WarpWindow ()
 - (NSButton *)standardWindowButtonAtEvent:(NSEvent *)event;
 - (BOOL)eventIsOverResizeEdge:(NSEvent *)event;
+- (BOOL)eventIsOverHostedSubview:(NSEvent *)event;
+- (BOOL)firstResponderIsHostedSubview;
 @end
 
 @implementation WarpWindow {
@@ -368,6 +370,9 @@ void init_warp_nswindow(NSWindow<WarpWindowProtocol> *window, bool testMode, boo
     // being created and positioned under the cursor.
     BOOL _suppressFrameConstraintsDuringDrag;
     BOOL _leftMouseDownStartedInNativeWindowChrome;
+    // Whether the current left click started on a native view hosted inside the content view (e.g.
+    // a web view), which must receive the rest of the click sequence to see a complete click.
+    BOOL _leftMouseDownStartedInHostedSubview;
 }
 
 @synthesize testMode;
@@ -467,16 +472,37 @@ void init_warp_nswindow(NSWindow<WarpWindowProtocol> *window, bool testMode, boo
     return NO;
 }
 
+- (BOOL)eventIsOverHostedSubview:(NSEvent *)event {
+    NSView *contentView = self.contentView;
+    NSView *superview = contentView.superview;
+    if (superview == nil) {
+        return NO;
+    }
+    NSPoint point = [superview convertPoint:event.locationInWindow fromView:nil];
+    NSView *hitView = [contentView hitTest:point];
+    return hitView != nil && hitView != contentView;
+}
+
+- (BOOL)firstResponderIsHostedSubview {
+    NSResponder *responder = self.firstResponder;
+    NSView *contentView = self.contentView;
+    return [responder isKindOfClass:[NSView class]] && responder != contentView &&
+           [(NSView *)responder isDescendantOf:contentView];
+}
+
 - (void)sendEvent:(NSEvent *)event {
     switch (event.type) {
         case NSEventTypeLeftMouseDown: {
             NSButton *windowButton = [self standardWindowButtonAtEvent:event];
             if (windowButton) {
                 _leftMouseDownStartedInNativeWindowChrome = YES;
+                _leftMouseDownStartedInHostedSubview = NO;
                 [super sendEvent:event];
                 break;
             }
             _leftMouseDownStartedInNativeWindowChrome = [self eventIsOverResizeEdge:event];
+            _leftMouseDownStartedInHostedSubview =
+                !_leftMouseDownStartedInNativeWindowChrome && [self eventIsOverHostedSubview:event];
             [super sendEvent:event];
             break;
         }
@@ -490,7 +516,9 @@ void init_warp_nswindow(NSWindow<WarpWindowProtocol> *window, bool testMode, boo
         // This breaks drag-and-drop for panes and tabs (see CLD-2581), so we work around it with
         // custom dispatching.
         case NSEventTypeLeftMouseUp:
-            if (@available(macOS 27, *)) {
+            if (_leftMouseDownStartedInHostedSubview) {
+                [super sendEvent:event];
+            } else if (@available(macOS 27, *)) {
                 if (_leftMouseDownStartedInNativeWindowChrome) {
                     [super sendEvent:event];
                 } else {
@@ -500,9 +528,12 @@ void init_warp_nswindow(NSWindow<WarpWindowProtocol> *window, bool testMode, boo
                 [self.contentView mouseUp:event];
             }
             _leftMouseDownStartedInNativeWindowChrome = NO;
+            _leftMouseDownStartedInHostedSubview = NO;
             break;
         case NSEventTypeLeftMouseDragged:
-            if (@available(macOS 27, *)) {
+            if (_leftMouseDownStartedInHostedSubview) {
+                [super sendEvent:event];
+            } else if (@available(macOS 27, *)) {
                 if (_leftMouseDownStartedInNativeWindowChrome) {
                     [super sendEvent:event];
                 } else {
@@ -550,6 +581,13 @@ void init_warp_nswindow(NSWindow<WarpWindowProtocol> *window, bool testMode, boo
         // See #9709.
         if ([(WarpHostView *)self.contentView hasMarkedText]) {
             return [super performKeyEquivalent:event];
+        }
+
+        // A focused hosted view (e.g. a web page) gets the first chance at key equivalents. WebKit
+        // answers YES while the page handles the key asynchronously and re-sends the keys the page
+        // ignores, which then fall through to Warp's bindings below.
+        if ([self firstResponderIsHostedSubview] && [super performKeyEquivalent:event]) {
+            return YES;
         }
 
         NSApplication *application = [NSApplication sharedApplication];

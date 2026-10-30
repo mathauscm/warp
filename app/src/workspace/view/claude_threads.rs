@@ -48,6 +48,7 @@ use crate::claude_threads::{
 };
 use crate::editor::{EditorView, Event as EditorEvent, SingleLineEditorOptions, TextOptions};
 use crate::menu::{Event as MenuEvent, Menu, MenuItem, MenuItemFields};
+use crate::native_chat::ChatProvider;
 use crate::native_chat::registry::{NativeChatRegistry, NativeChatStatus};
 use crate::terminal::CLIAgent;
 use crate::terminal::cli_agent_sessions::{CLIAgentSessionStatus, CLIAgentSessionsModel};
@@ -1715,6 +1716,7 @@ impl ClaudeThreadsView {
             .into_iter()
             .filter(|chat| self.find_thread(&chat.session_id).is_none())
             .map(|chat| ClaudeThread {
+                provider: chat.provider,
                 title: chat.title.unwrap_or_else(|| NEW_THREAD_TITLE.to_owned()),
                 session_id: chat.session_id,
                 cwd: chat.cwd,
@@ -1731,6 +1733,7 @@ impl ClaudeThreadsView {
                 let cwd = PathBuf::from(context.cwd.as_deref()?);
                 let is_scanned = self.find_thread(&session_id).is_some();
                 (!is_scanned).then(|| ClaudeThread {
+                    provider: ChatProvider::Claude,
                     title: context
                         .query
                         .as_deref()
@@ -2569,6 +2572,7 @@ impl ClaudeThreadsView {
             });
         let title = thread.title.clone();
         let age = claude_threads::format_age(thread.updated_at, now);
+        let is_codex = thread.provider == ChatProvider::Codex;
         let action = ClaudeThreadsAction::OpenThread {
             session_id: thread.session_id.clone(),
             cwd: thread.cwd.clone(),
@@ -2691,6 +2695,13 @@ impl ClaudeThreadsView {
                                 meta.add_child(
                                     Text::new_inline("● ", fonts.family, META_FONT_SIZE)
                                         .with_color(palette.sub_text.into())
+                                        .finish(),
+                                );
+                            }
+                            if is_codex {
+                                meta.add_child(
+                                    Text::new_inline("Codex · ", fonts.family, META_FONT_SIZE)
+                                        .with_color(palette.detail_text.into())
                                         .finish(),
                                 );
                             }

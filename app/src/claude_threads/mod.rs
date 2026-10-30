@@ -43,8 +43,11 @@ use std::io::{Read, Seek, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use claude_chat::{codex, codex_history};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::native_chat::ChatProvider;
 
 const CONFIG_FILE_NAME: &str = "claude_threads.toml";
 /// Bytes read from each end of a transcript: the first prompt sits at the
@@ -289,9 +292,12 @@ pub fn save_config(config: &ThreadsConfig) -> std::io::Result<()> {
     std::fs::write(path, contents)
 }
 
-/// One Claude Code conversation.
+/// One Claude Code or Codex conversation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaudeThread {
+    /// The CLI the conversation ran in.
+    pub provider: ChatProvider,
+    /// Claude Code's session id, or Codex's thread id.
     pub session_id: String,
     pub title: String,
     /// The folder the conversation runs in; `claude --resume` must start there.
@@ -307,7 +313,10 @@ impl ClaudeThread {
     /// The shell command that reopens this conversation, or `None` when the
     /// session id isn't safe to put on a command line.
     pub fn resume_command(&self) -> Option<String> {
-        is_session_id(&self.session_id).then(|| format!("claude --resume {}", self.session_id))
+        is_session_id(&self.session_id).then(|| match self.provider {
+            ChatProvider::Claude => format!("claude --resume {}", self.session_id),
+            ChatProvider::Codex => format!("codex resume {}", self.session_id),
+        })
     }
 }
 
@@ -334,12 +343,61 @@ pub fn project_slug(path: &Path) -> String {
         .collect()
 }
 
-/// Reads every thread from `~/.claude/projects`, newest first.
+/// Reads every thread from `~/.claude/projects` and Codex's sessions, newest first.
 pub fn scan(cache: &mut TranscriptCache) -> Vec<ClaudeThread> {
-    match dirs::home_dir() {
+    let mut threads = match dirs::home_dir() {
         Some(home) => scan_in(&home.join(".claude").join("projects"), cache),
         None => Vec::new(),
+    };
+    if let Some(home) = codex::codex_home() {
+        threads.extend(scan_codex_in(&home));
+        threads.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     }
+    threads
+}
+
+/// Codex's sessions under `codex_home`, as threads. Files read before and unchanged since come
+/// from a cache of their own, apart from Claude's.
+pub fn scan_codex_in(codex_home: &Path) -> Vec<ClaudeThread> {
+    static CACHE: std::sync::Mutex<BTreeMap<PathBuf, (SystemTime, Option<ClaudeThread>)>> =
+        std::sync::Mutex::new(BTreeMap::new());
+    let mut cache = CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let names = codex_history::thread_names(codex_home);
+    let files = codex_history::session_files(codex_home);
+    cache.retain(|path, _| files.contains(path));
+    files
+        .into_iter()
+        .filter_map(|path| {
+            let modified = std::fs::metadata(&path)
+                .and_then(|meta| meta.modified())
+                .ok()?;
+            if let Some((cached_at, thread)) = cache.get(&path)
+                && *cached_at == modified
+            {
+                return thread.clone().map(|mut thread| {
+                    if let Some(name) = names.get(&thread.session_id) {
+                        thread.title = name.clone();
+                    }
+                    thread
+                });
+            }
+            let thread = codex_history::summarize_session(&path, &names).and_then(|summary| {
+                Some(ClaudeThread {
+                    provider: ChatProvider::Codex,
+                    title: clean_title(summary.title.as_deref().unwrap_or("Codex")),
+                    cwd: summary.cwd?,
+                    updated_at: summary.updated_at,
+                    transcript: summary.path,
+                    git_branch: None,
+                    session_id: summary.id,
+                })
+            });
+            cache.insert(path, (modified, thread.clone()));
+            thread
+        })
+        .collect()
 }
 
 /// Reads every thread from the transcript folders in `root`, newest first.
@@ -448,6 +506,7 @@ fn read_transcript(path: &Path, modified: SystemTime) -> Option<ClaudeThread> {
     let git_branch = summary.git_branch.clone();
     let (title, cwd) = summary.finish()?;
     Some(ClaudeThread {
+        provider: ChatProvider::Claude,
         session_id,
         title,
         cwd,
@@ -460,7 +519,12 @@ fn read_transcript(path: &Path, modified: SystemTime) -> Option<ClaudeThread> {
 /// Renames a thread the way Claude Code's `/rename` does: a `custom-title` record appended to its
 /// transcript, which wins over every earlier title, also in `claude --resume`.
 pub fn rename_thread(thread: &ClaudeThread, title: &str) -> Result<String, String> {
-    rename_transcript(&thread.transcript, &thread.session_id, title)
+    match thread.provider {
+        ChatProvider::Claude => rename_transcript(&thread.transcript, &thread.session_id, title),
+        ChatProvider::Codex => {
+            Err("Renomear conversas do Codex por aqui ainda não é suportado".to_owned())
+        }
+    }
 }
 
 /// Appends the `custom-title` record of [`rename_thread`] to the transcript at `path`.
@@ -499,6 +563,10 @@ pub fn rename_transcript(path: &Path, session_id: &str, title: &str) -> Result<S
 /// next to it for subagents and tool output, to the Trash. Claude no longer
 /// lists it, and it can still be put back from the Trash.
 pub fn trash_thread(thread: &ClaudeThread) -> Result<(), String> {
+    // Codex indexes its sessions in a database of its own, which a moved file would leave stale.
+    if thread.provider == ChatProvider::Codex {
+        return Err("Conversas do Codex não podem ser apagadas por aqui".to_owned());
+    }
     move_to_trash(&thread.transcript)?;
     let sidecar = thread.transcript.with_extension("");
     if sidecar.is_dir() {

@@ -590,7 +590,15 @@ impl LocalRepoMetadataModel {
 
         // Process added or updated files
         for path in event.added_or_updated_iter() {
-            if let Some(repo_path) = self.find_repository_for_watcher_entry_path(path) {
+            let repo_path = self.find_repository_for_watcher_entry_path(path);
+            for root in self.enclosing_lazy_roots(path, repo_path.as_ref()) {
+                repo_updates
+                    .entry(root)
+                    .or_default()
+                    .added
+                    .push(path.to_path_buf());
+            }
+            if let Some(repo_path) = repo_path {
                 let repo_update = repo_updates.entry(repo_path).or_default();
                 repo_update.added.push(path.to_path_buf());
             }
@@ -598,20 +606,24 @@ impl LocalRepoMetadataModel {
 
         // Process deleted files
         for path in &event.deleted {
-            if let Some(repo_path) =
-                self.find_repository_for_path_string(path.to_string_lossy().as_ref())
+            let repo_path = self.find_repository_for_path_string(path.to_string_lossy().as_ref());
+            let lazy_roots = self.enclosing_lazy_roots(path, repo_path.as_ref());
+            if repo_path.is_none() && lazy_roots.is_empty() && !symlink_target_paths.contains(path)
             {
-                let repo_update = repo_updates.entry(repo_path).or_default();
-                repo_update.deleted.push(path.to_path_buf());
-            } else if !symlink_target_paths.contains(path) {
                 log::warn!("Deleted file not found in any repo: {path:?} not found in any repo");
+            }
+            for root in repo_path.into_iter().chain(lazy_roots) {
+                let repo_update = repo_updates.entry(root).or_default();
+                repo_update.deleted.push(path.to_path_buf());
             }
         }
 
         // Process moved files
         for (to_path, from_path) in &event.moved {
-            if let Some(repo_path) = self.find_repository_for_watcher_entry_path(to_path) {
-                let repo_update = repo_updates.entry(repo_path).or_default();
+            let repo_path = self.find_repository_for_watcher_entry_path(to_path);
+            let lazy_roots = self.enclosing_lazy_roots(to_path, repo_path.as_ref());
+            for root in repo_path.into_iter().chain(lazy_roots) {
+                let repo_update = repo_updates.entry(root).or_default();
                 repo_update
                     .moved
                     .insert(to_path.to_path_buf(), from_path.to_path_buf());
@@ -715,6 +727,32 @@ impl LocalRepoMetadataModel {
                 self.track_watcher_update_task(task_repo_path, update_handle);
             }
         }
+    }
+
+    /// Indexed lazy-loaded roots other than `owner` (the innermost repository) that contain `path`.
+    /// A lazy root holding repositories, like a folder of repos, shows their files too, so it needs
+    /// their changes as well.
+    #[cfg(feature = "local_fs")]
+    fn enclosing_lazy_roots(
+        &self,
+        path: &Path,
+        owner: Option<&StandardizedPath>,
+    ) -> Vec<StandardizedPath> {
+        let Ok(path) = StandardizedPath::try_from_local(path) else {
+            return Vec::new();
+        };
+        self.lazy_loaded_paths
+            .keys()
+            .filter(|root| {
+                Some(*root) != owner
+                    && path.starts_with(root)
+                    && matches!(
+                        self.repositories.get(*root),
+                        Some(IndexedRepoState::Indexed(_))
+                    )
+            })
+            .cloned()
+            .collect()
     }
 
     #[cfg(feature = "local_fs")]

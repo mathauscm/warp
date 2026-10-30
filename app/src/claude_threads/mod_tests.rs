@@ -124,6 +124,7 @@ fn long_titles_are_cut_with_an_ellipsis() {
 #[test]
 fn resume_command_rejects_unsafe_session_ids() {
     let thread = |session_id: &str| ClaudeThread {
+        provider: ChatProvider::Claude,
         session_id: session_id.to_owned(),
         title: String::new(),
         cwd: PathBuf::from("/w"),
@@ -152,6 +153,7 @@ fn format_age_uses_short_relative_labels() {
 
 fn thread(session_id: &str, cwd: &str) -> ClaudeThread {
     ClaudeThread {
+        provider: ChatProvider::Claude,
         session_id: session_id.to_owned(),
         title: session_id.to_owned(),
         cwd: PathBuf::from(cwd),
@@ -266,6 +268,7 @@ fn rename_appends_a_custom_title_that_wins() {
     // The last line is left unfinished, as when Claude is still writing it.
     std::fs::write(&transcript, format!("{prompt}\n{ai_title}")).unwrap();
     let thread = ClaudeThread {
+        provider: ChatProvider::Claude,
         session_id: "abc".to_owned(),
         title: "Bug do login".to_owned(),
         cwd: PathBuf::from("/w/kinbox"),

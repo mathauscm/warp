@@ -72,6 +72,7 @@ impl ChatActivity {
 /// An open native chat, as the Threads panel lists it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpenChat {
+    pub provider: super::ChatProvider,
     pub session_id: String,
     pub cwd: PathBuf,
     pub title: Option<String>,
@@ -103,6 +104,9 @@ impl NativeChatRegistry {
         session: &ModelHandle<ClaudeChatSession>,
         ctx: &mut ModelContext<Self>,
     ) {
+        // A Codex chat's id changes once its thread starts; drop the entry under the old one.
+        self.sessions
+            .retain(|id, registered| id == session_id || registered.id != session.id());
         self.sessions.insert(
             session_id.to_owned(),
             RegisteredSession {
@@ -151,6 +155,7 @@ impl NativeChatRegistry {
                 let session = registered.session.upgrade(app)?;
                 let session = session.as_ref(app);
                 Some(OpenChat {
+                    provider: session.provider(),
                     session_id: session_id.clone(),
                     cwd: session.cwd().to_path_buf(),
                     title: session.title().map(str::to_owned),

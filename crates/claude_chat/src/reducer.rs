@@ -576,6 +576,20 @@ impl Conversation {
         vec![ConversationChange::McpServers]
     }
 
+    /// Records the latest request's size and the model's context window, for backends that report
+    /// them outside Claude's stream events.
+    pub fn apply_context_tokens(
+        &mut self,
+        tokens: u64,
+        window: Option<u64>,
+    ) -> Vec<ConversationChange> {
+        self.live_context_tokens = Some(tokens);
+        if window.is_some() {
+            self.context_window = window;
+        }
+        vec![ConversationChange::ContextUsage]
+    }
+
     pub fn apply_context_usage(&mut self, usage: ContextUsage) -> Vec<ConversationChange> {
         if let Some(window) = usage.window_tokens() {
             self.context_window = Some(window);

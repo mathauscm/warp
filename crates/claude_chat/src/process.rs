@@ -37,18 +37,25 @@ pub fn find_claude(path_env: Option<&str>) -> Option<PathBuf> {
 
 /// [`find_claude`] with an explicit home directory.
 pub fn find_claude_in(path_env: Option<&str>, home: Option<&Path>) -> Option<PathBuf> {
-    candidate_dirs(path_env, home)
-        .into_iter()
-        .map(|dir| dir.join(executable_name()))
-        .find(|candidate| is_executable(candidate))
+    find_executable_in("claude", path_env, home)
 }
 
-fn executable_name() -> &'static str {
-    if cfg!(windows) {
-        "claude.exe"
+/// Looks for the executable `name` in `path_env`, then in the usual install locations of npm and
+/// Homebrew CLIs.
+pub(crate) fn find_executable_in(
+    name: &str,
+    path_env: Option<&str>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    let file_name = if cfg!(windows) {
+        format!("{name}.exe")
     } else {
-        "claude"
-    }
+        name.to_owned()
+    };
+    candidate_dirs(path_env, home)
+        .into_iter()
+        .map(|dir| dir.join(&file_name))
+        .find(|candidate| is_executable(candidate))
 }
 
 fn candidate_dirs(path_env: Option<&str>, home: Option<&Path>) -> Vec<PathBuf> {
@@ -251,10 +258,6 @@ impl SpawnConfig {
                 .map(|(key, value)| (OsString::from(key), OsString::from(value))),
         );
         command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        command
     }
 }
 
@@ -262,18 +265,32 @@ impl SpawnConfig {
 /// waits for it to exit. It resolves once the process is gone and its pipes are drained.
 pub type ProcessDriver = Pin<Box<dyn Future<Output = io::Result<ExitStatus>> + Send>>;
 
-/// A running `claude` process. Cheap to clone; dropping every clone closes stdin, which ends the
-/// session gracefully.
-#[derive(Clone)]
-pub struct ClaudeProcess {
+/// A running `claude` process.
+pub type ClaudeProcess = LineProcess<StdoutMessage>;
+
+/// A running CLI that talks in one JSON value per line, whose stdout lines are parsed into `T`.
+/// Cheap to clone; dropping every clone closes stdin, which ends the session gracefully.
+pub struct LineProcess<T> {
     pid: u32,
     stdin: Sender<String>,
     kill: Sender<()>,
-    messages: Receiver<StdoutMessage>,
+    messages: Receiver<T>,
     exit_status: Arc<Mutex<Option<ExitStatus>>>,
 }
 
-impl ClaudeProcess {
+impl<T> Clone for LineProcess<T> {
+    fn clone(&self) -> Self {
+        Self {
+            pid: self.pid,
+            stdin: self.stdin.clone(),
+            kill: self.kill.clone(),
+            messages: self.messages.clone(),
+            exit_status: self.exit_status.clone(),
+        }
+    }
+}
+
+impl<T> LineProcess<T> {
     pub fn pid(&self) -> u32 {
         self.pid
     }
@@ -284,7 +301,7 @@ impl ClaudeProcess {
     }
 
     /// The parsed stdout messages. The stream ends when stdout closes.
-    pub fn messages(&self) -> Receiver<StdoutMessage> {
+    pub fn messages(&self) -> Receiver<T> {
         self.messages.clone()
     }
 
@@ -309,14 +326,31 @@ impl ClaudeProcess {
 
 /// Starts the CLI. The returned driver must be spawned on an executor; see the module docs.
 pub fn spawn(config: &SpawnConfig) -> io::Result<(ClaudeProcess, ProcessDriver)> {
-    let mut child = config.command().spawn()?;
-    let pid = child.id();
     log::info!(
-        "Spawned claude (pid {pid}) in {} with args {:?}",
+        "Spawning claude in {} with args {:?}",
         config.cwd.display(),
         config.args()
     );
-    let missing = |name: &str| io::Error::other(format!("claude {name} was not piped"));
+    spawn_lines(config.command(), "claude", |line| {
+        StdoutMessage::parse_line(line).map_err(|error| error.to_string())
+    })
+}
+
+/// Starts `command` with piped stdio and parses each stdout line with `parse`. `name` labels the
+/// process in logs. The returned driver must be spawned on an executor; see the module docs.
+pub(crate) fn spawn_lines<T: Send + 'static>(
+    mut command: Command,
+    name: &'static str,
+    parse: fn(&str) -> Result<T, String>,
+) -> io::Result<(LineProcess<T>, ProcessDriver)> {
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let pid = child.id();
+    log::info!("Spawned {name} (pid {pid})");
+    let missing = |pipe: &str| io::Error::other(format!("{name} {pipe} was not piped"));
     let stdin = child.stdin.take().ok_or_else(|| missing("stdin"))?;
     let stdout = child.stdout.take().ok_or_else(|| missing("stdout"))?;
     let stderr = child.stderr.take().ok_or_else(|| missing("stderr"))?;
@@ -326,7 +360,7 @@ pub fn spawn(config: &SpawnConfig) -> io::Result<(ClaudeProcess, ProcessDriver)>
     let (messages_tx, messages_rx) = async_channel::unbounded();
     let exit_status = Arc::new(Mutex::new(None));
 
-    let handle = ClaudeProcess {
+    let handle = LineProcess {
         pid,
         stdin: stdin_tx.clone(),
         kill: kill_tx,
@@ -336,22 +370,22 @@ pub fn spawn(config: &SpawnConfig) -> io::Result<(ClaudeProcess, ProcessDriver)>
 
     let driver = async move {
         let lifecycle = async {
-            let status = wait_for_exit(&mut child, pid, &kill_rx, &stdin_tx).await;
+            let status = wait_for_exit(&mut child, pid, name, &kill_rx, &stdin_tx).await;
             // Unblocks the writer when the process exits on its own.
             stdin_tx.close();
             if let Ok(status) = &status {
                 *exit_status
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(*status);
-                log::info!("claude (pid {pid}) exited with {status}");
+                log::info!("{name} (pid {pid}) exited with {status}");
             }
             status
         };
         let (status, (), (), ()) = futures::join!(
             lifecycle,
-            write_stdin(stdin, stdin_rx, pid),
-            read_stdout(stdout, messages_tx, pid),
-            read_stderr(stderr, pid),
+            write_stdin(stdin, stdin_rx, pid, name),
+            read_stdout(stdout, messages_tx, pid, name, parse),
+            read_stderr(stderr, pid, name),
         );
         status
     };
@@ -361,6 +395,7 @@ pub fn spawn(config: &SpawnConfig) -> io::Result<(ClaudeProcess, ProcessDriver)>
 async fn wait_for_exit(
     child: &mut Child,
     pid: u32,
+    name: &str,
     kill_rx: &Receiver<()>,
     stdin_tx: &Sender<String>,
 ) -> io::Result<ExitStatus> {
@@ -374,20 +409,20 @@ async fn wait_for_exit(
         }
     };
     match signal {
-        Ok(()) => terminate(pid),
+        Ok(()) => terminate(pid, name),
         // Every handle was dropped: close stdin and give the CLI time to exit by itself.
         Err(_) => {
             stdin_tx.close();
             if let Some(status) = wait_with_timeout(child, KILL_GRACE_PERIOD).await {
                 return status;
             }
-            terminate(pid);
+            terminate(pid, name);
         }
     }
     if let Some(status) = wait_with_timeout(child, KILL_GRACE_PERIOD).await {
         return status;
     }
-    log::warn!("claude (pid {pid}) ignored SIGTERM; killing it");
+    log::warn!("{name} (pid {pid}) ignored SIGTERM; killing it");
     child.kill()?;
     child.status().await
 }
@@ -402,23 +437,23 @@ async fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Option<io::R
     }
 }
 
-fn terminate(pid: u32) {
+fn terminate(pid: u32, name: &str) {
     #[cfg(unix)]
     {
         // SAFETY: `kill` has no memory-safety preconditions.
         let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
         if result != 0 {
             log::warn!(
-                "Failed to send SIGTERM to claude (pid {pid}): {}",
+                "Failed to send SIGTERM to {name} (pid {pid}): {}",
                 io::Error::last_os_error()
             );
         }
     }
     #[cfg(not(unix))]
-    let _ = pid;
+    let _ = (pid, name);
 }
 
-async fn write_stdin(mut stdin: ChildStdin, lines: Receiver<String>, pid: u32) {
+async fn write_stdin(mut stdin: ChildStdin, lines: Receiver<String>, pid: u32, name: &str) {
     while let Ok(mut line) = lines.recv().await {
         line.push('\n');
         let written = async {
@@ -427,14 +462,20 @@ async fn write_stdin(mut stdin: ChildStdin, lines: Receiver<String>, pid: u32) {
         }
         .await;
         if let Err(error) = written {
-            log::warn!("Failed to write to claude (pid {pid}) stdin: {error}");
+            log::warn!("Failed to write to {name} (pid {pid}) stdin: {error}");
             break;
         }
     }
     let _ = stdin.close().await;
 }
 
-async fn read_stdout(stdout: ChildStdout, messages: Sender<StdoutMessage>, pid: u32) {
+async fn read_stdout<T>(
+    stdout: ChildStdout,
+    messages: Sender<T>,
+    pid: u32,
+    name: &str,
+    parse: fn(&str) -> Result<T, String>,
+) {
     let mut reader = BufReader::new(stdout);
     let mut line = String::new();
     loop {
@@ -446,32 +487,32 @@ async fn read_stdout(stdout: ChildStdout, messages: Sender<StdoutMessage>, pid: 
                 if trimmed.is_empty() {
                     continue;
                 }
-                match StdoutMessage::parse_line(trimmed) {
+                match parse(trimmed) {
                     Ok(message) => {
                         // Keep draining stdout even if nobody listens, so the CLI never blocks.
                         let _ = messages.send(message).await;
                     }
                     Err(error) => {
-                        log::warn!("Skipping non-JSON line from claude (pid {pid}): {error}");
+                        log::warn!("Skipping non-JSON line from {name} (pid {pid}): {error}");
                     }
                 }
             }
             Err(error) => {
-                log::warn!("Failed to read claude (pid {pid}) stdout: {error}");
+                log::warn!("Failed to read {name} (pid {pid}) stdout: {error}");
                 break;
             }
         }
     }
 }
 
-async fn read_stderr(stderr: ChildStderr, pid: u32) {
+async fn read_stderr(stderr: ChildStderr, pid: u32, name: &str) {
     let mut reader = BufReader::new(stderr);
     let mut line = String::new();
     loop {
         line.clear();
         match reader.read_line(&mut line).await {
             Ok(0) | Err(_) => break,
-            Ok(_) => log::info!("claude (pid {pid}) stderr: {}", line.trim_end()),
+            Ok(_) => log::info!("{name} (pid {pid}) stderr: {}", line.trim_end()),
         }
     }
 }

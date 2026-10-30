@@ -80,6 +80,7 @@ pub fn register_all_settings(ctx: &mut AppContext) {
     SelectionSettings::register(ctx);
     InputModeSettings::register(ctx);
     ThemeSettings::register(ctx);
+    crate::native_chat::provider::ChatProviderSettings::register(ctx);
     TuiAutoupdateSettings::register(ctx);
     TuiThemeSettings::register(ctx);
     TuiVoiceSettings::register(ctx);

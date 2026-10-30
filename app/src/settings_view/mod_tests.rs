@@ -75,6 +75,7 @@ const ALL_SECTIONS: &[SettingsSection] = &[
     SettingsSection::About,
     SettingsSection::Account,
     SettingsSection::BillingAndUsage,
+    SettingsSection::Providers,
     SettingsSection::Appearance,
     SettingsSection::Features,
     SettingsSection::Keybindings,
@@ -102,6 +103,7 @@ const ALL_SECTIONS: &[SettingsSection] = &[
 const SECTIONS_WITH_RENAMED_DISPLAY_LABELS: &[SettingsSection] = &[
     SettingsSection::WarpCloudAgentAPIKeys,
     SettingsSection::BillingAndUsage,
+    SettingsSection::Providers,
 ];
 
 #[test]
@@ -111,6 +113,7 @@ fn all_sections_list_is_exhaustive() {
             SettingsSection::About
             | SettingsSection::Account
             | SettingsSection::BillingAndUsage
+            | SettingsSection::Providers
             | SettingsSection::Appearance
             | SettingsSection::Features
             | SettingsSection::Keybindings

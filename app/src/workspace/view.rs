@@ -308,6 +308,7 @@ use crate::palette::PaletteMode;
 #[cfg(feature = "local_fs")]
 use crate::pane_group::FilePane;
 use crate::pane_group::pane::ActionOrigin;
+use crate::pane_group::working_directories::ChatFolders;
 use crate::pane_group::{
     self, AIFactPane, AnyPaneContent, ArtifactsPane, ChildAgentOrigin, CodeDiffPane, CodePane,
     CodeReviewPanelArg, CustomRouterEditorPane, Direction as PaneGroupDirection, Direction,
@@ -3745,6 +3746,13 @@ impl Workspace {
         }
         if let Some(action) = crate::native_chat::take_dev_open_settings_action() {
             ctx.dispatch_typed_action_deferred(action);
+        }
+        if let Some(action) = crate::native_chat::claude_update::take_dev_open_notifications_action()
+        {
+            ctx.spawn(
+                warpui::r#async::Timer::after(3 * DEV_HOOK_DELAY),
+                move |_, _, ctx| ctx.dispatch_typed_action_deferred(action),
+            );
         }
         for action in crate::code::take_dev_open_code_actions() {
             ctx.dispatch_typed_action_deferred(action);
@@ -10085,6 +10093,42 @@ impl Workspace {
         }
     }
 
+    /// Detects `repo_root` as a repository, then opens the code review panel on it.
+    #[cfg(feature = "local_fs")]
+    fn detect_and_open_code_review_for_repo(
+        &mut self,
+        repo_root: PathBuf,
+        pane_group: ViewHandle<PaneGroup>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        // The panel only reviews repositories among the pane group's working directories, which
+        // only lists repositories once they're detected.
+        let detection = DetectedRepositories::handle(ctx).update(ctx, |repos, ctx| {
+            repos.detect_possible_local_git_repo(
+                &repo_root.to_string_lossy(),
+                RepoDetectionSource::CodeReviewInitialization,
+                ctx,
+            )
+        });
+        ctx.spawn(detection, move |me, detected_root, ctx| {
+            me.open_code_review_for_repo(detected_root.unwrap_or(repo_root), &pane_group, ctx);
+        });
+    }
+
+    /// The git repository of the focused native chat: its cwd's, else the first of its other
+    /// folders that is in one.
+    #[cfg(feature = "local_fs")]
+    fn focused_chat_repo(pane_group: &PaneGroup, ctx: &AppContext) -> Option<PathBuf> {
+        pane_group
+            .focused_claude_chat_dirs(ctx)
+            .iter()
+            .find_map(|dir| {
+                dir.ancestors()
+                    .find(|ancestor| ancestor.join(".git").exists())
+                    .map(Path::to_path_buf)
+            })
+    }
+
     /// Opens the code review panel on a repository that may have no terminal, like a native
     /// chat's.
     #[cfg(feature = "local_fs")]
@@ -10197,6 +10241,21 @@ impl Workspace {
     ) {
         let target_open_state =
             pane_group_handle.read(ctx, |pane_group, _| !pane_group.right_panel_open);
+
+        // A native chat has no terminal session to take the repository from.
+        #[cfg(feature = "local_fs")]
+        {
+            if target_open_state
+                && let Some(repo_root) = Self::focused_chat_repo(pane_group_handle.as_ref(ctx), ctx)
+            {
+                self.detect_and_open_code_review_for_repo(
+                    repo_root,
+                    pane_group_handle.clone(),
+                    ctx,
+                );
+                return;
+            }
+        }
 
         // Read repo_path and preferred session from pane group (immutable context).
         let read_result = pane_group_handle.read(ctx, |pane_group, ctx| {
@@ -15757,13 +15816,14 @@ impl Workspace {
             .file_notebook_paths(ctx)
             .filter_map(|(id, path)| path.map(|p| (id, p)))
             .collect();
-        let chat_paths: Vec<(EntityId, LocalOrRemotePath)> =
-            pane_group.as_ref(ctx).claude_chat_paths(ctx).collect();
+        let chat_folders = ChatFolders {
+            all: pane_group.as_ref(ctx).claude_chat_dirs(ctx),
+            focused: pane_group.as_ref(ctx).focused_claude_chat_dirs(ctx),
+        };
         let local_paths: Vec<(EntityId, LocalOrRemotePath)> = code_paths
             .into_iter()
             .chain(notebook_paths)
             .chain(code_diff_paths)
-            .chain(chat_paths)
             .collect();
 
         // Get the focused terminal ID to prioritize it in the repo_to_terminal map
@@ -15777,6 +15837,7 @@ impl Workspace {
                 pane_group_id,
                 terminal_cwds,
                 local_paths,
+                chat_folders,
                 focused_terminal_id,
                 ctx,
             );
@@ -16937,6 +16998,9 @@ impl Workspace {
             // If focused pane contains an object, then set selected state in WD to that object
             pane_group::Event::PaneFocused => {
                 self.current_workspace_state.close_all_modals();
+                // A focused native chat's folders lead the file tree, and focusing one doesn't
+                // change the active terminal session.
+                self.refresh_working_directories_for_pane_group(&pane_group, ctx);
 
                 // Re-evaluate which region is focused and update pane dimming accordingly.
                 self.update_pane_dimming_for_current_focus_region(ctx);
@@ -21863,9 +21927,7 @@ impl Workspace {
             )
             .finish();
 
-        let unread_count = AgentNotificationsModel::as_ref(ctx)
-            .notifications()
-            .filtered_count(NotificationFilter::Unread);
+        let unread_count = AgentNotificationsModel::as_ref(ctx).unread_count();
         let mailbox_element = if unread_count > 0 {
             let indicator = Container::new(
                 ConstrainedBox::new(
@@ -24966,6 +25028,8 @@ impl TypedActionView for Workspace {
                         session_id: session_id.clone(),
                         cwd: cwd.clone(),
                         workspace: None,
+                        provider: None,
+                        model: None,
                         draft: draft.clone(),
                         artifact_kind: artifact_kind.clone(),
                     },
@@ -24984,12 +25048,17 @@ impl TypedActionView for Workspace {
                         session_id: session_id.clone(),
                         cwd: cwd.clone(),
                         workspace: Some(workspace.clone()),
+                        provider: None,
+                        model: None,
                         draft: None,
                         artifact_kind: None,
                     },
                     group.as_deref(),
                     ctx,
                 );
+            }
+            OpenClaudeChatSnapshot { snapshot, group } => {
+                self.open_claude_chat((**snapshot).clone(), group.as_deref(), ctx);
             }
             CloseClaudeChat { session_id } => self.close_claude_chat(session_id, ctx),
             OpenArtifacts { artifact_id } => self.open_artifacts(artifact_id.clone(), ctx),
@@ -25410,23 +25479,11 @@ impl TypedActionView for Workspace {
             #[cfg(feature = "local_fs")]
             OpenCodeReviewForRepo(repo_root) => {
                 let pane_group_handle = self.active_tab_pane_group().clone();
-                // The panel only reviews repositories among the pane group's working
-                // directories, which only lists repositories once they're detected.
-                let detection = DetectedRepositories::handle(ctx).update(ctx, |repos, ctx| {
-                    repos.detect_possible_local_git_repo(
-                        &repo_root.to_string_lossy(),
-                        RepoDetectionSource::CodeReviewInitialization,
-                        ctx,
-                    )
-                });
-                let fallback_root = repo_root.clone();
-                ctx.spawn(detection, move |me, detected_root, ctx| {
-                    me.open_code_review_for_repo(
-                        detected_root.unwrap_or(fallback_root),
-                        &pane_group_handle,
-                        ctx,
-                    );
-                });
+                self.detect_and_open_code_review_for_repo(
+                    repo_root.clone(),
+                    pane_group_handle,
+                    ctx,
+                );
             }
             #[cfg(not(feature = "local_fs"))]
             OpenCodeReviewForRepo(_) => {}
