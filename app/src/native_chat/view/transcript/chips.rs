@@ -415,13 +415,14 @@ fn pill(
             return chip;
         }
         let mut stack = Stack::new().with_child(chip);
+        // Below the pill: above it, a message near the top of the transcript clips the tooltip.
         stack.add_positioned_overlay_child(
             tooltip(&style, tooltip_text.clone()),
             OffsetPositioning::offset_from_parent(
-                vec2f(0., -6.),
+                vec2f(0., 6.),
                 ParentOffsetBounds::WindowByPosition,
-                ParentAnchor::TopRight,
-                ChildAnchor::BottomRight,
+                ParentAnchor::BottomRight,
+                ChildAnchor::TopRight,
             ),
         );
         stack.finish()
