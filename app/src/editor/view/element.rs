@@ -189,6 +189,7 @@ pub struct EditorElement {
     paint: Option<PaintState>,
     mouse_state: CommandXRayMouseStateHandle,
     preferred_cursor_type: CursorDisplayType,
+    beam_cursor_width: f32,
     soft_wrap: bool,
     /// Whether the placeholder text should soft wrap
     placeholder_soft_wrap: bool,
@@ -255,6 +256,7 @@ impl EditorElement {
             local_selection_data,
             remote_selections_data,
             preferred_cursor_type: cursor_display_type.unwrap_or_default(),
+            beam_cursor_width: BEAM_CURSOR_WIDTH_PX,
             cycle_next_command_hint: None,
             voice_input_cursor_icon: None,
             voice_input_toggle_key_code,
@@ -818,8 +820,10 @@ impl EditorElement {
     }
 
     /// Draws cursors and avatars for local and remote peers.
+    #[allow(clippy::too_many_arguments)]
     fn draw_cursors(
         cursor_display_type: CursorDisplayType,
+        beam_cursor_width: f32,
         cursors: SmallVec<[CursorData; 32]>,
         view_snapshot: &ViewSnapshot,
         remote_selections_data: &mut HashMap<ReplicaId, RemoteDrawableSelectionData>,
@@ -841,7 +845,7 @@ impl EditorElement {
                     cursor.block_cursor_width
                 }
                 _ if !is_local => REMOTE_BEAM_CURSOR_WIDTH_PX,
-                _ => BEAM_CURSOR_WIDTH_PX,
+                _ => beam_cursor_width,
             };
             let mut cursor_rect = RectF::new(cursor.origin, vec2f(cursor_width, cursor_height));
 
@@ -1448,6 +1452,11 @@ impl EditorElement {
     }
 
     /// Adds icons used in the input editor but not other editors.
+    pub fn with_beam_cursor_width(mut self, width: f32) -> Self {
+        self.beam_cursor_width = width;
+        self
+    }
+
     pub fn with_input_editor_icons(
         mut self,
         accept_autosuggestion_keybinding: &ViewHandle<AcceptAutosuggestionKeybinding>,
@@ -1880,6 +1889,7 @@ impl Element for EditorElement {
 
             Self::draw_cursors(
                 self.get_cursor_type(),
+                self.beam_cursor_width,
                 cursors,
                 view_snapshot,
                 &mut self.remote_selections_data,

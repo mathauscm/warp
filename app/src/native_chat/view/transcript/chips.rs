@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use claude_chat::attachments::{AttachedFile, AttachmentKind};
+use claude_chat::presentation::QuestionAnswer;
 
 use markdown_parser::{FormattedText, Hyperlink};
 use pathfinder_color::ColorU;
@@ -49,6 +50,9 @@ const PILL_HEIGHT: f32 = 26.;
 /// Also gives the label's shrinkable row a finite width inside wrapping rows, which lay children
 /// out unbounded.
 const PILL_MAX_WIDTH: f32 = 420.;
+const ANSWER_PILL_HEIGHT: f32 = 22.;
+/// Keeps a long answer from widening its pill past a narrow pane.
+const ANSWER_PILL_MAX_WIDTH: f32 = 320.;
 const QUOTE_TOOLTIP_CHARS: usize = 600;
 const PASTE_PREVIEW_LINES: usize = 6;
 const PASTE_PREVIEW_LINE_CHARS: usize = 60;
@@ -435,6 +439,77 @@ fn pill(
             .finish(),
         None => hoverable.finish(),
     }
+}
+
+/// What the user answered to one question, as a small pill: its header, muted, then the answer;
+/// hovering it shows the whole question.
+pub(super) fn answer_chip(cx: &RowContext, key: &str, answer: &QuestionAnswer) -> Box<dyn Element> {
+    let style = cx.style.clone();
+    let header = answer.header.clone();
+    let text = answer.answer.clone();
+    let tooltip_text = format!("{}\n{}", answer.question, answer.answer);
+    Hoverable::new(cx.view.mouse(&format!("answer:{key}")), move |state| {
+        let palette = &style.palette;
+        let sizes = &style.sizes;
+        let tint = palette.accent.0;
+        let mut content = Flex::row()
+            .with_main_axis_size(MainAxisSize::Min)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(5.);
+        if let Some(header) = &header {
+            content.add_child(
+                Text::new_inline(header.clone(), style.ui, sizes.tiny_font_size + 0.5)
+                    .with_color(palette.text_muted.0)
+                    .with_selectable(false)
+                    .finish(),
+            );
+        }
+        content.add_child(
+            Shrinkable::new(
+                1.,
+                Text::new_inline(text.clone(), style.ui, sizes.small_font_size)
+                    .with_color(palette.text.0)
+                    .with_clip(ClipConfig::ellipsis())
+                    .with_selectable(false)
+                    .finish(),
+            )
+            .finish(),
+        );
+        let border = if state.is_hovered() {
+            with_alpha(tint, 0x99)
+        } else {
+            with_alpha(tint, 0x4d)
+        };
+        let chip = Container::new(
+            ConstrainedBox::new(content.finish())
+                .with_height(ANSWER_PILL_HEIGHT)
+                .with_max_width(ANSWER_PILL_MAX_WIDTH)
+                .finish(),
+        )
+        .with_horizontal_padding(9.)
+        .with_background_color(mix(palette.page.0, tint, 0.08))
+        .with_border(Border::all(1.).with_border_color(border))
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(
+            ANSWER_PILL_HEIGHT / 2.,
+        )))
+        .finish();
+        if !state.is_hovered() {
+            return chip;
+        }
+        let mut stack = Stack::new().with_child(chip);
+        stack.add_positioned_overlay_child(
+            tooltip(&style, tooltip_text.clone()),
+            OffsetPositioning::offset_from_parent(
+                vec2f(0., 6.),
+                ParentOffsetBounds::WindowByPosition,
+                ParentAnchor::BottomLeft,
+                ChildAnchor::TopLeft,
+            ),
+        );
+        stack.finish()
+    })
+    .with_propagate_drag()
+    .finish()
 }
 
 /// `from` moved `amount` (0 to 1) of the way to `to`, opaque.

@@ -3,7 +3,7 @@
 
 use claude_chat::artifacts::{ArtifactKind, ArtifactMeta, is_artifact_tool, kind_label_pt};
 use claude_chat::presentation::{
-    self, Row, ToolBatch, ToolKind, ToolLabel, edit_stats, tool_label_in,
+    self, Row, ToolBatch, ToolKind, ToolLabel, edit_stats, question_answers, tool_label_in,
 };
 use claude_chat::timeline::{TodoStatus, ToolCall, ToolStatus};
 use pathfinder_color::ColorU;
@@ -12,13 +12,14 @@ use warpui::Element;
 use warpui::elements::shimmering_text::{ShimmerConfig, ShimmeringTextElement};
 use warpui::elements::{
     Border, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, Empty, Expanded, Flex,
-    Hoverable, MainAxisSize, ParentElement, Radius, Shrinkable, Text,
+    Hoverable, MainAxisAlignment, MainAxisSize, ParentElement, Radius, Shrinkable, Text, Wrap,
 };
 use warpui::fonts::{Properties, Weight};
 use warpui::platform::Cursor;
 use warpui::text_layout::ClipConfig;
 
 use super::TranscriptAction;
+use super::chips;
 use super::details::{self, DiffLineKind, MAX_DIFF_LINES};
 use super::render::{
     ICON_CHEVRON_DOWN, ICON_CHEVRON_RIGHT, MarkdownTone, RowContext, Style, disclosure_line, icon,
@@ -491,6 +492,47 @@ fn render_diff(cx: &RowContext, key: &str, lines: &[details::DiffLine]) -> Box<d
             .finish(),
         false,
     )
+}
+
+/// What the user answered to an AskUserQuestion call: one muted line with a pill per answer,
+/// wrapping in narrow panes.
+pub(super) fn render_question_answers(cx: &RowContext, tool: &ToolCall) -> Box<dyn Element> {
+    let palette = cx.palette();
+    let sizes = cx.sizes();
+    let lead = Flex::row()
+        .with_main_axis_size(MainAxisSize::Min)
+        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+        .with_child(
+            Container::new(icon(
+                kind_icon(ToolKind::Question),
+                palette.text_muted.0,
+                sizes.icon_size - 1.,
+            ))
+            .with_padding_right(ICON_GAP)
+            .finish(),
+        )
+        .with_child(
+            Text::new_inline("Você respondeu", cx.style.ui, sizes.small_font_size + 0.5)
+                .with_color(palette.text_muted.0)
+                .with_style(Properties::default().weight(Weight::Medium))
+                .with_selectable(false)
+                .finish(),
+        )
+        .finish();
+    let mut row = Wrap::row()
+        .with_main_axis_alignment(MainAxisAlignment::Start)
+        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+        .with_spacing(6.)
+        .with_run_spacing(6.);
+    row.add_child(lead);
+    for (position, answer) in question_answers(tool).iter().enumerate() {
+        row.add_child(chips::answer_chip(
+            cx,
+            &format!("{}:{position}", tool.id),
+            answer,
+        ));
+    }
+    row.finish()
 }
 
 pub(super) fn render_batch(cx: &RowContext, batch: &ToolBatch) -> Box<dyn Element> {

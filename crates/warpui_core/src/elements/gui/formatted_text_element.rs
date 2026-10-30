@@ -163,6 +163,9 @@ pub struct FormattedTextElement {
     hyperlink_support: HyperlinkSupport,
     saved_glyph_positions: Vec<SavedGlyphPositionIds>,
     is_selectable: bool,
+    /// The cursor shown over the text itself (not its links), like an I-beam for selectable text,
+    /// and the state remembering it was shown so leaving the text restores the cursor.
+    text_cursor: Option<(Cursor, MouseStateHandle)>,
     is_mouse_interaction_disabled: bool,
     disable_text_wrapping: bool,
     clip_config: Option<ClipConfig>,
@@ -202,6 +205,7 @@ impl FormattedTextElement {
             hyperlink_support,
             saved_glyph_positions: vec![],
             is_selectable: false,
+            text_cursor: None,
             is_mouse_interaction_disabled: false,
             disable_text_wrapping: false,
             clip_config: None,
@@ -526,6 +530,28 @@ impl FormattedTextElement {
     pub fn set_selectable(mut self, selectable: bool) -> Self {
         self.is_selectable = selectable;
         self
+    }
+
+    pub fn with_text_cursor(mut self, cursor: Cursor, state: MouseStateHandle) -> Self {
+        self.text_cursor = Some((cursor, state));
+        self
+    }
+
+    /// Shows the text cursor, or takes it back when `show` is false and it was showing.
+    fn update_text_cursor(&self, show: bool, z_index: ZIndex, ctx: &mut EventContext) {
+        let Some((cursor, state)) = &self.text_cursor else {
+            return;
+        };
+        let Ok(mut state) = state.lock() else {
+            return;
+        };
+        if show {
+            state.is_hovered = true;
+            ctx.set_cursor(*cursor, z_index);
+        } else if state.is_hovered {
+            state.is_hovered = false;
+            ctx.reset_cursor();
+        }
     }
 
     pub fn disable_mouse_interaction(mut self) -> Self {
@@ -876,6 +902,7 @@ impl FormattedTextElement {
 
         let is_covered = ctx.is_covered(Point::from_vec2f(position, z_index));
         let mut handled = false;
+        let mut over_link = false;
 
         let mut highlighted_link = self
             .hyperlink_support
@@ -897,6 +924,7 @@ impl FormattedTextElement {
                 if was_hovered {
                     ctx.reset_cursor();
                 }
+                self.update_text_cursor(false, z_index, ctx);
                 return false;
             }
         } else {
@@ -911,6 +939,7 @@ impl FormattedTextElement {
             for handlers in self.text_frame_mouse_handlers.iter() {
                 handlers.borrow_mut().unhover_all(ctx, app);
             }
+            self.update_text_cursor(false, z_index, ctx);
             ctx.reset_cursor();
             return true;
         };
@@ -949,7 +978,11 @@ impl FormattedTextElement {
 
         // If the mouse is on a frame without any hover handlers, reset the cursor
         if handlers.hover_handlers.is_empty() {
-            ctx.reset_cursor();
+            if self.text_cursor.is_some() && !is_covered {
+                self.update_text_cursor(true, z_index, ctx);
+            } else {
+                ctx.reset_cursor();
+            }
             return true;
         }
 
@@ -977,6 +1010,7 @@ impl FormattedTextElement {
                 }
 
                 if is_hovered {
+                    over_link = true;
                     *highlighted_link = Some(HyperlinkPosition {
                         // formatted text line index, not laid-out frame index
                         frame_index: self.frame_index_to_line_index(text_pos.frame_index),
@@ -984,6 +1018,11 @@ impl FormattedTextElement {
                     });
                 }
             });
+        if self.text_cursor.is_some() {
+            drop(handlers);
+            drop(highlighted_link);
+            self.update_text_cursor(!over_link && !is_covered, z_index, ctx);
+        }
         handled
     }
 

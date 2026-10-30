@@ -8,11 +8,14 @@ use serde_json::Value;
 use warp_core::ui::Icon as WarpIcon;
 use warpui::AppContext;
 use warpui::elements::{
-    Border, ClippedScrollable, ConstrainedBox, Container, CrossAxisAlignment, Element, Empty,
-    Expanded, Fill as ElementFill, Flex, FormattedTextElement, HeadingFontSizeMultipliers,
-    Hoverable, MainAxisAlignment, MainAxisSize, ParentElement, ScrollbarWidth, Shrinkable,
-    SizeConstraintCondition, SizeConstraintSwitch, Stack, Wrap,
+    Border, ClippedScrollable, ConstrainedBox, Container, CrossAxisAlignment,
+    DEFAULT_UI_LINE_HEIGHT_RATIO, DropShadow, Element, Empty, Expanded, Fill as ElementFill, Flex,
+    FormattedTextElement, HeadingFontSizeMultipliers, Hoverable, MainAxisAlignment, MainAxisSize,
+    MouseStateHandle, ParentElement, ScrollbarWidth, Shrinkable, SizeConstraintCondition,
+    SizeConstraintSwitch, Stack, Text, Wrap,
 };
+use warpui::fonts::{Properties, Weight};
+use warpui::geometry::vector::vec2f;
 use warpui::platform::Cursor;
 
 use super::logic::{self, PermissionPreview};
@@ -34,6 +37,12 @@ const GLYPH_WIDTH_RATIO: f32 = 0.6;
 const QUEUE_VISIBLE_ROWS: usize = 3;
 const QUEUE_ROW_SPACING: f32 = 2.;
 const QUEUE_INDEX_WIDTH: f32 = 16.;
+/// Space between the question card's edge and its option rows, whose radius follows the card's.
+const QUESTION_CARD_PADDING: f32 = 8.;
+const OPTION_PADDING_X: f32 = 8.;
+const OPTION_PADDING_Y: f32 = 5.;
+const OPTION_GAP: f32 = 9.;
+const OPTION_MARKER_SIZE: f32 = 13.;
 
 impl ComposerView {
     pub(super) fn render_cards(&self, look: &Look, app: &AppContext) -> Vec<Box<dyn Element>> {
@@ -52,9 +61,15 @@ impl ComposerView {
         }
         let pending = conversation.pending_requests();
         if let Some(request) = pending.first() {
-            cards.push(self.render_request(look, request, pending.len(), agent));
-        } else if let Some(request) = dev_request() {
-            cards.push(self.render_request(look, &request, 2, agent));
+            cards.push(self.render_request(
+                look,
+                request,
+                &self.question.selected,
+                pending.len(),
+                agent,
+            ));
+        } else if let Some((request, selected)) = dev_request() {
+            cards.push(self.render_request(look, &request, &selected, 2, agent));
         }
         cards
     }
@@ -329,10 +344,12 @@ impl ComposerView {
             .finish()
     }
 
+    /// `selected` holds the options picked in each question, when the request is a question.
     fn render_request(
         &self,
         look: &Look,
         request: &PendingRequest,
+        selected: &[Vec<usize>],
         count: usize,
         agent: &str,
     ) -> Box<dyn Element> {
@@ -355,12 +372,13 @@ impl ComposerView {
                 suggestions.first(),
             ),
             PendingRequestKind::Question { questions, .. } => {
-                self.render_questions(look, questions)
+                self.render_questions(look, questions, selected)
             }
             PendingRequestKind::PlanApproval { plan, .. } => self.render_plan(look, plan),
         };
         let palette = &look.palette;
         let sizes = &look.sizes;
+        let is_question = matches!(request.kind, PendingRequestKind::Question { .. });
         let mut column = Flex::column()
             .with_main_axis_size(MainAxisSize::Min)
             .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
@@ -373,8 +391,24 @@ impl ComposerView {
                     palette.text_faint.0,
                 ))
                 .with_padding_top(8.)
+                .with_padding_left(if is_question { OPTION_PADDING_X } else { 0. })
                 .finish(),
             );
+        }
+        if is_question {
+            return Container::new(column.finish())
+                .with_uniform_padding(QUESTION_CARD_PADDING)
+                .with_padding_top(QUESTION_CARD_PADDING + 4.)
+                .with_background_color(palette.surface.0)
+                .with_border(Border::all(1.).with_border_color(palette.border.0))
+                .with_corner_radius(look.radius(sizes.composer_radius))
+                .with_drop_shadow(DropShadow {
+                    color: palette.shadow.0,
+                    offset: vec2f(0., 4.),
+                    blur_radius: sizes.shadow_blur,
+                    spread_radius: 0.,
+                })
+                .finish();
         }
         Container::new(column.finish())
             .with_uniform_padding(sizes.composer_padding + 2.)
@@ -477,7 +511,7 @@ impl ComposerView {
                     .with_child(
                         Shrinkable::new(
                             1.,
-                            warpui::elements::Text::new_inline(
+                            Text::new_inline(
                                 stats.path.clone(),
                                 look.mono_font,
                                 sizes.code_font_size,
@@ -572,185 +606,87 @@ impl ComposerView {
         .finish()
     }
 
-    fn render_questions(&self, look: &Look, questions: &[Question]) -> Box<dyn Element> {
-        let palette = &look.palette;
+    /// `selected` holds the options picked in each question.
+    fn render_questions(
+        &self,
+        look: &Look,
+        questions: &[Question],
+        selected: &[Vec<usize>],
+    ) -> Box<dyn Element> {
         let sizes = &look.sizes;
+        let option_radius = sizes.composer_radius - QUESTION_CARD_PADDING;
         let mut column = Flex::column()
             .with_main_axis_size(MainAxisSize::Min)
             .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
-            .with_spacing(10.);
+            .with_spacing(14.);
         let mut option_states = self.mouse.options.iter();
         for (question_index, question) in questions.iter().enumerate() {
-            let mut title = Vec::new();
-            if let Some(header) = question.header.as_ref().filter(|header| !header.is_empty()) {
-                title.push((header.clone(), false));
-            } else {
-                title.push(("Pergunta".to_owned(), false));
-            }
-            if questions.len() > 1 {
-                title.push((format!("{}/{}", question_index + 1, questions.len()), false));
-            }
-            column.add_child(Self::render_card_header(
-                look,
-                WarpIcon::HelpCircle,
-                palette.info.0,
-                title,
-            ));
-            column.add_child(look.paragraph(
-                question.question.clone(),
-                sizes.font_size,
-                palette.text.0,
-            ));
-            let selected = self
-                .question
-                .selected
+            let picked = selected
                 .get(question_index)
-                .cloned()
+                .map(Vec::as_slice)
                 .unwrap_or_default();
             let is_active = question_index == self.question.active;
-            let mut options = Flex::column()
+            let mut block = Flex::column()
                 .with_main_axis_size(MainAxisSize::Min)
                 .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
-                .with_spacing(2.);
+                .with_spacing(1.)
+                .with_child(
+                    Container::new(question_heading(
+                        look,
+                        question,
+                        question_index,
+                        questions.len(),
+                    ))
+                    .with_horizontal_padding(OPTION_PADDING_X)
+                    .with_padding_bottom(6.)
+                    .finish(),
+                );
             for (option_index, option) in question.options.iter().enumerate() {
                 let Some(mouse_state) = option_states.next() else {
                     break;
                 };
-                let is_selected = selected.contains(&option_index);
-                let digit = (is_active && option_index < 9).then(|| option_index + 1);
-                let row_look = look.clone();
-                let label = option.label.clone();
-                let description = option.description.clone();
-                let is_multi = question.multi_select;
-                let action = ComposerAction::ToggleOption {
-                    question: question_index,
-                    option: option_index,
-                };
-                options.add_child(
-                    Hoverable::new(mouse_state.clone(), move |state| {
-                        let look = &row_look;
-                        let palette = &look.palette;
-                        let sizes = &look.sizes;
-                        let marker = if is_multi {
-                            if is_selected {
-                                Container::new(icon(WarpIcon::Check, palette.on_accent.0, 11.))
-                                    .with_uniform_padding((sizes.icon_size - 11.) / 2.)
-                                    .with_background_color(palette.accent.0)
-                                    .with_corner_radius(look.radius(4.))
-                                    .finish()
-                            } else {
-                                Container::new(widgets::spacer(
-                                    sizes.icon_size - 2.,
-                                    sizes.icon_size - 2.,
-                                ))
-                                .with_border(
-                                    Border::all(1.5).with_border_color(palette.text_faint.0),
-                                )
-                                .with_corner_radius(look.radius(4.))
-                                .finish()
-                            }
-                        } else {
-                            let ring_color = if is_selected {
-                                palette.accent.0
-                            } else {
-                                palette.text_faint.0
-                            };
-                            let mut radio = Stack::new().with_child(widgets::svg(
-                                "bundled/svg/picolas-ring-track.svg",
-                                ring_color,
-                                sizes.icon_size,
-                            ));
-                            if is_selected {
-                                radio.add_child(
-                                    Container::new(widgets::block(6., 6., 3., palette.accent.0))
-                                        .with_uniform_padding((sizes.icon_size - 6.) / 2.)
-                                        .finish(),
-                                );
-                            }
-                            radio.finish()
-                        };
-                        let mut text = Flex::column()
-                            .with_main_axis_size(MainAxisSize::Min)
-                            .with_cross_axis_alignment(CrossAxisAlignment::Start)
-                            .with_spacing(2.)
-                            .with_child(look.medium_text(
-                                label.clone(),
-                                sizes.small_font_size + 0.5,
-                                if is_selected || state.is_hovered() {
-                                    palette.text.0
-                                } else {
-                                    with_alpha(palette.text.0, 0xcc)
-                                },
-                            ));
-                        if let Some(description) = &description {
-                            text.add_child(look.paragraph(
-                                description.clone(),
-                                sizes.tiny_font_size + 0.5,
-                                palette.text_muted.0,
-                            ));
-                        }
-                        let mut row = Flex::row()
-                            .with_main_axis_size(MainAxisSize::Max)
-                            .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                            .with_spacing(10.)
-                            .with_child(marker)
-                            .with_child(Expanded::new(1., text.finish()).finish());
-                        if let Some(digit) = digit {
-                            row.add_child(widgets::key_cap(look, digit.to_string(), is_selected));
-                        }
-                        let mut container = Container::new(row.finish())
-                            .with_horizontal_padding(10.)
-                            .with_vertical_padding(7.)
-                            .with_corner_radius(look.radius(sizes.chip_radius + 1.));
-                        if is_selected {
-                            container = container
-                                .with_background_color(with_alpha(palette.accent.0, 0x1a))
-                                .with_border(
-                                    Border::all(1.)
-                                        .with_border_color(with_alpha(palette.accent.0, 0x66)),
-                                );
-                        } else {
-                            container = container
-                                .with_border(Border::all(1.).with_border_color(palette.border.0));
-                            if state.is_hovered() {
-                                container =
-                                    container.with_background_color(palette.surface_hover.0);
-                            }
-                        }
-                        container.finish()
-                    })
-                    .with_cursor(Cursor::PointingHand)
-                    .on_click(move |ctx, _, _| ctx.dispatch_typed_action(action.clone()))
-                    .finish(),
-                );
+                block.add_child(option_row(
+                    look,
+                    mouse_state.clone(),
+                    option,
+                    OptionState {
+                        is_multi: question.multi_select,
+                        is_selected: picked.contains(&option_index),
+                        digit: (is_active && option_index < 9).then_some(option_index + 1),
+                        radius: option_radius,
+                    },
+                    ComposerAction::ToggleOption {
+                        question: question_index,
+                        option: option_index,
+                    },
+                ));
             }
-            column.add_child(options.finish());
+            column.add_child(block.finish());
         }
-        column.add_child(look.text(
-            "Ou escreva outra resposta na caixa abaixo",
-            sizes.tiny_font_size,
-            palette.text_faint.0,
-        ));
-        column.add_child(action_row(
-            look,
-            Vec::new(),
-            vec![
-                ActionButton {
-                    label: "Dispensar".to_owned(),
-                    hint: None,
-                    kind: ButtonKind::Ghost,
-                    mouse: self.mouse.dismiss_question.clone(),
-                    action: ComposerAction::DismissQuestion,
-                },
-                ActionButton {
-                    label: "Enviar".to_owned(),
-                    hint: Some("↵"),
-                    kind: ButtonKind::Primary,
-                    mouse: self.mouse.submit_answers.clone(),
-                    action: ComposerAction::SubmitAnswers,
-                },
-            ],
-        ));
+        column.add_child(
+            Container::new(note_and_actions(
+                look,
+                "Ou escreva outra resposta na caixa abaixo",
+                vec![
+                    ActionButton {
+                        label: "Dispensar".to_owned(),
+                        hint: None,
+                        kind: ButtonKind::Ghost,
+                        mouse: self.mouse.dismiss_question.clone(),
+                        action: ComposerAction::DismissQuestion,
+                    },
+                    ActionButton {
+                        label: "Enviar".to_owned(),
+                        hint: Some("↵"),
+                        kind: ButtonKind::Primary,
+                        mouse: self.mouse.submit_answers.clone(),
+                        action: ComposerAction::SubmitAnswers,
+                    },
+                ],
+            ))
+            .with_padding_left(OPTION_PADDING_X)
+            .finish(),
+        );
         column.finish()
     }
 
@@ -847,8 +783,9 @@ impl ComposerView {
 }
 
 /// `PICOLAS_FAKE_REQUEST=permission|question|plan` shows that request with made-up content when
-/// Claude isn't waiting for one, to check the cards' layout. Debug builds only.
-fn dev_request() -> Option<PendingRequest> {
+/// Claude isn't waiting for one, to check the cards' layout, with some options picked. Debug builds
+/// only.
+fn dev_request() -> Option<(PendingRequest, Vec<Vec<usize>>)> {
     if !cfg!(debug_assertions) {
         return None;
     }
@@ -874,21 +811,42 @@ fn dev_request() -> Option<PendingRequest> {
         },
         "question" => PendingRequestKind::Question {
             input: Value::Null,
-            questions: vec![Question {
-                question: "Qual abordagem você prefere para o layout responsivo?".to_owned(),
-                header: Some("Layout".to_owned()),
-                multi_select: false,
-                options: vec![
-                    QuestionOption {
-                        label: "Empilhar os botões".to_owned(),
-                        description: Some("Um botão por linha em painéis estreitos".to_owned()),
-                    },
-                    QuestionOption {
-                        label: "Quebrar em linhas".to_owned(),
-                        description: None,
-                    },
-                ],
-            }],
+            questions: vec![
+                Question {
+                    question: "Qual abordagem você prefere para o layout responsivo?".to_owned(),
+                    header: Some("Layout".to_owned()),
+                    multi_select: false,
+                    options: vec![
+                        QuestionOption {
+                            label: "Empilhar os botões".to_owned(),
+                            description: Some("Um botão por linha em painéis estreitos".to_owned()),
+                        },
+                        QuestionOption {
+                            label: "Quebrar em linhas".to_owned(),
+                            description: None,
+                        },
+                    ],
+                },
+                Question {
+                    question: "Quais recursos entram na primeira versão?".to_owned(),
+                    header: Some("Recursos".to_owned()),
+                    multi_select: true,
+                    options: vec![
+                        QuestionOption {
+                            label: "Autenticação".to_owned(),
+                            description: Some("Login com e-mail e senha".to_owned()),
+                        },
+                        QuestionOption {
+                            label: "Notificações".to_owned(),
+                            description: Some("Avisos por e-mail quando algo muda".to_owned()),
+                        },
+                        QuestionOption {
+                            label: "Relatórios".to_owned(),
+                            description: None,
+                        },
+                    ],
+                },
+            ],
         },
         "plan" => PendingRequestKind::PlanApproval {
             input: Value::Null,
@@ -900,11 +858,14 @@ fn dev_request() -> Option<PendingRequest> {
         },
         _ => return None,
     };
-    Some(PendingRequest {
-        request_id: String::new(),
-        tool_use_id: None,
-        kind,
-    })
+    Some((
+        PendingRequest {
+            request_id: String::new(),
+            tool_use_id: None,
+            kind,
+        },
+        vec![vec![0], vec![0, 2]],
+    ))
 }
 
 /// A button of a card's action row.
@@ -912,7 +873,7 @@ struct ActionButton {
     label: String,
     hint: Option<&'static str>,
     kind: ButtonKind,
-    mouse: warpui::elements::MouseStateHandle,
+    mouse: MouseStateHandle,
     action: ComposerAction,
 }
 
@@ -978,6 +939,235 @@ fn action_row(
         )],
     )
     .finish()
+}
+
+/// A muted note at the left of a card's buttons; when both don't fit in one line, the note goes
+/// above the buttons, which then wrap like [`action_row`]'s.
+fn note_and_actions(look: &Look, note: &str, trailing: Vec<ActionButton>) -> Box<dyn Element> {
+    let note_size = look.sizes.tiny_font_size;
+    let note_color = look.palette.text_faint.0;
+    let inline_width = note.chars().count() as f32 * note_size * GLYPH_WIDTH_RATIO
+        + trailing
+            .iter()
+            .map(|button| button.estimated_width(look) + ACTION_SPACING)
+            .sum::<f32>()
+        + ACTION_SPACING;
+
+    let mut inline = Flex::row()
+        .with_main_axis_size(MainAxisSize::Max)
+        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+        .with_spacing(ACTION_SPACING)
+        .with_child(Expanded::new(1., look.text(note, note_size, note_color)).finish());
+    for button in &trailing {
+        inline.add_child(button.render(look));
+    }
+
+    let stacked = Flex::column()
+        .with_main_axis_size(MainAxisSize::Min)
+        .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+        .with_spacing(8.)
+        .with_child(look.paragraph(note, note_size, note_color))
+        .with_child(action_row(look, Vec::new(), trailing));
+
+    SizeConstraintSwitch::new(
+        inline.finish(),
+        [(
+            SizeConstraintCondition::WidthLessThan(inline_width),
+            stacked.finish(),
+        )],
+    )
+    .finish()
+}
+
+/// A question's subtle header chip, its place among several questions, and the question itself.
+fn question_heading(
+    look: &Look,
+    question: &Question,
+    index: usize,
+    count: usize,
+) -> Box<dyn Element> {
+    let palette = &look.palette;
+    let sizes = &look.sizes;
+    let mut tags = Flex::row()
+        .with_main_axis_size(MainAxisSize::Min)
+        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+        .with_spacing(6.);
+    if let Some(header) = question.header.as_ref().filter(|header| !header.is_empty()) {
+        tags.add_child(
+            Shrinkable::new(
+                1.,
+                Container::new(look.medium_text(
+                    header.clone(),
+                    sizes.tiny_font_size - 0.5,
+                    palette.text_muted.0,
+                ))
+                .with_horizontal_padding(6.)
+                .with_vertical_padding(1.5)
+                .with_background_color(palette.surface_strong.0)
+                .with_corner_radius(look.radius(6.))
+                .finish(),
+            )
+            .finish(),
+        );
+    }
+    if count > 1 {
+        tags.add_child(look.text(
+            format!("{} de {count}", index + 1),
+            sizes.tiny_font_size - 0.5,
+            palette.text_faint.0,
+        ));
+    }
+    let title = Text::new(
+        question.question.clone(),
+        look.ui_font,
+        sizes.small_font_size + 1.,
+    )
+    .soft_wrap(true)
+    .with_style(Properties::default().weight(Weight::Medium))
+    .with_color(palette.text.0)
+    .with_line_height_ratio(1.35)
+    .finish();
+    let mut column = Flex::column()
+        .with_main_axis_size(MainAxisSize::Min)
+        .with_cross_axis_alignment(CrossAxisAlignment::Start)
+        .with_spacing(6.);
+    if question
+        .header
+        .as_ref()
+        .is_some_and(|header| !header.is_empty())
+        || count > 1
+    {
+        column.add_child(tags.finish());
+    }
+    column.add_child(title);
+    column.finish()
+}
+
+/// How an option row of a question draws.
+#[derive(Clone, Copy)]
+struct OptionState {
+    is_multi: bool,
+    is_selected: bool,
+    /// The key that picks it, shown while its question takes the digits.
+    digit: Option<usize>,
+    radius: f32,
+}
+
+/// An option of a question: a light row, tinted with the accent color once picked.
+fn option_row(
+    look: &Look,
+    mouse_state: MouseStateHandle,
+    option: &QuestionOption,
+    state: OptionState,
+    action: ComposerAction,
+) -> Box<dyn Element> {
+    let look = look.clone();
+    let label = option.label.clone();
+    let description = option
+        .description
+        .clone()
+        .filter(|description| !description.trim().is_empty());
+    Hoverable::new(mouse_state, move |mouse| {
+        let palette = &look.palette;
+        let sizes = &look.sizes;
+        let is_hovered = mouse.is_hovered();
+        let label_size = sizes.small_font_size + 0.5;
+        let label_color = if state.is_selected || is_hovered {
+            palette.text.0
+        } else {
+            with_alpha(palette.text.0, 0xe0)
+        };
+        let mut text = Flex::column()
+            .with_main_axis_size(MainAxisSize::Min)
+            .with_cross_axis_alignment(CrossAxisAlignment::Start)
+            .with_spacing(1.)
+            .with_child(look.text(label.clone(), label_size, label_color));
+        if let Some(description) = &description {
+            text.add_child(look.paragraph(
+                description.clone(),
+                sizes.tiny_font_size + 0.5,
+                palette.text_muted.0,
+            ));
+        }
+        // Lines the marker and the key up with the label's first line when a description follows.
+        let line_height = label_size * DEFAULT_UI_LINE_HEIGHT_RATIO;
+        let mut row = Flex::row()
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_cross_axis_alignment(CrossAxisAlignment::Start)
+            .with_spacing(OPTION_GAP)
+            .with_child(
+                Container::new(option_marker(&look, state.is_multi, state.is_selected))
+                    .with_padding_top(((line_height - OPTION_MARKER_SIZE) / 2.).max(0.))
+                    .finish(),
+            )
+            .with_child(Expanded::new(1., text.finish()).finish());
+        if let Some(digit) = state.digit {
+            row.add_child(
+                Container::new(widgets::key_cap(
+                    &look,
+                    digit.to_string(),
+                    state.is_selected,
+                ))
+                .with_padding_top(((line_height - widgets::KEY_CAP_SIZE) / 2.).max(0.))
+                .finish(),
+            );
+        }
+        let background = match (state.is_selected, is_hovered) {
+            (true, false) => Some(with_alpha(palette.accent.0, 0x29)),
+            (true, true) => Some(with_alpha(palette.accent.0, 0x36)),
+            (false, true) => Some(palette.surface_hover.0),
+            (false, false) => None,
+        };
+        let mut container = Container::new(row.finish())
+            .with_horizontal_padding(OPTION_PADDING_X)
+            .with_vertical_padding(OPTION_PADDING_Y)
+            .with_corner_radius(look.radius(state.radius));
+        if let Some(background) = background {
+            container = container.with_background_color(background);
+        }
+        container.finish()
+    })
+    .with_cursor(Cursor::PointingHand)
+    .on_click(move |ctx, _, _| ctx.dispatch_typed_action(action.clone()))
+    .finish()
+}
+
+/// A small checkbox for a multiple-choice question, a radio button otherwise.
+fn option_marker(look: &Look, is_multi: bool, is_selected: bool) -> Box<dyn Element> {
+    let palette = &look.palette;
+    let size = OPTION_MARKER_SIZE;
+    match (is_multi, is_selected) {
+        (true, true) => Container::new(icon(WarpIcon::Check, palette.on_accent.0, size - 4.))
+            .with_uniform_padding(2.)
+            .with_background_color(palette.accent.0)
+            .with_corner_radius(look.radius(4.))
+            .finish(),
+        (true, false) => Container::new(widgets::spacer(size - 3., size - 3.))
+            .with_border(Border::all(1.5).with_border_color(palette.text_faint.0))
+            .with_corner_radius(look.radius(4.))
+            .finish(),
+        (false, is_selected) => {
+            let ring_color = if is_selected {
+                palette.accent.0
+            } else {
+                palette.text_faint.0
+            };
+            let mut radio = Stack::new().with_child(widgets::svg(
+                "bundled/svg/picolas-ring-track.svg",
+                ring_color,
+                size,
+            ));
+            if is_selected {
+                let dot = 5.;
+                radio.add_child(
+                    Container::new(widgets::block(dot, dot, dot / 2., palette.accent.0))
+                        .with_uniform_padding((size - dot) / 2.)
+                        .finish(),
+                );
+            }
+            radio.finish()
+        }
+    }
 }
 
 fn queue_row_height(look: &Look) -> f32 {

@@ -1925,6 +1925,7 @@ pub struct EditorView {
 
     /// The line height ratio set with [`EditorView::set_line_height_ratio`].
     line_height_ratio_override: Option<f32>,
+    beam_cursor_width: Option<f32>,
 
     process_attached_images_future_handle: Option<SpawnedFutureHandle>,
 
@@ -2995,6 +2996,12 @@ impl EditorView {
         ctx.notify();
     }
 
+    /// Overrides the width of the local beam cursor (the terminal input keeps the default).
+    pub fn set_beam_cursor_width(&mut self, width: f32, ctx: &mut ViewContext<Self>) {
+        self.beam_cursor_width = Some(width);
+        ctx.notify();
+    }
+
     fn clipboard_content(&mut self, ctx: &mut ViewContext<Self>) -> String {
         let content = ctx.clipboard().read();
         self.clipboard_text_content(content)
@@ -3278,6 +3285,7 @@ impl EditorView {
             drag_drop_path_transformer: options.drag_drop_path_transformer,
             forwards_dropped_files: false,
             line_height_ratio_override: None,
+            beam_cursor_width: None,
             process_attached_images_future_handle: None,
             is_password: options.is_password,
             keymap_context_modifier: options.keymap_context_modifier,
@@ -8824,7 +8832,11 @@ impl View for EditorView {
             remote_selections_data,
             self.cursor_display_override,
             self.voice_input_toggle_key_code(ctx),
-        )
+        );
+        let editor_element = match self.beam_cursor_width {
+            Some(width) => editor_element.with_beam_cursor_width(width),
+            None => editor_element,
+        }
         .with_input_editor_icons(
             &self.accept_autosuggestion_keybinding_view,
             &self.autosuggestion_ignore_view,

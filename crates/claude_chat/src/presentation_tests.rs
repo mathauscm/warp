@@ -677,8 +677,27 @@ fn builds_rows_for_a_loaded_transcript() {
             .iter()
             .all(|group| !group.is_live && group.collapsed_by_default)
     );
-    assert_eq!(groups.len(), 6);
+    // The turn that only asked a question shows its answer instead of a group.
+    assert_eq!(groups.len(), 5);
     assert_eq!(groups[0].summary, "Trabalhou por 5s");
+    let answered: Vec<Vec<QuestionAnswer>> = rows
+        .iter()
+        .filter_map(|row| match row {
+            Row::QuestionAnswers { index } => match &transcript.items[*index] {
+                TimelineItem::Tool(tool) => Some(question_answers(tool)),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        answered,
+        vec![vec![answer(
+            Some("Color"),
+            "Which color do you prefer?",
+            "Blue"
+        )]]
+    );
     // The Agent tool's subagent answer is not a row of its own.
     assert_eq!(
         rows.iter()
@@ -721,4 +740,127 @@ fn the_effort_picker_command_is_left_out() {
     let rows = build_rows(&items, false, at(10));
     assert_eq!(rows[0], Row::UserBubble { index: 1 });
     assert!(!rows.contains(&Row::UserBubble { index: 0 }));
+}
+
+fn answered_question(id: &str, text: &str, structured: Option<Value>) -> ToolCall {
+    let mut call = tool_call(
+        id,
+        "AskUserQuestion",
+        json!({"questions": [
+            {"question": "Qual stack?", "header": "Stack", "options": [], "multiSelect": false},
+            {"question": "Quais recursos?", "header": "Recursos", "options": [], "multiSelect": true},
+        ]}),
+        ToolStatus::Done,
+    );
+    call.result = Some(ToolResult {
+        text: text.to_owned(),
+        is_error: false,
+        structured,
+    });
+    call
+}
+
+fn answer(header: Option<&str>, question: &str, answer: &str) -> QuestionAnswer {
+    QuestionAnswer {
+        header: header.map(str::to_owned),
+        question: question.to_owned(),
+        answer: answer.to_owned(),
+    }
+}
+
+#[test]
+fn reads_question_answers_from_the_structured_result_in_question_order() {
+    let call = answered_question(
+        "q",
+        "ignored",
+        Some(json!({"answers": {
+            "Quais recursos?": ["Autenticação", "Testes"],
+            "Qual stack?": "React",
+        }})),
+    );
+    assert_eq!(
+        question_answers(&call),
+        vec![
+            answer(Some("Stack"), "Qual stack?", "React"),
+            answer(Some("Recursos"), "Quais recursos?", "Autenticação, Testes"),
+        ]
+    );
+}
+
+#[test]
+fn reads_question_answers_from_the_result_text() {
+    let call = answered_question(
+        "q",
+        "Your questions have been answered: \"Qual stack?\"=\"React, \"o de sempre\"\", \
+         \"Outra pergunta\"=\"Sim\". You can now continue with these answers in mind.",
+        None,
+    );
+    assert_eq!(
+        question_answers(&call),
+        vec![
+            answer(Some("Stack"), "Qual stack?", "React, \"o de sempre\""),
+            answer(None, "Outra pergunta", "Sim"),
+        ]
+    );
+    let older = answered_question(
+        "q",
+        "User has answered your questions: \"Qual stack?\"=\"Vue\". You can now continue with \
+         the user's answers in mind.",
+        None,
+    );
+    assert_eq!(
+        question_answers(&older),
+        vec![answer(Some("Stack"), "Qual stack?", "Vue")]
+    );
+}
+
+#[test]
+fn a_dismissed_or_waiting_question_has_no_answers() {
+    let mut denied = answered_question("q", "The user dismissed the question.", None);
+    denied.status = ToolStatus::Denied;
+    assert!(question_answers(&denied).is_empty());
+    let mut failed = answered_question("q", "The user dismissed the question.", None);
+    failed.result.as_mut().unwrap().is_error = true;
+    assert!(question_answers(&failed).is_empty());
+    let mut waiting = answered_question("q", "", None);
+    waiting.status = ToolStatus::AwaitingApproval;
+    waiting.result = None;
+    assert!(question_answers(&waiting).is_empty());
+    assert!(question_answers(&tool_call("r", "Read", json!({}), ToolStatus::Done)).is_empty());
+}
+
+#[test]
+fn an_answered_question_stays_out_of_the_folded_work() {
+    let answers = Some(json!({"answers": {"Qual stack?": "React"}}));
+    let items = vec![
+        user("u", 0),
+        read("r", "/p/a.rs"),
+        TimelineItem::Tool(answered_question("q", "", answers.clone())),
+        assistant("final", 5),
+        turn_end("end", Some(5_000), false),
+    ];
+    let rows = build_rows(&items, false, at(10));
+    assert_eq!(group(&rows[1]).items, vec![1]);
+    assert_eq!(
+        rows[2..],
+        [
+            Row::QuestionAnswers { index: 2 },
+            Row::AssistantProse { index: 3 },
+        ]
+    );
+
+    let only_the_question = vec![
+        user("u", 0),
+        TimelineItem::Tool(answered_question("q", "", answers)),
+        assistant("final", 5),
+        turn_end("end", Some(5_000), false),
+    ];
+    assert_eq!(
+        build_rows(&only_the_question, false, at(10)),
+        vec![
+            Row::UserBubble { index: 0 },
+            Row::QuestionAnswers { index: 1 },
+            Row::AssistantProse { index: 2 },
+        ]
+    );
 }
