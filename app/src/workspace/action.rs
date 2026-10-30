@@ -874,6 +874,12 @@ pub enum WorkspaceAction {
         /// Tab group to put the chat's tab in, like the workspace's name.
         group: Option<String>,
     },
+    /// [`Self::OpenClaudeChat`] from a whole snapshot, like a new chat with another provider or a
+    /// saved Codex conversation.
+    OpenClaudeChatSnapshot {
+        snapshot: Box<crate::native_chat::ClaudeChatPaneSnapshot>,
+        group: Option<String>,
+    },
     /// Open the gallery of local artifacts, or an artifact in it.
     OpenArtifacts {
         artifact_id: Option<String>,
@@ -1187,6 +1193,7 @@ impl WorkspaceAction {
             | OpenDirectoryInNewTab { .. }
             | OpenClaudeChat { .. }
             | OpenClaudeWorkspaceChat { .. }
+            | OpenClaudeChatSnapshot { .. }
             | OpenArtifacts { .. }
             | ToggleClaudeThreadsPanel
             | ToggleTerminalPanel

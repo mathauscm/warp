@@ -130,6 +130,16 @@ impl NotificationItem {
     }
 }
 
+/// Picolas's own notice that a newer Claude Code is out, shown above the agents' notifications.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudeCodeUpdateNotice {
+    pub installed: String,
+    pub latest: String,
+    /// Whether the update the user asked for is running.
+    pub is_updating: bool,
+    pub is_read: bool,
+}
+
 #[derive(Debug, Default)]
 pub struct NotificationItems {
     items: Vec<NotificationItem>,

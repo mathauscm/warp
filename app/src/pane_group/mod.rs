@@ -8217,19 +8217,29 @@ impl PaneGroup {
 
     /// The folders native chats in this group work in: each chat's cwd, then its workspace's other
     /// folders.
-    pub fn claude_chat_paths<'a>(
-        &'a self,
-        ctx: &'a AppContext,
-    ) -> impl Iterator<Item = (EntityId, LocalOrRemotePath)> + 'a {
-        self.panes_of::<ClaudeChatPane>().flat_map(move |pane| {
-            let id = pane.session().id();
-            pane.session()
-                .as_ref(ctx)
-                .dirs()
-                .into_iter()
-                .map(move |dir| (id, LocalOrRemotePath::Local(dir.to_path_buf())))
-                .collect::<Vec<_>>()
-        })
+    pub fn claude_chat_dirs(&self, ctx: &AppContext) -> Vec<PathBuf> {
+        self.pane_contents
+            .iter()
+            .filter(|(id, _)| !self.is_pane_hidden_for_close(**id))
+            .filter_map(|(_, contents)| contents.as_any().downcast_ref::<ClaudeChatPane>())
+            .flat_map(|pane| Self::chat_pane_dirs(pane, ctx))
+            .collect()
+    }
+
+    /// The folders of the focused native chat, cwd first; empty when the focused pane isn't one.
+    pub fn focused_claude_chat_dirs(&self, ctx: &AppContext) -> Vec<PathBuf> {
+        self.downcast_pane_by_id::<ClaudeChatPane>(self.focused_pane_id(ctx))
+            .map(|pane| Self::chat_pane_dirs(pane, ctx))
+            .unwrap_or_default()
+    }
+
+    fn chat_pane_dirs(pane: &ClaudeChatPane, ctx: &AppContext) -> Vec<PathBuf> {
+        pane.session()
+            .as_ref(ctx)
+            .dirs()
+            .into_iter()
+            .map(|dir| dir.to_path_buf())
+            .collect()
     }
 
     pub fn code_diff_view_paths<'a>(

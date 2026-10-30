@@ -8,7 +8,7 @@ use repo_metadata::repositories::DetectedRepositories;
 use repo_metadata::watcher::DirectoryWatcher;
 use warpui::{App, EntityId};
 
-use super::PaneGroupRepositoryRoots;
+use super::{ChatFolders, PaneGroupRepositoryRoots, put_focused_roots_first};
 use crate::code::buffer_location::LocalOrRemotePath;
 use crate::pane_group::WorkingDirectoriesModel;
 
@@ -60,6 +60,7 @@ fn refresh_working_directories_collapses_subroots_to_nearest_repo_root() {
                         (terminal_2, LocalOrRemotePath::Local(repo_b.clone())),
                     ],
                     vec![],
+                    ChatFolders::default(),
                     Some(terminal_1),
                     ctx,
                 );
@@ -109,6 +110,7 @@ fn refresh_working_directories_preserves_non_repo_paths_and_dedupes() {
                         (terminal_3, LocalOrRemotePath::Local(dir_1.clone())),
                     ],
                     vec![],
+                    ChatFolders::default(),
                     Some(terminal_1),
                     ctx,
                 );
@@ -410,6 +412,7 @@ fn shared_diff_state_model_survives_when_other_pane_group_still_references_repo(
                 pane_group_a,
                 vec![(terminal_a, LocalOrRemotePath::Local(repo_path.clone()))],
                 vec![],
+                ChatFolders::default(),
                 Some(terminal_a),
                 ctx,
             );
@@ -417,6 +420,7 @@ fn shared_diff_state_model_survives_when_other_pane_group_still_references_repo(
                 pane_group_b,
                 vec![(terminal_b, LocalOrRemotePath::Local(repo_path.clone()))],
                 vec![],
+                ChatFolders::default(),
                 Some(terminal_b),
                 ctx,
             );
@@ -436,6 +440,7 @@ fn shared_diff_state_model_survives_when_other_pane_group_still_references_repo(
                 pane_group_a,
                 vec![],
                 vec![],
+                ChatFolders::default(),
                 None,
                 ctx,
             );
@@ -475,6 +480,7 @@ fn diff_state_model_is_dropped_when_no_pane_group_references_repo() {
                 pane_group,
                 vec![(terminal, LocalOrRemotePath::Local(repo_path.clone()))],
                 vec![],
+                ChatFolders::default(),
                 Some(terminal),
                 ctx,
             );
@@ -489,7 +495,14 @@ fn diff_state_model_is_dropped_when_no_pane_group_references_repo() {
 
         // Only pane group leaves the repo → model is orphaned and dropped.
         working_directories_handle.update(&mut app, |model, ctx| {
-            model.refresh_working_directories_for_pane_group(pane_group, vec![], vec![], None, ctx);
+            model.refresh_working_directories_for_pane_group(
+                pane_group,
+                vec![],
+                vec![],
+                ChatFolders::default(),
+                None,
+                ctx,
+            );
         });
 
         let after_id = working_directories_handle.update(&mut app, |model, ctx| {
@@ -526,6 +539,7 @@ fn remove_pane_group_does_not_drop_diff_state_model_shared_with_other_pane_group
                 pane_group_a,
                 vec![(terminal_a, LocalOrRemotePath::Local(repo_path.clone()))],
                 vec![],
+                ChatFolders::default(),
                 Some(terminal_a),
                 ctx,
             );
@@ -533,6 +547,7 @@ fn remove_pane_group_does_not_drop_diff_state_model_shared_with_other_pane_group
                 pane_group_b,
                 vec![(terminal_b, LocalOrRemotePath::Local(repo_path.clone()))],
                 vec![],
+                ChatFolders::default(),
                 Some(terminal_b),
                 ctx,
             );
@@ -588,5 +603,93 @@ fn clear_selected_review_repo_removes_only_the_targeted_pane_group_entry() {
                 Some(local(&repo_b)),
             );
         });
+    });
+}
+
+#[test]
+fn focused_chat_folders_lead_and_drop_their_parent_roots() {
+    let mut roots = indexmap::IndexSet::from_iter([
+        local_str("/projects/personal"),
+        local_str("/projects/aldeia/other"),
+        local_str("/projects/personal/warp"),
+        local_str("/projects/aldeia/kinbox-web"),
+    ]);
+
+    put_focused_roots_first(
+        &mut roots,
+        &[
+            PathBuf::from("/projects/aldeia/kinbox-api-v2"),
+            PathBuf::from("/projects/aldeia/kinbox-web"),
+        ],
+    );
+    let most_recent_first: Vec<_> = roots.iter().rev().cloned().collect();
+    assert_eq!(
+        most_recent_first,
+        vec![
+            local_str("/projects/aldeia/kinbox-api-v2"),
+            local_str("/projects/aldeia/kinbox-web"),
+            local_str("/projects/personal/warp"),
+            local_str("/projects/aldeia/other"),
+            local_str("/projects/personal"),
+        ]
+    );
+
+    put_focused_roots_first(&mut roots, &[PathBuf::from("/projects/personal/warp")]);
+    assert_eq!(
+        roots.iter().next_back(),
+        Some(&local_str("/projects/personal/warp")),
+        "the focused chat's folder should be the most recent root"
+    );
+    assert!(
+        !roots.contains(&local_str("/projects/personal")),
+        "a parent folder would fold the focused chat's folder into it"
+    );
+}
+
+#[test]
+fn chat_folders_are_roots_themselves_not_their_parent() {
+    App::test((), |mut app| async move {
+        app.add_singleton_model(|_| DetectedRepositories::default());
+
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let personal = temp_dir.path().join("personal");
+        let warp = personal.join("warp");
+        let kinbox_web = temp_dir.path().join("aldeia").join("kinbox-web");
+        fs::create_dir_all(&warp).expect("create warp");
+        fs::create_dir_all(&kinbox_web).expect("create kinbox-web");
+        let canonical_personal = dunce::canonicalize(&personal).expect("canonical personal");
+        let canonical_warp = dunce::canonicalize(&warp).expect("canonical warp");
+        let canonical_kinbox_web = dunce::canonicalize(&kinbox_web).expect("canonical kinbox");
+
+        let pane_group_id = EntityId::new();
+        let terminal = EntityId::new();
+        let working_directories_handle = app.add_model(|_| WorkingDirectoriesModel::new());
+        let roots: Vec<LocalOrRemotePath> =
+            working_directories_handle.update(&mut app, |model, ctx| {
+                model.refresh_working_directories_for_pane_group(
+                    pane_group_id,
+                    vec![(terminal, local(&personal))],
+                    vec![],
+                    ChatFolders {
+                        all: vec![kinbox_web.clone(), warp.clone()],
+                        focused: vec![warp.clone()],
+                    },
+                    None,
+                    ctx,
+                );
+
+                model
+                    .most_recent_directories_for_pane_group(pane_group_id)
+                    .expect("pane group exists")
+                    .map(|dir| dir.path)
+                    .collect()
+            });
+
+        assert_eq!(roots.first(), Some(&local(&canonical_warp)));
+        assert!(roots.contains(&local(&canonical_kinbox_web)));
+        assert!(
+            !roots.contains(&local(&canonical_personal)),
+            "the terminal's parent folder must not swallow the focused chat's folder"
+        );
     });
 }

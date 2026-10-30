@@ -21,11 +21,12 @@ use crate::ai::agent_management::notifications::item_rendering::{
     handle_notification_artifact_buttons_event, render_notification_item_content,
 };
 use crate::ai::agent_management::notifications::{
-    NotificationId, NotificationItem, NotificationItems,
+    ClaudeCodeUpdateNotice, NotificationId, NotificationItem, NotificationItems,
 };
 use crate::ai::agent_management::{AgentManagementEvent, AgentNotificationsModel};
 use crate::ai::artifacts::{Artifact, ArtifactButtonsRow, ArtifactButtonsRowEvent};
 use crate::appearance::Appearance;
+use crate::native_chat::claude_update::ClaudeCodeUpdates;
 use crate::ui_components::icons::Icon;
 use crate::view_components::action_button::{ActionButton, ButtonSize, NakedTheme};
 
@@ -49,6 +50,8 @@ pub struct NotificationMailboxView {
     artifact_buttons_views: Vec<Option<ViewHandle<ArtifactButtonsRow>>>,
     /// Index of the currently keyboard-selected notification item, if any.
     selected_index: Option<usize>,
+    update_claude_code_button: MouseStateHandle,
+    dismiss_claude_code_update_button: MouseStateHandle,
 }
 
 impl Entity for NotificationMailboxView {
@@ -61,7 +64,7 @@ pub enum NotificationMailboxViewEvent {
     Dismissed,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum NotificationMailboxViewAction {
     SetFilter(NotificationFilter),
     MarkAllRead,
@@ -71,6 +74,8 @@ pub enum NotificationMailboxViewAction {
     SelectNext,
     CycleFilter,
     ActivateSelected,
+    UpdateClaudeCode,
+    DismissClaudeCodeUpdate,
 }
 
 impl NotificationMailboxView {
@@ -148,11 +153,16 @@ impl NotificationMailboxView {
             filtered_ids: Vec::new(),
             artifact_buttons_views: Vec::new(),
             selected_index: None,
+            update_claude_code_button: Default::default(),
+            dismiss_claude_code_update_button: Default::default(),
         }
     }
 
     /// Resets the mailbox state when opening. Called from the workspace toggle handler.
     pub fn reset_for_open(&mut self, select_first: bool, ctx: &mut ViewContext<Self>) {
+        AgentNotificationsModel::handle(ctx).update(ctx, |model, ctx| {
+            model.mark_claude_code_update_read(ctx);
+        });
         self.rebuild_filtered_ids(ctx);
         self.selected_index = if select_first && !self.filtered_ids.is_empty() {
             Some(0)
@@ -327,6 +337,14 @@ impl TypedActionView for NotificationMailboxView {
                     self.activate_notification(id, ctx);
                 }
             }
+            NotificationMailboxViewAction::UpdateClaudeCode => {
+                ClaudeCodeUpdates::handle(ctx).update(ctx, |updates, ctx| {
+                    updates.start_update(ctx);
+                });
+            }
+            NotificationMailboxViewAction::DismissClaudeCodeUpdate => {
+                ClaudeCodeUpdates::handle(ctx).update(ctx, |updates, ctx| updates.dismiss(ctx));
+            }
         }
     }
 }
@@ -338,16 +356,22 @@ impl View for NotificationMailboxView {
 
     fn render(&self, app: &AppContext) -> Box<dyn Element> {
         let appearance = Appearance::as_ref(app);
-        let notifications = AgentNotificationsModel::as_ref(app).notifications();
+        let model = AgentNotificationsModel::as_ref(app);
+        let notifications = model.notifications();
 
         let mut column = Flex::column()
             .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
             .with_main_axis_size(MainAxisSize::Min)
             .with_child(self.render_header(appearance))
             .with_child(self.render_filter_bar(notifications, app));
+        if let Some(notice) = model.claude_code_update() {
+            column.add_child(self.render_claude_code_update(notice, appearance));
+        }
 
         if notifications.filtered_count(self.active_filter) == 0 {
-            column.add_child(self.render_empty_state(appearance));
+            if model.claude_code_update().is_none() {
+                column.add_child(self.render_empty_state(appearance));
+            }
         } else {
             let theme = appearance.theme();
 
@@ -564,6 +588,107 @@ impl NotificationMailboxView {
         .finish()
     }
 
+    /// The offer to update Claude Code, with its "Atualizar" and "Agora não" buttons.
+    fn render_claude_code_update(
+        &self,
+        notice: &ClaudeCodeUpdateNotice,
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let text = |text: String, size: f32, color: pathfinder_color::ColorU, weight: Weight| {
+            appearance
+                .ui_builder()
+                .wrappable_text(text, true)
+                .with_style(UiComponentStyles {
+                    font_size: Some(size),
+                    font_weight: Some(weight),
+                    font_color: Some(color),
+                    font_family_id: Some(appearance.ui_font_family()),
+                    ..Default::default()
+                })
+                .build()
+                .finish()
+        };
+        let title = text(
+            format!(
+                "Atualização do Claude Code disponível: {} → {}",
+                notice.installed, notice.latest
+            ),
+            14.,
+            theme.main_text_color(theme.surface_2()).into(),
+            Weight::Semibold,
+        );
+        let detail = text(
+            if notice.is_updating {
+                "Atualizando… as conversas abertas continuam na versão atual.".to_owned()
+            } else {
+                "Novas conversas passam a usar a nova versão.".to_owned()
+            },
+            12.,
+            theme.sub_text_color(theme.surface_2()).into(),
+            Weight::Normal,
+        );
+        let icon = ConstrainedBox::new(Icon::Download.to_warpui_icon(theme.accent()).finish())
+            .with_width(16.)
+            .with_height(16.)
+            .finish();
+
+        let mut buttons = Flex::row()
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_main_axis_alignment(MainAxisAlignment::End)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(6.);
+        if !notice.is_updating {
+            buttons.add_child(notice_button(
+                "Agora não",
+                false,
+                self.dismiss_claude_code_update_button.clone(),
+                NotificationMailboxViewAction::DismissClaudeCodeUpdate,
+                appearance,
+            ));
+        }
+        buttons.add_child(notice_button(
+            if notice.is_updating {
+                "Atualizando…"
+            } else {
+                "Atualizar"
+            },
+            !notice.is_updating,
+            self.update_claude_code_button.clone(),
+            NotificationMailboxViewAction::UpdateClaudeCode,
+            appearance,
+        ));
+
+        let body = Flex::column()
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_main_axis_size(MainAxisSize::Min)
+            .with_spacing(4.)
+            .with_child(title)
+            .with_child(detail)
+            .with_child(
+                Container::new(buttons.finish())
+                    .with_padding_top(6.)
+                    .finish(),
+            );
+        let row = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Start)
+            .with_spacing(10.)
+            .with_child(Container::new(icon).with_padding_top(2.).finish())
+            .with_child(Shrinkable::new(1., body.finish()).finish());
+        let mut container = Container::new(row.finish())
+            .with_padding(
+                Padding::default()
+                    .with_vertical(ITEM_PADDING)
+                    .with_horizontal(16.),
+            )
+            .with_border(Border::bottom(1.).with_border_color(theme.outline().into()));
+        if !notice.is_read {
+            container =
+                container.with_background_color(internal_colors::fg_overlay_1(theme).into());
+        }
+        container.finish()
+    }
+
     /// Asks the clipped scrollable to bring the currently selected item into
     /// view on the next paint pass.
     fn scroll_selected_into_view(&self) {
@@ -626,4 +751,59 @@ impl NotificationMailboxView {
         })
         .finish()
     }
+}
+
+/// A small text button of the Claude Code update notice; `is_primary` fills it with the accent.
+fn notice_button(
+    label: &'static str,
+    is_primary: bool,
+    mouse_state: MouseStateHandle,
+    action: NotificationMailboxViewAction,
+    appearance: &Appearance,
+) -> Box<dyn Element> {
+    let theme = appearance.theme();
+    let ui_builder = appearance.ui_builder().clone();
+    let font_family = appearance.ui_font_family();
+    let accent = theme.accent();
+    let main_text = theme.main_text_color(theme.surface_2());
+    let on_accent = theme.main_text_color(accent);
+    let hover = internal_colors::fg_overlay_2(theme);
+    let outline = theme.outline();
+    EventHandler::new(
+        Hoverable::new(mouse_state, move |state| {
+            let color = if is_primary { on_accent } else { main_text };
+            let mut container = Container::new(
+                ui_builder
+                    .wrappable_text(label.to_owned(), false)
+                    .with_style(UiComponentStyles {
+                        font_size: Some(12.),
+                        font_weight: Some(Weight::Semibold),
+                        font_color: Some(color.into()),
+                        font_family_id: Some(font_family),
+                        ..Default::default()
+                    })
+                    .build()
+                    .finish(),
+            )
+            .with_padding(Padding::default().with_vertical(4.).with_horizontal(10.))
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(5.)));
+            if is_primary {
+                container = container.with_background(accent.clone());
+            } else {
+                container =
+                    container.with_border(Border::all(1.).with_border_color(outline.into()));
+                if state.is_hovered() {
+                    container = container.with_background_color(hover.into());
+                }
+            }
+            container.finish()
+        })
+        .with_cursor(Cursor::PointingHand)
+        .finish(),
+    )
+    .on_left_mouse_down(move |ctx, _, _| {
+        ctx.dispatch_typed_action(action.clone());
+        DispatchEventResult::StopPropagation
+    })
+    .finish()
 }

@@ -76,6 +76,7 @@ diesel::table! {
         session_id -> Nullable<Text>,
         cwd -> Text,
         workspace -> Nullable<Text>,
+        provider -> Nullable<Text>,
     }
 }
 

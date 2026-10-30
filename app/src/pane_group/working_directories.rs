@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 #[cfg(feature = "local_fs")]
 use std::path::Path;
-#[cfg(feature = "local_fs")]
 use std::path::PathBuf;
 
 #[cfg(feature = "local_fs")]
@@ -220,6 +219,18 @@ impl PaneGroupRepositoryRoots {
     }
 }
 
+/// Folders that native chats in a pane group work in. Each folder is a file tree root as is,
+/// rather than collapsing to its repository or its parent like an editor's file does.
+#[derive(Clone, Debug, Default)]
+pub struct ChatFolders {
+    /// Every chat's folders.
+    pub all: Vec<PathBuf>,
+    /// The focused chat's folders, cwd first. These become the most recent roots, ahead of every
+    /// other pane's, and roots containing them are dropped so the tree doesn't fold them into a
+    /// parent folder.
+    pub focused: Vec<PathBuf>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkingDirectory {
     pub path: LocalOrRemotePath,
@@ -306,6 +317,27 @@ pub struct WorkingDirectoriesModel {
 #[cfg(not(feature = "local_fs"))]
 /// Does nothing without a local file system
 pub struct WorkingDirectoriesModel {}
+
+/// Makes `focused` the most recent roots, `focused[0]` first, and drops the roots that contain
+/// one of them so the file tree shows the focused folders themselves instead of a parent.
+#[cfg(feature = "local_fs")]
+fn put_focused_roots_first(roots: &mut IndexSet<LocalOrRemotePath>, focused: &[PathBuf]) {
+    if focused.is_empty() {
+        return;
+    }
+    roots.retain(|root| {
+        !root.to_local_path().is_some_and(|root| {
+            focused
+                .iter()
+                .any(|dir| dir.as_path() != root && dir.starts_with(root))
+        })
+    });
+    for dir in focused.iter().rev() {
+        let dir = LocalOrRemotePath::Local(dir.clone());
+        roots.shift_remove(&dir);
+        roots.insert(dir);
+    }
+}
 
 /// Index Sets are ordered by insertion order. This function updates an index set to match a new set of items.
 #[cfg(feature = "local_fs")]
@@ -600,7 +632,7 @@ impl WorkingDirectoriesModel {
     }
 
     /// Refreshes the working directories for a pane group from terminal CWDs
-    /// (both local and remote) and code editor paths.
+    /// (both local and remote), code editor paths and native chat folders.
     ///
     /// If `focused_terminal_id` is provided, the repo_to_terminal map will prioritize
     pub fn refresh_working_directories_for_pane_group(
@@ -608,10 +640,11 @@ impl WorkingDirectoriesModel {
         pane_group_id: EntityId,
         terminal_cwds: Vec<(EntityId, LocalOrRemotePath)>,
         editor_paths: Vec<(EntityId, LocalOrRemotePath)>,
+        chat_folders: ChatFolders,
         focused_terminal_id: Option<EntityId>,
         ctx: &mut ModelContext<Self>,
     ) {
-        if terminal_cwds.is_empty() && editor_paths.is_empty() {
+        if terminal_cwds.is_empty() && editor_paths.is_empty() && chat_folders.all.is_empty() {
             self.handle_empty_pane_group(pane_group_id, ctx);
             return;
         }
@@ -659,10 +692,22 @@ impl WorkingDirectoriesModel {
         }
 
         // Collapse working directories to their nearest repository root (when detected).
-        let mut file_path_ancestors: HashSet<PathBuf> = local_terminal_cwds
+        let terminal_roots: Vec<PathBuf> = local_terminal_cwds
             .iter()
             .filter_map(|(_, cwd)| root_for_raw_path(cwd))
             .collect();
+        let chat_roots: Vec<PathBuf> = chat_folders
+            .all
+            .iter()
+            .filter_map(|dir| dunce::canonicalize(dir).ok())
+            .collect();
+        let focused_chat_roots: Vec<PathBuf> = chat_folders
+            .focused
+            .iter()
+            .filter_map(|dir| dunce::canonicalize(dir).ok())
+            .collect();
+        let mut file_path_ancestors: HashSet<PathBuf> =
+            terminal_roots.iter().chain(&chat_roots).cloned().collect();
 
         // Split editor paths into local and remote buckets.
         let mut local_editor_paths: Vec<(EntityId, String)> = Vec::new();
@@ -679,17 +724,16 @@ impl WorkingDirectoriesModel {
         }
 
         // Like VS Code, a file inside a folder the tree already shows (a
-        // terminal's directory, or a root kept from before) stays under the
-        // outermost such folder instead of adding its own repo or parent
-        // folder as a root. Its repo still counts for code review below.
-        let shown_local_roots: Vec<PathBuf> = file_path_ancestors
+        // terminal's directory, a chat's folder, or a root kept from before)
+        // stays under the outermost such folder instead of adding its own repo
+        // or parent folder as a root. Its repo still counts for code review
+        // below. Current folders win over kept roots so a stale parent root
+        // doesn't outlive the panes that put it there.
+        let current_local_roots: Vec<PathBuf> =
+            terminal_roots.iter().chain(&chat_roots).cloned().collect();
+        let kept_local_roots: Vec<PathBuf> = old_directories
             .iter()
-            .cloned()
-            .chain(
-                old_directories
-                    .iter()
-                    .filter_map(|dir| dir.path.to_local_path().map(|p| p.to_path_buf())),
-            )
+            .filter_map(|dir| dir.path.to_local_path().map(|p| p.to_path_buf()))
             .collect();
         let editor_repo_roots: Vec<PathBuf> = local_editor_paths
             .iter()
@@ -700,12 +744,15 @@ impl WorkingDirectoriesModel {
             .into_iter()
             .filter_map(|(view_id, path)| {
                 let path_buf = PathBuf::from(&path);
-                let shown_root = shown_local_roots
-                    .iter()
-                    .filter(|root| path_buf.starts_with(root))
-                    .min_by_key(|root| root.components().count())
-                    .cloned();
-                let resolved_path = shown_root
+                let outermost_shown_root = |roots: &[PathBuf]| {
+                    roots
+                        .iter()
+                        .filter(|root| path_buf.starts_with(root))
+                        .min_by_key(|root| root.components().count())
+                        .cloned()
+                };
+                let resolved_path = outermost_shown_root(&current_local_roots)
+                    .or_else(|| outermost_shown_root(&kept_local_roots))
                     .or_else(|| self.get_repo_root_for_path(&path_buf, ctx))
                     .or_else(|| path_buf.parent().map(|p| p.to_path_buf()))?;
 
@@ -722,6 +769,7 @@ impl WorkingDirectoriesModel {
             .iter()
             .chain(local_cwds.iter())
             .filter_map(|(_, cwd)| root_for_raw_path(cwd))
+            .chain(chat_roots)
             .collect();
 
         // Build remote root paths for pane_groups from remote terminal CWDs
@@ -761,6 +809,7 @@ impl WorkingDirectoriesModel {
         // (IndexSet maintains insertion order and auto-deduplicates)
         let pane_group_roots = self.pane_groups.entry(pane_group_id).or_default();
         update_index_set(pane_group_roots, new_display_roots);
+        put_focused_roots_first(pane_group_roots, &focused_chat_roots);
 
         // Build repo roots and their terminal associations
         // First pass: collect all local repo roots and build initial mapping
@@ -1048,6 +1097,7 @@ impl WorkingDirectoriesModel {
         _pane_group_id: EntityId,
         _terminal_cwds: Vec<(EntityId, LocalOrRemotePath)>,
         _editor_paths: Vec<(EntityId, LocalOrRemotePath)>,
+        _chat_folders: ChatFolders,
         _focused_terminal_id: Option<EntityId>,
         _ctx: &mut ModelContext<Self>,
     ) {

@@ -1923,6 +1923,9 @@ pub struct EditorView {
     /// inserted as text.
     forwards_dropped_files: bool,
 
+    /// The line height ratio set with [`EditorView::set_line_height_ratio`].
+    line_height_ratio_override: Option<f32>,
+
     process_attached_images_future_handle: Option<SpawnedFutureHandle>,
 
     is_password: bool,
@@ -2986,6 +2989,12 @@ impl EditorView {
         self.forwards_dropped_files = forwards;
     }
 
+    /// Lays lines out at this ratio of the font size instead of the default or settings one.
+    pub fn set_line_height_ratio(&mut self, ratio: Option<f32>, ctx: &mut ViewContext<Self>) {
+        self.line_height_ratio_override = ratio;
+        ctx.notify();
+    }
+
     fn clipboard_content(&mut self, ctx: &mut ViewContext<Self>) -> String {
         let content = ctx.clipboard().read();
         self.clipboard_text_content(content)
@@ -3268,6 +3277,7 @@ impl EditorView {
             delegate_paste_handling: options.delegate_paste_handling,
             drag_drop_path_transformer: options.drag_drop_path_transformer,
             forwards_dropped_files: false,
+            line_height_ratio_override: None,
             process_attached_images_future_handle: None,
             is_password: options.is_password,
             keymap_context_modifier: options.keymap_context_modifier,
@@ -7502,6 +7512,9 @@ impl EditorView {
     }
 
     pub fn line_height_ratio(&self, appearance: &Appearance) -> f32 {
+        if let Some(ratio) = self.line_height_ratio_override {
+            return ratio;
+        }
         if self.use_settings_line_height_ratio {
             return appearance.line_height_ratio();
         }

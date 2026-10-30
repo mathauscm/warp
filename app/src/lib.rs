@@ -2402,6 +2402,8 @@ pub(crate) fn initialize_app(
     {
         ctx.add_singleton_model(LocalShellState::new);
         ctx.add_singleton_model(system::SystemInfo::new);
+        // After `LocalShellState`, whose PATH finds `claude`, and `AgentNotificationsModel`.
+        ctx.add_singleton_model(native_chat::claude_update::ClaudeCodeUpdates::new);
     }
 
     // In a sandboxed Oz runner, mint IAP tokens by self-minting via Workload

@@ -709,6 +709,8 @@ pub struct ClaudeChatPane {
     pub cwd: String,
     /// The chat's workspace, as JSON.
     pub workspace: Option<String>,
+    /// The CLI the chat drives (`claude` or `codex`); `None` for chats saved before it was stored.
+    pub provider: Option<String>,
 }
 
 #[derive(Insertable)]
@@ -718,6 +720,7 @@ pub struct NewClaudeChatPane {
     pub session_id: Option<String>,
     pub cwd: String,
     pub workspace: Option<String>,
+    pub provider: Option<String>,
 }
 
 #[derive(Insertable)]

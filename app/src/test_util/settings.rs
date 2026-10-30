@@ -126,6 +126,7 @@ pub fn initialize_settings_for_tests_with_mode(
     TerminalSettings::register(app);
     PaneSettings::register(app);
     ThemeSettings::register(app);
+    crate::native_chat::provider::ChatProviderSettings::register(app);
     TuiVoiceSettings::register(app);
     UndoCloseSettings::register(app);
     VimBannerSettings::register(app);

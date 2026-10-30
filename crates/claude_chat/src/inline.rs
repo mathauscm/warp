@@ -6,7 +6,7 @@
 //! quote and a long paste a `<pasted_text>` block. The labels stay in the text as anchors, so the
 //! transcript lays each attachment out where it was put, for live and reloaded messages alike.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::ops::Range;
 
 use crate::attachments::{self, AttachedFile, ListedFile};
@@ -20,6 +20,10 @@ const PASTED_OPEN: &str = "<pasted_text";
 const PASTED_CLOSE: &str = "</pasted_text>";
 /// Longer numbers in brackets are just text.
 const MAX_NUMBER_DIGITS: usize = 4;
+/// Joins the words of a token in the composer, so a line never wraps inside a short one.
+const NO_BREAK_SPACE: char = '\u{a0}';
+/// How many earlier states of a draft [`LinkHistory`] keeps.
+const MAX_SAVED_LINKS: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TokenKind {
@@ -116,12 +120,12 @@ pub fn find_tokens(text: &str) -> Vec<Token> {
     while let Some(offset) = text[from..].find('[') {
         let start = from + offset;
         match parse_token(&text[start..]) {
-            Some((id, len)) => {
+            Some(token) => {
                 tokens.push(Token {
-                    id,
-                    range: start..start + len,
+                    id: token.id,
+                    range: start..start + token.len,
                 });
-                from = start + len;
+                from = start + token.len;
             }
             None => from = start + 1,
         }
@@ -129,36 +133,68 @@ pub fn find_tokens(text: &str) -> Vec<Token> {
     tokens
 }
 
-/// The token `text` starts with and its length.
-fn parse_token(text: &str) -> Option<(TokenId, usize)> {
+/// The token in the composer's editor: [`token_text`] with no-break spaces, so it wraps whole.
+pub fn editor_token_text(id: TokenId, detail: &str) -> String {
+    token_text(id, detail).replace(' ', &NO_BREAK_SPACE.to_string())
+}
+
+/// A token at the start of a text, with byte ranges relative to it.
+struct ParsedToken {
+    id: TokenId,
+    len: usize,
+    number: Range<usize>,
+    detail: Option<Range<usize>>,
+}
+
+/// The token `text` starts with. Its spaces may be no-break spaces, as in the composer.
+fn parse_token(text: &str) -> Option<ParsedToken> {
     let rest = text.strip_prefix('[')?;
     TokenKind::ALL.iter().find_map(|&kind| {
-        let rest = rest.strip_prefix(kind.label())?.strip_prefix(' ')?;
+        let rest = strip_spaced(strip_spaced(rest, kind.label())?, " ")?;
         let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
         if digits == 0 || digits > MAX_NUMBER_DIGITS {
             return None;
         }
+        let number_start = text.len() - rest.len();
         let number = rest[..digits].parse().ok()?;
         let mut after = &rest[digits..];
+        let mut detail = None;
         if let Some(separator) = kind.detail_separator() {
-            let detail = after.strip_prefix(separator)?;
-            let end = detail.find([']', '[', '\n'])?;
-            if detail[..end].trim().is_empty() {
+            let rest = strip_spaced(after, separator)?;
+            let end = rest.find([']', '[', '\n'])?;
+            if rest[..end].trim().is_empty() {
                 return None;
             }
-            after = &detail[end..];
+            let detail_start = text.len() - rest.len();
+            detail = Some(detail_start..detail_start + end);
+            after = &rest[end..];
         }
-        after
-            .starts_with(']')
-            .then(|| (TokenId { kind, number }, text.len() - after.len() + 1))
+        after.starts_with(']').then(|| ParsedToken {
+            id: TokenId { kind, number },
+            len: text.len() - after.len() + 1,
+            number: number_start..number_start + digits,
+            detail,
+        })
     })
 }
 
+/// `text` without `prefix`, each space of which may also be a no-break space.
+fn strip_spaced<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    let mut rest = text.chars();
+    for expected in prefix.chars() {
+        let actual = rest.next()?;
+        if actual != expected && !(expected == ' ' && actual == NO_BREAK_SPACE) {
+            return None;
+        }
+    }
+    Some(rest.as_str())
+}
+
 /// The detail of a token, like a file's name or path.
-fn token_detail(token_text: &str, kind: TokenKind) -> Option<&str> {
-    let separator = kind.detail_separator()?;
-    let start = token_text.find(separator)? + separator.len();
-    token_text.get(start..token_text.len() - 1)
+fn token_detail(token_text: &str) -> Option<&str> {
+    parse_token(token_text)?
+        .detail
+        .map(|range| &token_text[range])
 }
 
 /// `text` with the numbers of its tokens changed by `renumber`; tokens it returns `None` for are
@@ -170,28 +206,15 @@ pub fn renumber_tokens(text: &str, renumber: impl Fn(TokenId) -> Option<usize>) 
         let Some(number) = renumber(token.id) else {
             continue;
         };
-        let token_text = &text[token.range.clone()];
-        let detail = token_detail(token_text, token.id.kind).unwrap_or_default();
-        result.push_str(&text[cursor..token.range.start]);
-        result.push_str(&token_text_raw(
-            TokenId {
-                kind: token.id.kind,
-                number,
-            },
-            detail,
-        ));
-        cursor = token.range.end;
+        let Some(parsed) = parse_token(&text[token.range.start..]) else {
+            continue;
+        };
+        result.push_str(&text[cursor..token.range.start + parsed.number.start]);
+        result.push_str(&number.to_string());
+        cursor = token.range.start + parsed.number.end;
     }
     result.push_str(&text[cursor..]);
     result
-}
-
-/// Like [`token_text`], keeping `detail` as written.
-fn token_text_raw(id: TokenId, detail: &str) -> String {
-    match id.kind.detail_separator() {
-        Some(separator) => format!("[{} {}{separator}{detail}]", id.kind.label(), id.number),
-        None => format!("[{} {}]", id.kind.label(), id.number),
-    }
 }
 
 /// When going from `old` to `new` deleted part of a token (but not all of it), the token and the
@@ -296,6 +319,111 @@ fn common_suffix_len(a: &str, b: &str) -> usize {
         .take_while(|(a, b)| a == b)
         .map(|(a, _)| a.len_utf8())
         .sum()
+}
+
+// --- linking ----------------------------------------------------------------------------------
+
+/// An attachment of a draft and the token that places it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Link {
+    /// Tells the attachment apart from the others while numbers change.
+    pub key: u64,
+    pub id: TokenId,
+}
+
+/// The keys of the `links` whose token isn't in `text`.
+pub fn unlinked(text: &str, links: &[Link]) -> Vec<u64> {
+    let present: HashSet<TokenId> = find_tokens(text)
+        .into_iter()
+        .map(|token| token.id)
+        .collect();
+    links
+        .iter()
+        .filter(|link| !present.contains(&link.id))
+        .map(|link| link.key)
+        .collect()
+}
+
+/// Earlier texts of a draft with the attachments they had, so that undoing an edit that removed
+/// attachments, or renumbered them, brings them back as they were.
+#[derive(Debug, Default)]
+pub struct LinkHistory {
+    /// The text the attachments last matched, with their links then.
+    current: Option<(String, Vec<Link>)>,
+    saved: VecDeque<(String, Vec<Link>)>,
+}
+
+impl LinkHistory {
+    /// Notes that the attachments of `text` are `links`.
+    pub fn note(&mut self, text: &str, links: Vec<Link>) {
+        self.current = Some((text.to_owned(), links));
+    }
+
+    /// Keeps the last noted state, from before an edit that's about to remove attachments, and
+    /// `text` with `links`, the state right after it.
+    pub fn save(&mut self, text: &str, links: Vec<Link>) {
+        if let Some(current) = self.current.take() {
+            self.push(current);
+        }
+        self.push((text.to_owned(), links.clone()));
+        self.current = Some((text.to_owned(), links));
+    }
+
+    fn push(&mut self, state: (String, Vec<Link>)) {
+        if state.1.is_empty() {
+            return;
+        }
+        self.saved.retain(|(text, _)| *text != state.0);
+        if self.saved.len() == MAX_SAVED_LINKS {
+            self.saved.pop_front();
+        }
+        self.saved.push_back(state);
+    }
+
+    /// The links `text` had when it was saved, if the attachments with `keys` were all among
+    /// them: an attachment added since makes an equal text a different draft.
+    pub fn find(&self, text: &str, keys: &[u64]) -> Option<&[Link]> {
+        self.saved
+            .iter()
+            .rev()
+            .find(|(saved, links)| {
+                saved == text
+                    && keys
+                        .iter()
+                        .all(|key| links.iter().any(|link| link.key == *key))
+            })
+            .map(|(_, links)| links.as_slice())
+    }
+
+    /// Whether some saved state has the attachment with `key`.
+    pub fn remembers(&self, key: u64) -> bool {
+        self.saved
+            .iter()
+            .any(|(_, links)| links.iter().any(|link| link.key == key))
+    }
+
+    pub fn clear(&mut self) {
+        self.current = None;
+        self.saved.clear();
+    }
+}
+
+/// The new number of each of `links` whose kind is in `kinds`, so that each kind is numbered 1, 2,
+/// 3… in the order it was.
+pub fn compact_numbers(links: &[Link], kinds: &[TokenKind]) -> Vec<(u64, usize)> {
+    kinds
+        .iter()
+        .flat_map(|&kind| {
+            let mut of_kind: Vec<&Link> =
+                links.iter().filter(|link| link.id.kind == kind).collect();
+            of_kind.sort_by_key(|link| link.id.number);
+            of_kind
+                .into_iter()
+                .enumerate()
+                .map(|(index, link)| (link.key, index + 1))
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 // --- sending ----------------------------------------------------------------------------------
@@ -698,7 +826,7 @@ fn push_anchored_parts(parts: &mut Vec<MessagePart>, text: &str, placed: &mut [b
                     placed[index] = true;
                     MessagePart::Image(index)
                 }),
-            TokenKind::File => token_detail(token_text, TokenKind::File)
+            TokenKind::File => token_detail(token_text)
                 .filter(|detail| looks_like_path(detail))
                 .and_then(attachments::parse_listed_line)
                 .map(MessagePart::File),

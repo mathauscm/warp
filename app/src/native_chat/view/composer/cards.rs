@@ -1,14 +1,17 @@
 //! The cards stacked above the composer: a crashed process, queued messages, Claude's task list
 //! and the request waiting for an answer (a permission, a question or the plan).
 
-use claude_chat::timeline::{PendingRequest, PendingRequestKind, Question, TodoItem, TodoStatus};
+use claude_chat::timeline::{
+    PendingRequest, PendingRequestKind, Question, QuestionOption, TodoItem, TodoStatus,
+};
 use serde_json::Value;
 use warp_core::ui::Icon as WarpIcon;
 use warpui::AppContext;
 use warpui::elements::{
     Border, ClippedScrollable, ConstrainedBox, Container, CrossAxisAlignment, Element, Empty,
     Expanded, Fill as ElementFill, Flex, FormattedTextElement, HeadingFontSizeMultipliers,
-    Hoverable, MainAxisAlignment, MainAxisSize, ParentElement, ScrollbarWidth, Shrinkable, Stack,
+    Hoverable, MainAxisAlignment, MainAxisSize, ParentElement, ScrollbarWidth, Shrinkable,
+    SizeConstraintCondition, SizeConstraintSwitch, Stack, Wrap,
 };
 use warpui::platform::Cursor;
 
@@ -22,6 +25,11 @@ use super::{
 const PREVIEW_MAX_HEIGHT: f32 = 132.;
 const PLAN_MAX_HEIGHT: f32 = 300.;
 const TODO_SEGMENTS_MAX: usize = 12;
+/// Below this width the task list's header drops its progress bar.
+const TODO_BAR_MIN_WIDTH: f32 = 360.;
+const ACTION_SPACING: f32 = 8.;
+/// A rough average glyph width as a share of the font size, to tell when buttons fit in a line.
+const GLYPH_WIDTH_RATIO: f32 = 0.6;
 /// More queued messages than this scroll.
 const QUEUE_VISIBLE_ROWS: usize = 3;
 const QUEUE_ROW_SPACING: f32 = 2.;
@@ -30,6 +38,7 @@ const QUEUE_INDEX_WIDTH: f32 = 16.;
 impl ComposerView {
     pub(super) fn render_cards(&self, look: &Look, app: &AppContext) -> Vec<Box<dyn Element>> {
         let session = self.session.as_ref(app);
+        let agent = session.provider().label();
         let conversation = session.conversation();
         let mut cards = Vec::new();
         if let Some(error) = exit_error(session.process_state()).or(conversation.exit_error()) {
@@ -43,7 +52,9 @@ impl ComposerView {
         }
         let pending = conversation.pending_requests();
         if let Some(request) = pending.first() {
-            cards.push(self.render_request(look, request, pending.len()));
+            cards.push(self.render_request(look, request, pending.len(), agent));
+        } else if let Some(request) = dev_request() {
+            cards.push(self.render_request(look, &request, 2, agent));
         }
         cards
     }
@@ -173,67 +184,83 @@ impl ComposerView {
         let header_look = look.clone();
         let header = Hoverable::new(self.mouse.todos.clone(), move |state| {
             let look = &header_look;
-            let segments = statuses.len().min(TODO_SEGMENTS_MAX);
-            let mut bar = Flex::row()
-                .with_main_axis_size(MainAxisSize::Min)
-                .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                .with_spacing(2.);
-            for index in 0..segments {
-                // With more tasks than segments, each segment stands for a share of them.
-                let task = index * statuses.len() / segments;
-                let color = match statuses[task] {
-                    TodoStatus::Completed => palette.success.0,
-                    TodoStatus::InProgress => palette.accent.0,
-                    TodoStatus::Pending => palette.surface_strong.0,
+            let header_row = |show_bar: bool| {
+                let segments = if show_bar {
+                    statuses.len().min(TODO_SEGMENTS_MAX)
+                } else {
+                    0
                 };
-                bar.add_child(widgets::block(10., 3., 1.5, color));
-            }
-            let count_color = if done == total {
-                palette.success.0
-            } else {
-                palette.text_muted.0
+                let mut bar = Flex::row()
+                    .with_main_axis_size(MainAxisSize::Min)
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_spacing(2.);
+                for index in 0..segments {
+                    // With more tasks than segments, each segment stands for a share of them.
+                    let task = index * statuses.len() / segments;
+                    let color = match statuses[task] {
+                        TodoStatus::Completed => palette.success.0,
+                        TodoStatus::InProgress => palette.accent.0,
+                        TodoStatus::Pending => palette.surface_strong.0,
+                    };
+                    bar.add_child(widgets::block(10., 3., 1.5, color));
+                }
+                let count_color = if done == total {
+                    palette.success.0
+                } else {
+                    palette.text_muted.0
+                };
+                let mut row = Flex::row()
+                    .with_main_axis_size(MainAxisSize::Max)
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_spacing(8.)
+                    .with_child(icon(
+                        WarpIcon::TaskListBlock,
+                        palette.text_muted.0,
+                        sizes.small_icon_size,
+                    ))
+                    .with_child(look.medium_text("Tarefas", sizes.small_font_size, palette.text.0))
+                    .with_child(look.text(
+                        format!("{done}/{total}"),
+                        sizes.small_font_size,
+                        count_color,
+                    ));
+                if show_bar {
+                    row.add_child(bar.finish());
+                }
+                let detail = current.clone().unwrap_or_default();
+                row.add_child(
+                    Shrinkable::new(
+                        1.,
+                        look.text(detail, sizes.small_font_size, palette.text_muted.0),
+                    )
+                    .finish(),
+                );
+                row.add_child(Expanded::new(1., Empty::new().finish()).finish());
+                row.add_child(icon(
+                    if is_expanded {
+                        WarpIcon::ChevronDown
+                    } else {
+                        WarpIcon::ChevronUp
+                    },
+                    if state.is_hovered() {
+                        palette.text.0
+                    } else {
+                        palette.text_faint.0
+                    },
+                    sizes.small_icon_size - 2.,
+                ));
+                ConstrainedBox::new(row.finish())
+                    .with_height(sizes.chip_height)
+                    .finish()
             };
-            let mut row = Flex::row()
-                .with_main_axis_size(MainAxisSize::Max)
-                .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                .with_spacing(8.)
-                .with_child(icon(
-                    WarpIcon::TaskListBlock,
-                    palette.text_muted.0,
-                    sizes.small_icon_size,
-                ))
-                .with_child(look.medium_text("Tarefas", sizes.small_font_size, palette.text.0))
-                .with_child(look.text(
-                    format!("{done}/{total}"),
-                    sizes.small_font_size,
-                    count_color,
-                ))
-                .with_child(bar.finish());
-            let detail = current.clone().unwrap_or_default();
-            row.add_child(
-                Shrinkable::new(
-                    1.,
-                    look.text(detail, sizes.small_font_size, palette.text_muted.0),
-                )
-                .finish(),
-            );
-            row.add_child(Expanded::new(1., Empty::new().finish()).finish());
-            row.add_child(icon(
-                if is_expanded {
-                    WarpIcon::ChevronDown
-                } else {
-                    WarpIcon::ChevronUp
-                },
-                if state.is_hovered() {
-                    palette.text.0
-                } else {
-                    palette.text_faint.0
-                },
-                sizes.small_icon_size - 2.,
-            ));
-            ConstrainedBox::new(row.finish())
-                .with_height(sizes.chip_height)
-                .finish()
+            SizeConstraintSwitch::new(
+                header_row(true),
+                [(
+                    SizeConstraintCondition::WidthLessThan(TODO_BAR_MIN_WIDTH),
+                    header_row(false),
+                )],
+            )
+            .finish()
         })
         .with_cursor(Cursor::PointingHand)
         .on_click(|ctx, _, _| ctx.dispatch_typed_action(ComposerAction::ToggleTodos))
@@ -307,6 +334,7 @@ impl ComposerView {
         look: &Look,
         request: &PendingRequest,
         count: usize,
+        agent: &str,
     ) -> Box<dyn Element> {
         let content = match &request.kind {
             PendingRequestKind::Permission {
@@ -318,6 +346,7 @@ impl ComposerView {
                 suggestions,
             } => self.render_permission(
                 look,
+                agent,
                 tool_name,
                 display_name.as_deref(),
                 input,
@@ -380,11 +409,12 @@ impl ComposerView {
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_spacing(4.);
         for (part, is_strong) in title {
-            text.add_child(if is_strong {
+            let part = if is_strong {
                 look.medium_text(part, sizes.font_size - 0.5, palette.text.0)
             } else {
                 look.text(part, sizes.font_size - 0.5, palette.text_muted.0)
-            });
+            };
+            text.add_child(Shrinkable::new(1., part).finish());
         }
         row.add_child(Shrinkable::new(1., text.finish()).finish());
         row.finish()
@@ -394,6 +424,7 @@ impl ComposerView {
     fn render_permission(
         &self,
         look: &Look,
+        agent: &str,
         tool_name: &str,
         display_name: Option<&str>,
         input: &Value,
@@ -412,7 +443,7 @@ impl ComposerView {
                 look,
                 WarpIcon::Lock,
                 palette.warning.0,
-                vec![("Claude quer usar".to_owned(), false), (tool, true)],
+                vec![(format!("{agent} quer usar"), false), (tool, true)],
             ));
 
         let preview = logic::permission_preview(tool_name, input);
@@ -478,56 +509,58 @@ impl ComposerView {
         if let Some(path) = blocked_path
             && !matches!(tool_name, "Edit" | "MultiEdit" | "Write" | "Read")
         {
-            column.add_child(look.text(
+            column.add_child(look.paragraph(
                 format!("Fora da pasta do projeto: {path}"),
                 sizes.tiny_font_size,
                 palette.text_faint.0,
             ));
         }
 
-        let mut buttons = Flex::row()
-            .with_main_axis_size(MainAxisSize::Max)
-            .with_cross_axis_alignment(CrossAxisAlignment::Center)
-            .with_spacing(8.);
-        if let Some(suggestion) = suggestion {
-            buttons.add_child(widgets::button(
-                look,
-                self.mouse.allow_always.clone(),
-                logic::suggestion_label(suggestion),
-                None,
-                ButtonKind::Ghost,
-                ComposerAction::Permission(PermissionChoice::AllowAlways),
-            ));
-        }
-        buttons.add_child(Expanded::new(1., Empty::new().finish()).finish());
-        buttons.add_child(widgets::button(
+        let allow_always = suggestion.map(|suggestion| ActionButton {
+            label: logic::suggestion_label(suggestion),
+            hint: None,
+            kind: ButtonKind::Ghost,
+            mouse: self.mouse.allow_always.clone(),
+            action: ComposerAction::Permission(PermissionChoice::AllowAlways),
+        });
+        let buttons = action_row(
             look,
-            self.mouse.deny.clone(),
-            "Negar",
-            Some("esc"),
-            ButtonKind::Secondary,
-            ComposerAction::Permission(PermissionChoice::Deny),
-        ));
-        buttons.add_child(widgets::button(
-            look,
-            self.mouse.allow.clone(),
-            "Permitir",
-            Some("↵"),
-            ButtonKind::Primary,
-            ComposerAction::Permission(PermissionChoice::Allow),
-        ));
-        column.add_child(
-            Container::new(buttons.finish())
-                .with_padding_top(2.)
-                .finish(),
+            allow_always.into_iter().collect(),
+            vec![
+                ActionButton {
+                    label: "Negar".to_owned(),
+                    hint: Some("esc"),
+                    kind: ButtonKind::Secondary,
+                    mouse: self.mouse.deny.clone(),
+                    action: ComposerAction::Permission(PermissionChoice::Deny),
+                },
+                ActionButton {
+                    label: "Permitir".to_owned(),
+                    hint: Some("↵"),
+                    kind: ButtonKind::Primary,
+                    mouse: self.mouse.allow.clone(),
+                    action: ComposerAction::Permission(PermissionChoice::Allow),
+                },
+            ],
         );
+        column.add_child(Container::new(buttons).with_padding_top(2.).finish());
         column.finish()
     }
 
+    /// A preview in a code box that scrolls once it's taller than [`PREVIEW_MAX_HEIGHT`].
     fn render_code_box(&self, look: &Look, content: Box<dyn Element>) -> Box<dyn Element> {
         let palette = &look.palette;
+        let scrollable = ClippedScrollable::vertical(
+            self.preview_scroll.clone(),
+            Container::new(content).with_padding_right(6.).finish(),
+            ScrollbarWidth::Custom(4.),
+            palette.border_strong.0.into(),
+            palette.text_faint.0.into(),
+            ElementFill::None,
+        )
+        .finish();
         ConstrainedBox::new(
-            Container::new(warpui::elements::Clipped::new(content).finish())
+            Container::new(scrollable)
                 .with_horizontal_padding(10.)
                 .with_vertical_padding(8.)
                 .with_background_color(palette.code_background.0)
@@ -698,29 +731,26 @@ impl ComposerView {
             sizes.tiny_font_size,
             palette.text_faint.0,
         ));
-        let buttons = Flex::row()
-            .with_main_axis_size(MainAxisSize::Max)
-            .with_main_axis_alignment(MainAxisAlignment::End)
-            .with_cross_axis_alignment(CrossAxisAlignment::Center)
-            .with_spacing(8.)
-            .with_child(widgets::button(
-                look,
-                self.mouse.dismiss_question.clone(),
-                "Dispensar",
-                None,
-                ButtonKind::Ghost,
-                ComposerAction::DismissQuestion,
-            ))
-            .with_child(widgets::button(
-                look,
-                self.mouse.submit_answers.clone(),
-                "Enviar",
-                Some("↵"),
-                ButtonKind::Primary,
-                ComposerAction::SubmitAnswers,
-            ))
-            .finish();
-        column.add_child(buttons);
+        column.add_child(action_row(
+            look,
+            Vec::new(),
+            vec![
+                ActionButton {
+                    label: "Dispensar".to_owned(),
+                    hint: None,
+                    kind: ButtonKind::Ghost,
+                    mouse: self.mouse.dismiss_question.clone(),
+                    action: ComposerAction::DismissQuestion,
+                },
+                ActionButton {
+                    label: "Enviar".to_owned(),
+                    hint: Some("↵"),
+                    kind: ButtonKind::Primary,
+                    mouse: self.mouse.submit_answers.clone(),
+                    action: ComposerAction::SubmitAnswers,
+                },
+            ],
+        ));
         column.finish()
     }
 
@@ -773,36 +803,32 @@ impl ComposerView {
             .with_corner_radius(look.radius(sizes.card_radius))
             .finish();
 
-        let buttons = Flex::row()
-            .with_main_axis_size(MainAxisSize::Max)
-            .with_cross_axis_alignment(CrossAxisAlignment::Center)
-            .with_spacing(8.)
-            .with_child(widgets::button(
-                look,
-                self.mouse.keep_planning.clone(),
-                "Continuar planejando",
-                None,
-                ButtonKind::Ghost,
-                ComposerAction::Plan(PlanChoice::KeepPlanning),
-            ))
-            .with_child(Expanded::new(1., Empty::new().finish()).finish())
-            .with_child(widgets::button(
-                look,
-                self.mouse.approve_accept_edits.clone(),
-                "Aprovar e aceitar edições",
-                None,
-                ButtonKind::Secondary,
-                ComposerAction::Plan(PlanChoice::ApproveAcceptEdits),
-            ))
-            .with_child(widgets::button(
-                look,
-                self.mouse.approve.clone(),
-                "Aprovar",
-                Some("↵"),
-                ButtonKind::Primary,
-                ComposerAction::Plan(PlanChoice::Approve),
-            ))
-            .finish();
+        let buttons = action_row(
+            look,
+            vec![ActionButton {
+                label: "Continuar planejando".to_owned(),
+                hint: None,
+                kind: ButtonKind::Ghost,
+                mouse: self.mouse.keep_planning.clone(),
+                action: ComposerAction::Plan(PlanChoice::KeepPlanning),
+            }],
+            vec![
+                ActionButton {
+                    label: "Aprovar e aceitar edições".to_owned(),
+                    hint: None,
+                    kind: ButtonKind::Secondary,
+                    mouse: self.mouse.approve_accept_edits.clone(),
+                    action: ComposerAction::Plan(PlanChoice::ApproveAcceptEdits),
+                },
+                ActionButton {
+                    label: "Aprovar".to_owned(),
+                    hint: Some("↵"),
+                    kind: ButtonKind::Primary,
+                    mouse: self.mouse.approve.clone(),
+                    action: ComposerAction::Plan(PlanChoice::Approve),
+                },
+            ],
+        );
 
         Flex::column()
             .with_main_axis_size(MainAxisSize::Min)
@@ -818,6 +844,140 @@ impl ComposerView {
             .with_child(buttons)
             .finish()
     }
+}
+
+/// `PICOLAS_FAKE_REQUEST=permission|question|plan` shows that request with made-up content when
+/// Claude isn't waiting for one, to check the cards' layout. Debug builds only.
+fn dev_request() -> Option<PendingRequest> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    let kind = match std::env::var("PICOLAS_FAKE_REQUEST").ok()?.as_str() {
+        "permission" => PendingRequestKind::Permission {
+            tool_name: "Bash".to_owned(),
+            display_name: None,
+            input: serde_json::json!({
+                "command": (1..=24)
+                    .map(|step| format!(
+                        "echo \"passo {step}: verificando /Users/exemplo/projetos/um-caminho-bem-longo/sem-espacos/arquivo-{step}.txt\""
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(" && \\\n  "),
+            }),
+            description: Some("Executa uma sequência longa de comandos de verificação".to_owned()),
+            blocked_path: None,
+            suggestions: vec![serde_json::json!({
+                "type": "addRules",
+                "rules": [{ "toolName": "Bash", "ruleContent": "echo:*" }],
+                "destination": "localSettings",
+            })],
+        },
+        "question" => PendingRequestKind::Question {
+            input: Value::Null,
+            questions: vec![Question {
+                question: "Qual abordagem você prefere para o layout responsivo?".to_owned(),
+                header: Some("Layout".to_owned()),
+                multi_select: false,
+                options: vec![
+                    QuestionOption {
+                        label: "Empilhar os botões".to_owned(),
+                        description: Some("Um botão por linha em painéis estreitos".to_owned()),
+                    },
+                    QuestionOption {
+                        label: "Quebrar em linhas".to_owned(),
+                        description: None,
+                    },
+                ],
+            }],
+        },
+        "plan" => PendingRequestKind::PlanApproval {
+            input: Value::Null,
+            plan: (1..=30)
+                .map(|step| format!("{step}. Um passo do plano com bastante texto para quebrar"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            plan_file_path: None,
+        },
+        _ => return None,
+    };
+    Some(PendingRequest {
+        request_id: String::new(),
+        tool_use_id: None,
+        kind,
+    })
+}
+
+/// A button of a card's action row.
+struct ActionButton {
+    label: String,
+    hint: Option<&'static str>,
+    kind: ButtonKind,
+    mouse: warpui::elements::MouseStateHandle,
+    action: ComposerAction,
+}
+
+impl ActionButton {
+    fn render(&self, look: &Look) -> Box<dyn Element> {
+        widgets::button(
+            look,
+            self.mouse.clone(),
+            self.label.clone(),
+            self.hint,
+            self.kind,
+            self.action.clone(),
+        )
+    }
+
+    /// About how wide the button draws, padding included.
+    fn estimated_width(&self, look: &Look) -> f32 {
+        let glyph = |text: &str, size: f32| text.chars().count() as f32 * size * GLYPH_WIDTH_RATIO;
+        let hint = self
+            .hint
+            .map_or(0., |hint| 6. + glyph(hint, look.sizes.tiny_font_size));
+        glyph(&self.label, look.sizes.small_font_size) + hint + 24.
+    }
+}
+
+/// A card's buttons in one line, `leading` at the left and `trailing` at the right; when they
+/// don't fit, they wrap onto more lines, aligned right, so none goes out of the card.
+fn action_row(
+    look: &Look,
+    leading: Vec<ActionButton>,
+    trailing: Vec<ActionButton>,
+) -> Box<dyn Element> {
+    let buttons = || leading.iter().chain(&trailing);
+    let inline_width = buttons()
+        .map(|button| button.estimated_width(look) + ACTION_SPACING)
+        .sum::<f32>()
+        + ACTION_SPACING;
+
+    let mut inline = Flex::row()
+        .with_main_axis_size(MainAxisSize::Max)
+        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+        .with_spacing(ACTION_SPACING);
+    for button in &leading {
+        inline.add_child(button.render(look));
+    }
+    inline.add_child(Expanded::new(1., Empty::new().finish()).finish());
+    for button in &trailing {
+        inline.add_child(button.render(look));
+    }
+
+    let mut wrapped = Wrap::row()
+        .with_main_axis_alignment(MainAxisAlignment::End)
+        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+        .with_spacing(ACTION_SPACING)
+        .with_run_spacing(ACTION_SPACING);
+    wrapped.extend(buttons().map(|button| button.render(look)));
+
+    SizeConstraintSwitch::new(
+        inline.finish(),
+        [(
+            SizeConstraintCondition::WidthLessThan(inline_width),
+            wrapped.finish(),
+        )],
+    )
+    .finish()
 }
 
 fn queue_row_height(look: &Look) -> f32 {

@@ -50,6 +50,8 @@ const PILL_HEIGHT: f32 = 26.;
 /// out unbounded.
 const PILL_MAX_WIDTH: f32 = 420.;
 const QUOTE_TOOLTIP_CHARS: usize = 600;
+const PASTE_PREVIEW_LINES: usize = 6;
+const PASTE_PREVIEW_LINE_CHARS: usize = 60;
 
 fn chip_icon(kind: PathKind) -> &'static str {
     match kind {
@@ -265,12 +267,7 @@ pub(super) fn pasted_chip(
     lines: usize,
     toggle: TranscriptAction,
 ) -> Box<dyn Element> {
-    let preview = if text.chars().count() > QUOTE_TOOLTIP_CHARS {
-        let cut: String = text.chars().take(QUOTE_TOOLTIP_CHARS).collect();
-        format!("{}…", cut.trim_end())
-    } else {
-        text.to_owned()
-    };
+    let preview = paste_preview(text, lines);
     let lines = if lines == 1 {
         "1 linha".to_owned()
     } else {
@@ -285,6 +282,32 @@ pub(super) fn pasted_chip(
         preview,
         Some(toggle),
     )
+}
+
+/// The first lines of a paste, each cut short, so its hover preview stays small enough to fit
+/// inside the window above the pill.
+pub(super) fn paste_preview(text: &str, lines: usize) -> String {
+    let mut preview: Vec<String> = text
+        .lines()
+        .take(PASTE_PREVIEW_LINES)
+        .map(|line| {
+            if line.chars().count() > PASTE_PREVIEW_LINE_CHARS {
+                let cut: String = line.chars().take(PASTE_PREVIEW_LINE_CHARS).collect();
+                format!("{}…", cut.trim_end())
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect();
+    let hidden = lines.saturating_sub(PASTE_PREVIEW_LINES);
+    if hidden > 0 {
+        preview.push(if hidden == 1 {
+            "… mais 1 linha".to_owned()
+        } else {
+            format!("… mais {hidden} linhas")
+        });
+    }
+    preview.join("\n")
 }
 
 /// A file attached to a message, as a pill with its kind's icon that opens it; hovering it shows

@@ -4,6 +4,6 @@ pub(crate) mod toast_stack;
 pub(crate) mod view;
 
 pub(crate) use item::{
-    NotificationCategory, NotificationFilter, NotificationId, NotificationItem, NotificationItems,
-    NotificationOrigin, NotificationSourceAgent,
+    ClaudeCodeUpdateNotice, NotificationCategory, NotificationFilter, NotificationId,
+    NotificationItem, NotificationItems, NotificationOrigin, NotificationSourceAgent,
 };

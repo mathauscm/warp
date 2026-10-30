@@ -16,6 +16,7 @@ use mcp_servers_page::MCPServersSettingsPageView;
 use nav::{SettingsNavItem, SettingsUmbrella};
 use pathfinder_geometry::vector::Vector2F;
 use privacy_page::{PrivacyPageView, PrivacyPageViewEvent};
+use providers_page::ProvidersPageView;
 use referrals_page::{ReferralsPageEvent, ReferralsPageView};
 use scripting_page::ScriptingSettingsPageView;
 use settings_file_footer::{SettingsFooterKind, SettingsFooterMouseStates, render_footer};
@@ -105,6 +106,7 @@ mod platform;
 mod platform_page;
 mod privacy;
 mod privacy_page;
+mod providers_page;
 mod referrals_page;
 mod remove_custom_endpoint_confirmation_dialog;
 mod scripting_page;
@@ -284,6 +286,8 @@ pub enum SettingsSection {
     #[default]
     Account,
     BillingAndUsage,
+    /// Which CLI native chats drive: Claude Code or Codex.
+    Providers,
     Appearance,
     Features,
     Keybindings,
@@ -316,6 +320,7 @@ impl Display for SettingsSection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SettingsSection::BillingAndUsage => write!(f, "Uso"),
+            SettingsSection::Providers => write!(f, "Provedores"),
             SettingsSection::Keybindings => write!(f, "Keyboard shortcuts"),
             SettingsSection::SharedBlocks => write!(f, "Shared blocks"),
             SettingsSection::Scripting => write!(f, "Scripting"),
@@ -353,6 +358,7 @@ impl SettingsSection {
             Self::About => "About",
             Self::Account => "Account",
             Self::BillingAndUsage => "Billing and usage",
+            Self::Providers => "Providers",
             Self::Appearance => "Appearance",
             Self::Features => "Features",
             Self::Keybindings => "Keyboard shortcuts",
@@ -396,6 +402,7 @@ impl SettingsSection {
             Self::About
             | Self::Account
             | Self::BillingAndUsage
+            | Self::Providers
             | Self::Appearance
             | Self::Features
             | Self::Keybindings
@@ -420,6 +427,7 @@ impl SettingsSection {
             "About" => Self::About,
             "Account" => Self::Account,
             "Billing and usage" => Self::BillingAndUsage,
+            "Providers" => Self::Providers,
             "Appearance" => Self::Appearance,
             "Features" => Self::Features,
             "Keyboard shortcuts" => Self::Keybindings,
@@ -696,6 +704,7 @@ pub fn init_actions_from_parent_view<T: Action + Clone>(
     code_indexing_page::init_actions_from_parent_view(app, context, builder);
     code_editor_review_page::init_actions_from_parent_view(app, context, builder);
     warp_drive_page::init_actions_from_parent_view(app, context, builder);
+    providers_page::init_actions_from_parent_view(app, context, builder);
 
     if ChannelState::enable_debug_features() || cfg!(windows) {
         ToggleSettingActionPair::add_toggle_setting_action_pairs_as_bindings(
@@ -1005,6 +1014,8 @@ pub enum SettingsAction {
     EditorAndCodeReview(EditorAndCodeReviewPageAction),
     WarpDrive(warp_drive_page::WarpDriveSettingsPageAction),
     WarpifyPageToggle(WarpifyPageAction),
+    /// Picks the CLI new native chats drive, from the Command Palette.
+    SetDefaultChatProvider(crate::native_chat::ChatProvider),
     Tab,
     Split(Direction),
     ToggleMaximizePane,
@@ -1168,6 +1179,7 @@ macro_rules! update_page {
                 $ctx.update_view(handle, $update)
             }
             SettingsPageViewHandle::BillingAndUsage(handle) => $ctx.update_view(handle, $update),
+            SettingsPageViewHandle::Providers(handle) => $ctx.update_view(handle, $update),
             SettingsPageViewHandle::MCPServers(handle) => $ctx.update_view(handle, $update),
             SettingsPageViewHandle::WarpDrive(handle) => $ctx.update_view(handle, $update),
         }
@@ -1275,6 +1287,7 @@ impl SettingsView {
         });
 
         let usage_page = SettingsPage::new(ctx.add_typed_action_view(UsagePageView::new));
+        let providers_page = SettingsPage::new(ctx.add_typed_action_view(ProvidersPageView::new));
 
         // Keybindings page
         let keybindings_handle = ctx.add_typed_action_view(KeybindingsView::new);
@@ -1378,6 +1391,7 @@ impl SettingsView {
             SettingsPage::new(knowledge_page_handle),
             SettingsPage::new(cli_agents_page_handle),
             usage_page,
+            providers_page,
             SettingsPage::new(code_indexing_page_handle),
             SettingsPage::new(editor_review_page_handle),
             SettingsPage::new(teams_page_handle),
@@ -1409,6 +1423,7 @@ impl SettingsView {
         let mut nav_items = vec![
             SettingsNavItem::Page(SettingsSection::Account),
             SettingsNavItem::Page(SettingsSection::BillingAndUsage),
+            SettingsNavItem::Page(SettingsSection::Providers),
             SettingsNavItem::Umbrella(SettingsUmbrella::new(
                 "Code",
                 vec![
@@ -2081,6 +2096,7 @@ impl SettingsView {
             SettingsPageViewHandle::Features(v) => v.as_ref(app).should_render(app),
             SettingsPageViewHandle::Appearance(v) => v.as_ref(app).should_render(app),
             SettingsPageViewHandle::BillingAndUsage(v) => v.as_ref(app).should_render(app),
+            SettingsPageViewHandle::Providers(v) => v.as_ref(app).should_render(app),
             SettingsPageViewHandle::About(v) => v.as_ref(app).should_render(app),
             SettingsPageViewHandle::WarpCloudAgentAPIKeys(v) => v.as_ref(app).should_render(app),
             SettingsPageViewHandle::Privacy(v) => v.as_ref(app).should_render(app),
@@ -2799,6 +2815,9 @@ impl TypedActionView for SettingsView {
                         view.handle_action(warpify_action, ctx);
                     })
                 }
+            }
+            SettingsAction::SetDefaultChatProvider(provider) => {
+                providers_page::set_default_provider(*provider, ctx);
             }
             SettingsAction::Tab => self.input_tab(ctx),
             SettingsAction::Split(direction) => {

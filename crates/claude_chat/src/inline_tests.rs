@@ -424,3 +424,133 @@ fn moves_text_typed_inside_a_token_after_it() {
         None
     );
 }
+
+#[test]
+fn editor_tokens_wrap_whole_and_still_parse() {
+    let token = editor_token_text(id(TokenKind::Pasted, 2), "3 linhas");
+    assert_eq!(
+        token,
+        "[Texto\u{a0}colado\u{a0}2\u{a0}·\u{a0}3\u{a0}linhas]"
+    );
+    assert!(!token.contains(' '));
+    let file = editor_token_text(id(TokenKind::File, 1), "meu arquivo.pdf");
+    let text = format!("a {token} b {file} c [Imagem 3]");
+    let found: Vec<TokenId> = find_tokens(&text)
+        .into_iter()
+        .map(|token| token.id)
+        .collect();
+    assert_eq!(
+        found,
+        vec![
+            id(TokenKind::Pasted, 2),
+            id(TokenKind::File, 1),
+            id(TokenKind::Image, 3)
+        ]
+    );
+    // Renumbering only changes the numbers, keeping the no-break spaces.
+    let renumbered = renumber_tokens(&text, |id| Some(id.number + 9));
+    assert_eq!(
+        renumbered,
+        "a [Texto\u{a0}colado\u{a0}11\u{a0}·\u{a0}3\u{a0}linhas] b \
+         [Arquivo\u{a0}10:\u{a0}meu\u{a0}arquivo.pdf] c [Imagem 12]"
+    );
+}
+
+#[test]
+fn composes_editor_tokens_with_plain_spaces() {
+    let red = image("RED");
+    let attachments = [DraftAttachment {
+        id: id(TokenKind::Image, 1),
+        content: DraftContent::Image(&red),
+    }];
+    let text = format!(
+        "veja {} aqui",
+        editor_token_text(id(TokenKind::Image, 1), "")
+    );
+    let message = compose(&text, &attachments);
+    assert_eq!(message.text, "veja [Imagem 1] aqui");
+}
+
+fn link(key: u64, kind: TokenKind, number: usize) -> Link {
+    Link {
+        key,
+        id: id(kind, number),
+    }
+}
+
+#[test]
+fn finds_attachments_whose_token_is_gone() {
+    let links = [
+        link(1, TokenKind::Image, 1),
+        link(2, TokenKind::Image, 2),
+        link(3, TokenKind::Pasted, 1),
+    ];
+    assert_eq!(
+        unlinked("[Imagem 1] e [Texto colado 1 · 3 linhas]", &links),
+        vec![2]
+    );
+    assert_eq!(unlinked("", &links), vec![1, 2, 3]);
+    // A partial token doesn't count.
+    assert_eq!(
+        unlinked("[Imagem 1 [Imagem 2] [Texto colado 1]", &links),
+        vec![1, 3]
+    );
+}
+
+#[test]
+fn compacts_numbers_per_kind_in_order() {
+    let links = [
+        link(7, TokenKind::Image, 3),
+        link(8, TokenKind::Image, 1),
+        link(9, TokenKind::File, 4),
+    ];
+    assert_eq!(
+        compact_numbers(&links, &[TokenKind::Image]),
+        vec![(8, 1), (7, 2)]
+    );
+    assert_eq!(
+        compact_numbers(&links, &[TokenKind::Image, TokenKind::File]),
+        vec![(8, 1), (7, 2), (9, 1)]
+    );
+}
+
+#[test]
+fn restores_the_links_of_a_text_undone_back_to() {
+    let mut history = LinkHistory::default();
+    let before = "a [Imagem 1] b [Imagem 2] c [Imagem 3]";
+    history.note(
+        before,
+        vec![
+            link(1, TokenKind::Image, 1),
+            link(2, TokenKind::Image, 2),
+            link(3, TokenKind::Image, 3),
+        ],
+    );
+    // Image 2's token is deleted: the state before and the one right after are saved, then the
+    // last image is renumbered.
+    let deleted = "a [Imagem 1] b  c [Imagem 3]";
+    history.save(
+        deleted,
+        vec![link(1, TokenKind::Image, 1), link(3, TokenKind::Image, 3)],
+    );
+    history.note(
+        "a [Imagem 1] b  c [Imagem 2]",
+        vec![link(1, TokenKind::Image, 1), link(3, TokenKind::Image, 2)],
+    );
+
+    // Undoing the renumbering gives image 3 its number back.
+    assert_eq!(
+        history.find(deleted, &[1, 3]),
+        Some(&[link(1, TokenKind::Image, 1), link(3, TokenKind::Image, 3)][..])
+    );
+    // Undoing the deletion brings image 2 back.
+    assert_eq!(history.find(before, &[1, 3]).map(<[Link]>::len), Some(3));
+    assert!(history.remembers(2));
+    // An attachment added since makes an equal text another draft.
+    assert_eq!(history.find(before, &[1, 3, 4]), None);
+    assert_eq!(history.find("outro", &[1]), None);
+
+    history.clear();
+    assert_eq!(history.find(before, &[1, 3]), None);
+    assert!(!history.remembers(2));
+}

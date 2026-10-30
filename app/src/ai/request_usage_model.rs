@@ -2,6 +2,8 @@ use std::sync::Arc;
 
 use ai::api_keys::{ApiKeyManager, AwsCredentialsState};
 use anyhow::Context as _;
+#[cfg(feature = "tui")]
+use chrono::Local;
 use chrono::{DateTime, Utc};
 use futures::channel::oneshot::{self, Receiver};
 use instant::Instant;
@@ -648,6 +650,11 @@ impl AIRequestUsageModel {
 
     pub fn next_refresh_time(&self) -> DateTime<Utc> {
         self.request_limit_info.next_refresh_time.utc()
+    }
+
+    #[cfg(feature = "tui")]
+    pub fn next_refresh_time_local(&self) -> DateTime<Local> {
+        self.next_refresh_time().with_timezone(&Local)
     }
 
     pub fn is_unlimited(&self) -> bool {
