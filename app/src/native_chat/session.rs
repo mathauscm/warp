@@ -15,7 +15,7 @@ use claude_chat::inline::{self, ComposedMessage};
 use claude_chat::process::{self, ClaudeProcess, SpawnConfig};
 use claude_chat::protocol::{
     self, ControlRequestBody, IncomingControlRequest, IncomingRequest, OutgoingBlock,
-    OutgoingImage, StdoutMessage,
+    OutgoingImage, StdoutMessage, SystemMessage,
 };
 use claude_chat::reducer::{
     ControlReply, Conversation, ConversationChange, ConversationStatus, ReplyPayload,
@@ -28,6 +28,7 @@ use warpui::{Entity, ModelContext, SingletonEntity};
 
 use super::ChatWorkspace;
 use super::provider::{self, ChatProvider, ChatProviderSettings};
+use crate::claude_threads;
 use crate::terminal::local_shell::LocalShellState;
 
 /// How often MCP servers are polled while some are still connecting.
@@ -35,6 +36,8 @@ const MCP_POLL_INTERVAL: Duration = Duration::from_secs(3);
 /// MCP servers usually connect within a few seconds; stop polling after this many tries.
 const MCP_POLL_ATTEMPTS: usize = 10;
 const TITLE_MAX_CHARS: usize = 60;
+/// The permission mode the CLI starts in ("Perguntar").
+const DEFAULT_PERMISSION_MODE: &str = "default";
 /// Appended to Claude Code's system prompt. Kept neutral so Claude behaves as it does in a
 /// terminal; the artifacts tools describe themselves. It must not be empty: without an appended
 /// prompt, a headless CLI introduces itself as a generic "Claude agent" instead of Claude Code.
@@ -151,6 +154,12 @@ pub struct ClaudeChatSession {
     history_loaded: bool,
     model_override: Option<String>,
     effort_override: Option<String>,
+    /// The permission mode to put the CLI in once it starts: the one the thread was left in, or
+    /// the one the chat was in before its process restarted.
+    startup_permission_mode: Option<String>,
+    /// The mode of the `set_permission_mode` that restores `startup_permission_mode`, until the
+    /// CLI answers it.
+    restoring_permission_mode: Option<String>,
     artifacts: ArtifactStore,
 }
 
@@ -182,6 +191,9 @@ impl ClaudeChatSession {
             .as_deref()
             .and_then(|session_id| transcript_path(provider, &cwd, session_id));
         let resume = transcript.is_some();
+        let startup_permission_mode = session_id
+            .as_deref()
+            .and_then(claude_threads::saved_permission_mode);
         let session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let model_override = match provider {
             ChatProvider::Claude => None,
@@ -212,8 +224,11 @@ impl ClaudeChatSession {
             history_loaded: transcript.is_none(),
             model_override,
             effort_override: None,
+            startup_permission_mode,
+            restoring_permission_mode: None,
             artifacts: ArtifactStore::new(artifacts_root()),
         };
+        session.assume_startup_permission_mode();
         if let Some(path) = transcript.or_else(|| dev_history(&session.cwd, resume)) {
             session.load_history(path, ctx);
         }
@@ -327,6 +342,10 @@ impl ClaudeChatSession {
         } else {
             config.session_id = Some(self.session_id.clone());
         }
+        if !self.cwd.is_dir() {
+            self.fail_to_start(missing_folder_message(&self.cwd), ctx);
+            return;
+        }
         let (process, driver) = match process::spawn(&config) {
             Ok(spawned) => spawned,
             Err(err) => {
@@ -354,6 +373,17 @@ impl ClaudeChatSession {
             },
             ctx,
         );
+        // Sent ahead of the queued messages, so they already run in the restored mode. Asking
+        // after `initialize` rather than passing `--permission-mode` keeps a mode the CLI
+        // refuses from stopping it from starting.
+        if let Some(mode) = self
+            .startup_permission_mode
+            .clone()
+            .filter(|mode| mode != DEFAULT_PERMISSION_MODE)
+        {
+            self.restoring_permission_mode = Some(mode.clone());
+            self.request(ControlRequestBody::SetPermissionMode { mode }, ctx);
+        }
         for line in std::mem::take(&mut self.queued_lines) {
             self.write(line);
         }
@@ -376,6 +406,10 @@ impl ClaudeChatSession {
         };
         let mut spawn_config = codex::SpawnConfig::new(codex_path, self.cwd.clone());
         spawn_config.path_env = path_env;
+        if !self.cwd.is_dir() {
+            self.fail_to_start(missing_folder_message(&self.cwd), ctx);
+            return;
+        }
         let (process, driver) = match codex::spawn(&spawn_config) {
             Ok(spawned) => spawned,
             Err(err) => {
@@ -453,7 +487,16 @@ impl ClaudeChatSession {
                 }
                 CodexEvent::ThreadStarted { thread_id } => {
                     if thread_id != self.session_id {
-                        self.session_id = thread_id;
+                        let previous = std::mem::replace(&mut self.session_id, thread_id);
+                        if self.has_transcript() {
+                            if let Err(err) = claude_threads::remember_permission_mode(
+                                &previous,
+                                DEFAULT_PERMISSION_MODE,
+                            ) {
+                                log::warn!("Native chat: {err}");
+                            }
+                            self.remember_permission_mode();
+                        }
                         ctx.emit(ClaudeChatSessionEvent::SessionIdAssigned);
                     }
                 }
@@ -565,7 +608,7 @@ impl ClaudeChatSession {
             return;
         }
         self.resume = self.has_transcript();
-        self.conversation = Conversation::new(Some(self.session_id.clone()));
+        self.reset_conversation();
         self.history_loaded = !self.resume;
         if self.resume
             && let Some(path) = transcript_path(self.provider, &self.cwd, &self.session_id)
@@ -583,7 +626,7 @@ impl ClaudeChatSession {
         }
         self.cwd = cwd;
         self.stop();
-        self.conversation = Conversation::new(Some(self.session_id.clone()));
+        self.reset_conversation();
         ctx.emit(ClaudeChatSessionEvent::Changed(Vec::new()));
         self.start(ctx);
     }
@@ -623,11 +666,43 @@ impl ClaudeChatSession {
         self.effort_override = None;
         self.title = None;
         self.queued_lines.clear();
-        self.conversation = Conversation::new(Some(self.session_id.clone()));
+        self.reset_conversation();
         ctx.emit(ClaudeChatSessionEvent::Changed(Vec::new()));
         ctx.emit(ClaudeChatSessionEvent::SessionIdAssigned);
         self.start(ctx);
         true
+    }
+
+    /// Starts the conversation over, keeping the permission mode the chat is in for the CLI to
+    /// start in.
+    fn reset_conversation(&mut self) {
+        if let Some(mode) = self.conversation.session().permission_mode.clone() {
+            self.startup_permission_mode = Some(mode);
+        }
+        self.restoring_permission_mode = None;
+        self.conversation = Conversation::new(Some(self.session_id.clone()));
+        self.assume_startup_permission_mode();
+    }
+
+    /// Shows the mode the CLI is about to start in, so the composer doesn't flash the default.
+    fn assume_startup_permission_mode(&mut self) {
+        if let Some(mode) = self.startup_permission_mode.clone() {
+            self.conversation.assume_permission_mode(&mode);
+        }
+    }
+
+    /// Saves the permission mode the chat is in, for its thread to reopen in it. Chats without a
+    /// conversation yet save it with their first message.
+    fn remember_permission_mode(&self) {
+        let Some(mode) = &self.conversation.session().permission_mode else {
+            return;
+        };
+        if !self.has_transcript() {
+            return;
+        }
+        if let Err(err) = claude_threads::remember_permission_mode(&self.session_id, mode) {
+            log::warn!("Native chat: {err}");
+        }
     }
 
     fn load_history(&mut self, path: PathBuf, ctx: &mut ModelContext<Self>) {
@@ -736,8 +811,21 @@ impl ClaudeChatSession {
             }
             message => {
                 let finished_turn = matches!(message, StdoutMessage::Result(_));
+                // Like when an approved plan switches to accepting edits.
+                let reports_mode = matches!(
+                    &message,
+                    StdoutMessage::System(SystemMessage::Status(status))
+                        if status.permission_mode.is_some()
+                );
+                let mode_before = self.conversation.session().permission_mode.clone();
                 let queued = self.conversation.queued_messages().len();
                 let changes = self.conversation.apply(message, SystemTime::now());
+                if reports_mode
+                    && self.restoring_permission_mode.is_none()
+                    && self.conversation.session().permission_mode != mode_before
+                {
+                    self.remember_permission_mode();
+                }
                 if changes.is_empty() && self.conversation.queued_messages().len() != queued {
                     // The queue isn't a change of its own; an empty batch still has views re-read it.
                     ctx.emit(ClaudeChatSessionEvent::Changed(changes));
@@ -838,7 +926,25 @@ impl ClaudeChatSession {
     }
 
     fn on_control_reply(&mut self, reply: ControlReply, ctx: &mut ModelContext<Self>) {
-        let changes = self.conversation.apply_control_reply(&reply);
+        let mut changes = self.conversation.apply_control_reply(&reply);
+        // The reply to `initialize` reports the mode the CLI started in, which the restoring
+        // request changes next.
+        if matches!(reply.request, ControlRequestBody::Initialize { .. })
+            && let Some(mode) = &self.restoring_permission_mode
+        {
+            changes.extend(self.conversation.assume_permission_mode(mode));
+        }
+        if matches!(reply.request, ControlRequestBody::SetPermissionMode { .. }) {
+            let restoring = self.restoring_permission_mode.take();
+            match &reply.outcome {
+                Ok(_) => self.remember_permission_mode(),
+                Err(_) if restoring.is_some() => changes.extend(
+                    self.conversation
+                        .assume_permission_mode(DEFAULT_PERMISSION_MODE),
+                ),
+                Err(_) => {}
+            }
+        }
         if changes.contains(&ConversationChange::Models) {
             provider::remember_claude_models(self.conversation.models());
         }
@@ -984,6 +1090,7 @@ impl ClaudeChatSession {
         self.apply_changes(changes, ctx);
         if !self.has_sent {
             self.has_sent = true;
+            self.remember_permission_mode();
             ctx.emit(ClaudeChatSessionEvent::SessionIdAssigned);
         }
         uuid
@@ -1199,6 +1306,7 @@ impl ClaudeChatSession {
     pub fn set_permission_mode(&mut self, mode: &str, ctx: &mut ModelContext<Self>) {
         if self.provider == ChatProvider::Codex {
             self.with_codex(ctx, |client| client.set_permission_mode(mode));
+            self.remember_permission_mode();
             return;
         }
         self.request(
@@ -1391,4 +1499,13 @@ impl ClaudeChatSession {
         }
         ctx.emit(ClaudeChatSessionEvent::TitleChanged);
     }
+}
+
+/// Why a chat can't start when its folder was moved or deleted; spawning would only report a
+/// missing file, which reads as if the CLI were missing.
+fn missing_folder_message(cwd: &Path) -> String {
+    format!(
+        "A pasta desta conversa não existe mais: {}. Mova-a de volta ou abra a conversa em outra pasta.",
+        cwd.display()
+    )
 }

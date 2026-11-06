@@ -6,7 +6,8 @@ use pathfinder_geometry::rect::RectF;
 use super::*;
 use crate::elements::new_scrollable::SingleAxisConfig;
 use crate::elements::{
-    ClippedScrollStateHandle, EventHandler, Fill, List, ListState, NewScrollable, SelectableElement,
+    ClippedScrollStateHandle, Container, EventHandler, Fill, Flex, Hoverable, List, ListState,
+    MouseStateHandle, NewScrollable, ParentElement, SelectableElement, Shrinkable,
 };
 use crate::platform::WindowStyle;
 use crate::units::IntoPixels;
@@ -661,4 +662,100 @@ fn dragging_past_the_top_autoscrolls_backwards() {
         assert_eq!(text, Some(all_rows));
         assert!(ended_drag.expect("the mouse-up ended a drag").is_reversed);
     });
+}
+
+/// A list whose first row is wrapped the way chat bubbles and code are: an I-beam `Hoverable`
+/// inside a hover `Hoverable`, a `Shrinkable` and a `Container`.
+struct WrappedRowsView {
+    selection_handle: SelectionHandle,
+    captured_selection: Rc<RefCell<Option<Option<String>>>>,
+    list_state: ListState<()>,
+}
+
+impl Default for WrappedRowsView {
+    fn default() -> Self {
+        let (hover, ibeam) = (MouseStateHandle::default(), MouseStateHandle::default());
+        let list_state = ListState::new(move |index, _, _| {
+            let probe = Box::new(LayeredSelectableProbe::default());
+            if index > 0 {
+                return probe;
+            }
+            let text = Hoverable::new(ibeam.clone(), |_| probe)
+                .with_cursor(crate::platform::Cursor::IBeam)
+                .with_propagate_drag()
+                .finish();
+            let bubble = Container::new(text).finish();
+            let row = Hoverable::new(hover.clone(), |_| {
+                Flex::column().with_child(bubble).finish()
+            })
+            .with_propagate_drag()
+            .finish();
+            Flex::row()
+                .with_child(Shrinkable::new(1., row).finish())
+                .finish()
+        });
+        list_state.add_item();
+        list_state.add_item();
+        Self {
+            selection_handle: Default::default(),
+            captured_selection: Default::default(),
+            list_state,
+        }
+    }
+}
+
+impl Entity for WrappedRowsView {
+    type Event = ();
+}
+
+impl crate::core::View for WrappedRowsView {
+    fn ui_name() -> &'static str {
+        "wrapped_rows_test_view"
+    }
+
+    fn render(&self, _: &AppContext) -> Box<dyn Element> {
+        let captured_selection = self.captured_selection.clone();
+        SelectableArea::new(
+            self.selection_handle.clone(),
+            move |args, _, _| {
+                *captured_selection.borrow_mut() = Some(args.selection);
+            },
+            List::new(self.list_state.clone()).finish(),
+        )
+        .finish()
+    }
+}
+
+impl TypedActionView for WrappedRowsView {
+    type Action = ();
+}
+
+/// Text under an I-beam `Hoverable` stays readable, alone and together with the next row.
+#[test]
+fn hover_wrapped_text_can_be_copied_alone_and_with_other_rows() {
+    for (end, expected) in [
+        (vec2f(60., 10.), "probe"),
+        (vec2f(60., 150.), "probe\nprobe"),
+    ] {
+        App::test((), |mut app| async move {
+            let (window_id, view) =
+                app.add_window(WindowStyle::NotStealFocus, |_| WrappedRowsView::default());
+            let captured_selection = view.read(&app, |view, _| view.captured_selection.clone());
+            let root_view_id = view.id();
+            app.update(move |ctx| {
+                let presenter = present(window_id, root_view_id, ctx);
+                for event in [
+                    mouse_down(vec2f(10., 10.)),
+                    mouse_dragged(end),
+                    mouse_up(end),
+                ] {
+                    ctx.simulate_window_event(event, window_id, presenter.clone());
+                }
+            });
+            assert_eq!(
+                *captured_selection.borrow(),
+                Some(Some(expected.to_owned()))
+            );
+        });
+    }
 }

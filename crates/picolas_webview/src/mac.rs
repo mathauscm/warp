@@ -1,23 +1,29 @@
 use std::cell::RefCell;
+use std::ffi::c_void;
 use std::path::Path;
 
 use anyhow::{Context as _, Result, anyhow};
 use block2::{DynBlock, RcBlock};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObjectProtocol, ProtocolObject};
-use objc2::{ClassType, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
+use objc2::{
+    ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel,
+};
 use objc2_app_kit::{
     NSAppearance, NSAppearanceCustomization, NSAppearanceNameAqua, NSAppearanceNameDarkAqua,
     NSBitmapImageFileType, NSBitmapImageRep, NSColor, NSImage, NSWorkspace,
 };
 use objc2_foundation::{
-    NSDictionary, NSError, NSNumber, NSObject, NSObjectNSKeyValueCoding, NSPoint, NSRect, NSSize,
-    NSString, NSURL, ns_string,
+    NSDictionary, NSError, NSKeyValueObservingOptions, NSNumber, NSObject,
+    NSObjectNSKeyValueCoding, NSObjectNSKeyValueObserverRegistration, NSPoint, NSRect, NSSize,
+    NSString, NSURL, NSURLRequest, ns_string,
 };
 use objc2_web_kit::{
-    WKNavigationAction, WKNavigationActionPolicy, WKNavigationDelegate, WKNavigationType,
-    WKUIDelegate, WKWebView, WKWebViewConfiguration, WKWindowFeatures,
+    WKNavigation, WKNavigationAction, WKNavigationActionPolicy, WKNavigationDelegate,
+    WKNavigationType, WKUIDelegate, WKWebView, WKWebViewConfiguration, WKWindowFeatures,
 };
+
+use crate::{NavigationState, WebViewEvent};
 
 /// The native view a [`WebView`] is attached to (typically the window's content view).
 pub type ParentView = objc2_app_kit::NSView;
@@ -29,21 +35,68 @@ const LOCAL_SCHEMES: &[&str] = &["file", "about", "data", "blob"];
 /// dropped so untrusted HTML can't launch arbitrary URL-scheme handlers.
 const EXTERNAL_SCHEMES: &[&str] = &["http", "https", "mailto"];
 
+/// Schemes a browsing web view loads itself.
+const BROWSER_SCHEMES: &[&str] = &["http", "https", "file", "about", "data", "blob"];
+
+/// The `WKWebView` properties a browsing web view observes to report [`WebViewEvent::StateChanged`].
+const OBSERVED_KEY_PATHS: &[&str] = &["title", "URL", "canGoBack", "canGoForward", "loading"];
+
+/// `NSURLErrorCancelled`: a load replaced by another one, which isn't worth reporting.
+const URL_ERROR_CANCELLED: isize = -999;
+/// `WebKitErrorFrameLoadInterruptedByPolicyChange`: a load the navigation policy cancelled.
+const FRAME_LOAD_INTERRUPTED: isize = 102;
+
+/// Without a Safari version in the user agent, some sites serve degraded pages to WKWebView.
+const APPLICATION_NAME_FOR_USER_AGENT: &str = "Version/18.0 Safari/605.1.15";
+
 /// A WKWebView attached as a child of a native parent view. Main-thread only (`!Send`).
 pub struct WebView {
     web_view: Retained<WKWebView>,
     // WKWebView only holds its delegates weakly.
-    _delegate: Retained<NavigationDelegate>,
+    delegate: Retained<NavigationDelegate>,
 }
 
 impl WebView {
+    /// A web view for local artifacts: it stays on local content and opens web links in the
+    /// default browser.
     pub fn new(parent: &ParentView) -> Result<Self> {
+        Self::with_mode(parent, None)
+    }
+
+    /// A web view that browses the web like a browser tab, reporting its navigation through
+    /// `on_event`.
+    pub fn new_browser(
+        parent: &ParentView,
+        on_event: impl Fn(WebViewEvent) + 'static,
+    ) -> Result<Self> {
+        let this = Self::with_mode(parent, Some(Box::new(on_event)))?;
+        for key_path in OBSERVED_KEY_PATHS {
+            // SAFETY: the observer is removed in `Drop`, while `Self` still keeps it alive.
+            unsafe {
+                this.web_view.addObserver_forKeyPath_options_context(
+                    &this.delegate,
+                    &NSString::from_str(key_path),
+                    NSKeyValueObservingOptions::New,
+                    std::ptr::null_mut(),
+                );
+            }
+        }
+        Ok(this)
+    }
+
+    fn with_mode(parent: &ParentView, on_event: Option<Box<dyn Fn(WebViewEvent)>>) -> Result<Self> {
         let mtm = MainThreadMarker::new().context("WebView must be created on the main thread")?;
+        let is_browser = on_event.is_some();
 
         // SAFETY: plain Objective-C object construction and property setters on the main thread.
         // The KVC keys are long-standing WKPreferences/WKWebView properties (also used by wry).
         let web_view = unsafe {
             let configuration = WKWebViewConfiguration::new(mtm);
+            if is_browser {
+                configuration.setApplicationNameForUserAgent(Some(&NSString::from_str(
+                    APPLICATION_NAME_FOR_USER_AGENT,
+                )));
+            }
             let preferences = configuration.preferences();
             preferences.setJavaScriptCanOpenWindowsAutomatically(false);
             let yes = NSNumber::numberWithBool(true);
@@ -64,10 +117,14 @@ impl WebView {
             if web_view.respondsToSelector(sel!(setInspectable:)) {
                 web_view.setInspectable(true);
             }
+            if is_browser {
+                web_view.setAllowsBackForwardNavigationGestures(true);
+                web_view.setAllowsMagnification(true);
+            }
             web_view
         };
 
-        let delegate = NavigationDelegate::new(mtm);
+        let delegate = NavigationDelegate::new(mtm, on_event);
         // SAFETY: the delegate is kept alive by `Self` for as long as it is installed.
         unsafe {
             web_view.setNavigationDelegate(Some(ProtocolObject::from_ref(&*delegate)));
@@ -75,10 +132,7 @@ impl WebView {
         }
         parent.addSubview(&web_view);
 
-        Ok(Self {
-            web_view,
-            _delegate: delegate,
-        })
+        Ok(Self { web_view, delegate })
     }
 
     /// Positions the view using WarpUI's top-left-origin logical coordinates.
@@ -146,9 +200,55 @@ impl WebView {
         };
     }
 
+    /// Loads `url`, which must be absolute (like `http://localhost:5173/`).
+    pub fn load_url(&self, url: &str) -> Result<()> {
+        let ns_url = NSURL::URLWithString(&NSString::from_str(url))
+            .with_context(|| format!("invalid URL: {url}"))?;
+        let request = NSURLRequest::requestWithURL(&ns_url);
+        // SAFETY: loading a request built from a valid URL.
+        unsafe { self.web_view.loadRequest(&request) };
+        Ok(())
+    }
+
     pub fn reload(&self) {
         // SAFETY: plain method call on a live view.
         unsafe { self.web_view.reload() };
+    }
+
+    pub fn stop_loading(&self) {
+        // SAFETY: plain method call on a live view.
+        unsafe { self.web_view.stopLoading() };
+    }
+
+    pub fn go_back(&self) {
+        // SAFETY: plain method call on a live view; it does nothing without history.
+        unsafe { self.web_view.goBack() };
+    }
+
+    pub fn go_forward(&self) {
+        // SAFETY: plain method call on a live view; it does nothing without history.
+        unsafe { self.web_view.goForward() };
+    }
+
+    pub fn navigation_state(&self) -> NavigationState {
+        // SAFETY: property getters on a live view on the main thread.
+        unsafe {
+            NavigationState {
+                url: self
+                    .web_view
+                    .URL()
+                    .and_then(|url| url.absoluteString())
+                    .map(|url| url.to_string()),
+                title: self
+                    .web_view
+                    .title()
+                    .map(|title| title.to_string())
+                    .filter(|title| !title.is_empty()),
+                can_go_back: self.web_view.canGoBack(),
+                can_go_forward: self.web_view.canGoForward(),
+                loading: self.web_view.isLoading(),
+            }
+        }
     }
 
     pub fn evaluate_js(&self, script: &str) {
@@ -222,6 +322,15 @@ impl WebView {
 
 impl Drop for WebView {
     fn drop(&mut self) {
+        if self.delegate.ivars().on_event.is_some() {
+            for key_path in OBSERVED_KEY_PATHS {
+                // SAFETY: the observer was added in `new_browser` and is still alive.
+                unsafe {
+                    self.web_view
+                        .removeObserver_forKeyPath(&self.delegate, &NSString::from_str(key_path));
+                }
+            }
+        }
         // SAFETY: clearing delegates and stopping loads on a live view on the main thread.
         unsafe {
             self.web_view.stopLoading();
@@ -261,12 +370,32 @@ fn open_externally(url: &NSURL) {
     }
 }
 
+struct DelegateIvars {
+    /// Set for a browsing web view, which reports its navigation through it.
+    on_event: Option<Box<dyn Fn(WebViewEvent)>>,
+}
+
 define_class!(
     // SAFETY: NSObject has no subclassing requirements and this type does not implement Drop.
     #[unsafe(super = NSObject)]
     #[thread_kind = MainThreadOnly]
     #[name = "PicolasWebViewNavigationDelegate"]
+    #[ivars = DelegateIvars]
     struct NavigationDelegate;
+
+    impl NavigationDelegate {
+        /// Key-value observing of the browsing web view's navigation properties.
+        #[unsafe(method(observeValueForKeyPath:ofObject:change:context:))]
+        fn observe_value(
+            &self,
+            _key_path: Option<&NSString>,
+            _object: Option<&AnyObject>,
+            _change: Option<&AnyObject>,
+            _context: *mut c_void,
+        ) {
+            self.emit(WebViewEvent::StateChanged);
+        }
+    }
 
     unsafe impl NSObjectProtocol for NavigationDelegate {}
 
@@ -278,23 +407,57 @@ define_class!(
             navigation_action: &WKNavigationAction,
             decision_handler: &DynBlock<dyn Fn(WKNavigationActionPolicy)>,
         ) {
-            decision_handler.call((navigation_policy(navigation_action),));
+            let policy = if self.is_browser() {
+                browser_navigation_policy(navigation_action)
+            } else {
+                navigation_policy(navigation_action)
+            };
+            decision_handler.call((policy,));
+        }
+
+        #[unsafe(method(webView:didFinishNavigation:))]
+        fn did_finish_navigation(&self, _web_view: &WKWebView, _navigation: Option<&WKNavigation>) {
+            self.emit(WebViewEvent::StateChanged);
+        }
+
+        #[unsafe(method(webView:didFailNavigation:withError:))]
+        fn did_fail_navigation(
+            &self,
+            web_view: &WKWebView,
+            _navigation: Option<&WKNavigation>,
+            error: &NSError,
+        ) {
+            self.report_failure(web_view, error, None);
+        }
+
+        #[unsafe(method(webView:didFailProvisionalNavigation:withError:))]
+        fn did_fail_provisional_navigation(
+            &self,
+            web_view: &WKWebView,
+            _navigation: Option<&WKNavigation>,
+            error: &NSError,
+        ) {
+            self.report_failure(web_view, error, failing_url(error));
         }
     }
 
     unsafe impl WKUIDelegate for NavigationDelegate {
-        /// Pages asking for a new window (`target="_blank"`, `window.open`) get the URL opened
-        /// in the default browser instead.
+        /// Pages asking for a new window (`target="_blank"`, `window.open`) get the URL loaded in
+        /// place when browsing, and opened in the default browser otherwise.
         #[unsafe(method_id(webView:createWebViewWithConfiguration:forNavigationAction:windowFeatures:))]
         fn create_web_view(
             &self,
-            _web_view: &WKWebView,
+            web_view: &WKWebView,
             _configuration: &WKWebViewConfiguration,
             navigation_action: &WKNavigationAction,
             _window_features: &WKWindowFeatures,
         ) -> Option<Retained<WKWebView>> {
             // SAFETY: reading properties of a live navigation action.
-            if let Some(url) = unsafe { navigation_action.request() }.URL() {
+            let request = unsafe { navigation_action.request() };
+            if self.is_browser() {
+                // SAFETY: loading the page's own request in the view that asked for it.
+                unsafe { web_view.loadRequest(&request) };
+            } else if let Some(url) = request.URL() {
                 open_externally(&url);
             }
             None
@@ -303,11 +466,60 @@ define_class!(
 );
 
 impl NavigationDelegate {
-    fn new(mtm: MainThreadMarker) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(());
+    fn new(mtm: MainThreadMarker, on_event: Option<Box<dyn Fn(WebViewEvent)>>) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(DelegateIvars { on_event });
         // SAFETY: NSObject's `init` signature is correct.
         unsafe { msg_send![super(this), init] }
     }
+
+    fn is_browser(&self) -> bool {
+        self.ivars().on_event.is_some()
+    }
+
+    fn emit(&self, event: WebViewEvent) {
+        if let Some(on_event) = &self.ivars().on_event {
+            on_event(event);
+        }
+    }
+
+    fn report_failure(&self, web_view: &WKWebView, error: &NSError, url: Option<String>) {
+        if matches!(error.code(), URL_ERROR_CANCELLED | FRAME_LOAD_INTERRUPTED) {
+            self.emit(WebViewEvent::StateChanged);
+            return;
+        }
+        // SAFETY: reading a property of a live view on the main thread.
+        let url = url.or_else(|| {
+            unsafe { web_view.URL() }
+                .and_then(|url| url.absoluteString())
+                .map(|url| url.to_string())
+        });
+        self.emit(WebViewEvent::LoadFailed {
+            url,
+            message: error.localizedDescription().to_string(),
+        });
+    }
+}
+
+/// The URL a provisional navigation failed on, from the error's user info.
+fn failing_url(error: &NSError) -> Option<String> {
+    let user_info = error.userInfo();
+    let value = user_info.objectForKey(ns_string!("NSErrorFailingURLStringKey"))?;
+    let value = value.downcast_ref::<NSString>()?;
+    Some(value.to_string())
+}
+
+/// Lets a browsing web view go anywhere on the web, handing other schemes (like `mailto:`) to the
+/// system when allowed.
+fn browser_navigation_policy(navigation_action: &WKNavigationAction) -> WKNavigationActionPolicy {
+    // SAFETY: reading properties of a live navigation action.
+    let Some(url) = (unsafe { navigation_action.request() }).URL() else {
+        return WKNavigationActionPolicy::Allow;
+    };
+    if url_scheme(&url).is_some_and(|scheme| BROWSER_SCHEMES.contains(&scheme.as_str())) {
+        return WKNavigationActionPolicy::Allow;
+    }
+    open_externally(&url);
+    WKNavigationActionPolicy::Cancel
 }
 
 /// Keeps the web view on local content: local schemes and subframe loads are allowed, while

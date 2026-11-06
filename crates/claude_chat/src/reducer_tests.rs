@@ -1174,3 +1174,61 @@ fn parses_rfc3339_timestamps() {
     );
     assert_eq!(parse_rfc3339("nope"), None);
 }
+
+#[test]
+fn tool_results_keep_their_images() {
+    let now = start_time();
+    let mut conversation = Conversation::new(None);
+    apply_json(
+        &mut conversation,
+        json!({"type": "assistant", "parent_tool_use_id": null, "message": {"id": "msg_1", "model": "m",
+            "content": [{"type": "tool_use", "id": "shot", "name": "mcp__chrome__take_screenshot", "input": {}}]}}),
+        now,
+    );
+    apply_json(
+        &mut conversation,
+        json!({"type": "user", "parent_tool_use_id": null, "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "shot", "content": [
+                {"type": "text", "text": "Took a screenshot"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}},
+            ]},
+        ]}}),
+        now,
+    );
+    let Some(TimelineItem::Tool(tool)) = conversation.items().last() else {
+        panic!("expected the tool call");
+    };
+    let result = tool.result.as_ref().expect("the call finished");
+    assert_eq!(result.text, "Took a screenshot\n[image]");
+    assert_eq!(
+        result.images,
+        [ImageAttachment {
+            media_type: "image/png".to_owned(),
+            path: None,
+            data: Some("iVBORw0KGgo=".to_owned()),
+        }]
+    );
+}
+
+#[test]
+fn an_assumed_permission_mode_shows_until_the_cli_reports_another() {
+    let mut conversation = Conversation::new(None);
+    assert_eq!(
+        conversation.assume_permission_mode("auto"),
+        [ConversationChange::Session]
+    );
+    assert!(conversation.assume_permission_mode("auto").is_empty());
+    assert_eq!(
+        conversation.session().permission_mode.as_deref(),
+        Some("auto")
+    );
+    apply_json(
+        &mut conversation,
+        json!({"type": "system", "subtype": "status", "status": null, "permissionMode": "plan"}),
+        start_time(),
+    );
+    assert_eq!(
+        conversation.session().permission_mode.as_deref(),
+        Some("plan")
+    );
+}

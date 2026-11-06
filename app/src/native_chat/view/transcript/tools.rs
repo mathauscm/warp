@@ -22,16 +22,15 @@ use super::TranscriptAction;
 use super::chips;
 use super::details::{self, DiffLineKind, MAX_DIFF_LINES};
 use super::render::{
-    ICON_CHEVRON_DOWN, ICON_CHEVRON_RIGHT, MarkdownTone, RowContext, Style, disclosure_line, icon,
-    indented_detail, mono_box, render_markdown, render_nested_rows, scroll_box,
+    ICON_CHEVRON_DOWN, ICON_CHEVRON_RIGHT, MarkdownTone, RowContext, Style, TOOL_ICON_GAP,
+    disclosure_line, icon, indented_detail, mono_box, render_markdown, render_nested_rows,
+    scroll_box, tools_at, with_tool_images,
 };
 
 /// Lines of a tool's result shown when it's expanded.
 const RESULT_PREVIEW_LINES: usize = 80;
 /// Lines of an integration's input shown when it's expanded.
 const INPUT_PREVIEW_LINES: usize = 24;
-/// Gap between a tool's icon and its label; details indent to line up with the label.
-const ICON_GAP: f32 = 8.;
 const ARTIFACT_TILE_SIZE: f32 = 40.;
 
 fn kind_icon(kind: ToolKind) -> &'static str {
@@ -87,13 +86,15 @@ pub(super) fn render_tool(cx: &RowContext, tool: &ToolCall) -> Box<dyn Element> 
     let details = tool_details(cx, tool, &key);
     let expanded = details.is_some() && cx.view.is_expanded(&key, false);
     let line = tool_line(cx, tool, &label, &key, expanded, details.is_some());
+    // Shown whether or not the call is open, like the images of a message.
+    let line = with_tool_images(cx, &key, line, &[tool]);
     match details.filter(|_| expanded) {
         Some(details) => Flex::column()
             .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
             .with_child(line)
             .with_child(
                 Container::new(details)
-                    .with_padding_left(cx.sizes().icon_size + ICON_GAP)
+                    .with_padding_left(cx.sizes().icon_size + TOOL_ICON_GAP)
                     .with_padding_top(2.)
                     .with_padding_bottom(6.)
                     .finish(),
@@ -145,7 +146,7 @@ fn tool_line(
             .with_main_axis_size(MainAxisSize::Max)
             .with_child(
                 Container::new(icon(kind_icon(kind), icon_color, sizes.icon_size - 1.))
-                    .with_padding_right(ICON_GAP)
+                    .with_padding_right(TOOL_ICON_GAP)
                     .finish(),
             );
         let text = match &target {
@@ -244,13 +245,89 @@ fn tool_line(
             .with_height(sizes.tool_row_height)
             .finish()
     });
-    if !expandable {
-        return hoverable.finish();
+    let line = if expandable {
+        hoverable
+            .with_cursor(Cursor::PointingHand)
+            .on_click(move |ctx, _, _| ctx.dispatch_typed_action(action.clone()))
+            .finish()
+    } else {
+        hoverable.finish()
+    };
+    match tool_page_url(tool) {
+        Some(url) => Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_child(Expanded::new(1., line).finish())
+            .with_child(open_in_browser_button(cx, key, url))
+            .finish(),
+        None => line,
     }
-    hoverable
-        .with_cursor(Cursor::PointingHand)
-        .on_click(move |ctx, _, _| ctx.dispatch_typed_action(action.clone()))
-        .finish()
+}
+
+/// The page a finished tool call opened or mentions (like a dev server's local URL), to show in
+/// the in-app browser.
+fn tool_page_url(tool: &ToolCall) -> Option<String> {
+    if matches!(
+        tool.status,
+        ToolStatus::Streaming | ToolStatus::AwaitingApproval
+    ) {
+        return None;
+    }
+    crate::browser::url::tool_page_url(
+        &tool.name,
+        &tool.input,
+        tool.result.as_ref().map(|result| result.text.as_str()),
+    )
+}
+
+fn open_in_browser_button(cx: &RowContext, key: &str, url: String) -> Box<dyn Element> {
+    let style = cx.style.clone();
+    Hoverable::new(
+        cx.view.mouse(&format!("open-browser:{key}")),
+        move |state| {
+            let palette = &style.palette;
+            let sizes = &style.sizes;
+            let color = if state.is_hovered() {
+                palette.text.0
+            } else {
+                palette.text_muted.0
+            };
+            let mut button = Container::new(
+                Flex::row()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_spacing(5.)
+                    .with_child(icon(
+                        "bundled/svg/picolas-globe.svg",
+                        color,
+                        sizes.small_icon_size - 1.,
+                    ))
+                    .with_child(
+                        Text::new_inline("Abrir no navegador", style.ui, sizes.tiny_font_size)
+                            .with_color(color)
+                            .with_selectable(false)
+                            .finish(),
+                    )
+                    .finish(),
+            )
+            .with_horizontal_padding(7.)
+            .with_vertical_padding(3.)
+            .with_border(Border::all(1.).with_border_color(palette.border.0))
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(7.)));
+            if state.is_hovered() {
+                button = button.with_background_color(palette.surface_hover.0);
+            }
+            Container::new(button.finish())
+                .with_margin_left(8.)
+                .finish()
+        },
+    )
+    .with_cursor(Cursor::PointingHand)
+    .on_click(move |ctx, _, _| {
+        ctx.dispatch_typed_action(crate::workspace::WorkspaceAction::OpenBrowser {
+            url: Some(url.clone()),
+        });
+    })
+    .finish()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -508,7 +585,7 @@ pub(super) fn render_question_answers(cx: &RowContext, tool: &ToolCall) -> Box<d
                 palette.text_muted.0,
                 sizes.icon_size - 1.,
             ))
-            .with_padding_right(ICON_GAP)
+            .with_padding_right(TOOL_ICON_GAP)
             .finish(),
         )
         .with_child(
@@ -547,7 +624,7 @@ pub(super) fn render_batch(cx: &RowContext, batch: &ToolBatch) -> Box<dyn Elemen
         batch.is_live,
     );
     if !expanded {
-        return header;
+        return with_tool_images(cx, &key, header, &tools_at(cx, &batch.items));
     }
     let rows: Vec<Row> = batch
         .items
@@ -623,7 +700,7 @@ fn render_subagent(cx: &RowContext, tool: &ToolCall, label: &ToolLabel) -> Box<d
             .with_main_axis_size(MainAxisSize::Max)
             .with_child(
                 Container::new(icon(kind_icon(ToolKind::Subagent), color, sizes.icon_size))
-                    .with_padding_right(ICON_GAP)
+                    .with_padding_right(TOOL_ICON_GAP)
                     .finish(),
             )
             .with_child(
@@ -807,7 +884,7 @@ fn render_todos(cx: &RowContext, tool: &ToolCall, label: &ToolLabel) -> Box<dyn 
         .with_child(line)
         .with_child(
             Container::new(list.finish())
-                .with_padding_left(sizes.icon_size + ICON_GAP)
+                .with_padding_left(sizes.icon_size + TOOL_ICON_GAP)
                 .with_padding_top(2.)
                 .with_padding_bottom(6.)
                 .finish(),

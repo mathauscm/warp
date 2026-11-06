@@ -884,6 +884,11 @@ pub enum WorkspaceAction {
     OpenArtifacts {
         artifact_id: Option<String>,
     },
+    /// Focus the in-app browser, or open one beside the focused chat (else in a new tab), with
+    /// `url` in a tab.
+    OpenBrowser {
+        url: Option<String>,
+    },
     /// Show the Threads panel (Claude Code conversations by project) in the
     /// vertical tabs sidebar, or hide it when it's already showing.
     ToggleClaudeThreadsPanel,
@@ -1195,6 +1200,7 @@ impl WorkspaceAction {
             | OpenClaudeWorkspaceChat { .. }
             | OpenClaudeChatSnapshot { .. }
             | OpenArtifacts { .. }
+            | OpenBrowser { .. }
             | ToggleClaudeThreadsPanel
             | ToggleTerminalPanel
             | ToggleProjectManagerPanel

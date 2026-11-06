@@ -294,7 +294,8 @@ pub(super) fn strip_chip_room(text: &str) -> String {
         .collect()
 }
 
-/// Turns the paths that `blocks`' prose names into chips, quotes included.
+/// Turns the paths that `blocks`' prose names into chips, and finds the files of their images,
+/// quotes included.
 pub(super) fn add_chips(
     blocks: &mut [Block],
     cwd: &Path,
@@ -310,6 +311,13 @@ pub(super) fn add_chips(
                 }
             }
             Block::Quote(blocks) => add_chips(blocks, cwd, home, lookup),
+            Block::Image { source, path, .. } => {
+                let candidate =
+                    resolve(source.strip_prefix("file://").unwrap_or(source), cwd, home);
+                if lookup(&candidate) == Some(false) {
+                    *path = Some(candidate);
+                }
+            }
             Block::Code { .. } | Block::Table(_) => {}
         }
     }

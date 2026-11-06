@@ -11,6 +11,7 @@ mod auth;
 mod autoupdate;
 mod banner;
 mod billing;
+mod browser;
 mod changelog_model;
 mod chip_configurator;
 mod claude_threads;
@@ -2742,6 +2743,8 @@ pub(crate) fn app_callbacks(
             lsp::LspManagerModel::handle(ctx).update(ctx, |manager, ctx| {
                 manager.terminate(ctx);
             });
+
+            browser::server::stop_all();
 
             // We want to tear down the terminal server before relaunching for
             // autoupdate, to ensure we're not running any extra Warp processes

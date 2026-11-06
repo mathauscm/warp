@@ -484,3 +484,68 @@ fn git_branch_reads_head_of_repositories_and_worktrees() {
     std::fs::write(worktree_git.join("HEAD"), "0123456789abcdef\n").unwrap();
     assert_eq!(git_branch(&worktree).as_deref(), Some("0123456"));
 }
+
+#[test]
+fn threads_remember_the_permission_mode_they_were_left_in() {
+    let mut config = ThreadsConfig::default();
+    assert_eq!(config.permission_mode("a"), None);
+    assert!(config.set_permission_mode("a", "auto"));
+    assert!(!config.set_permission_mode("a", "auto"));
+    assert!(config.set_permission_mode("b", "plan"));
+    assert_eq!(config.permission_mode("a"), Some("auto"));
+    assert_eq!(config.permission_mode("b"), Some("plan"));
+
+    assert!(
+        config.set_permission_mode("a", "default"),
+        "going back to the default forgets the thread's mode"
+    );
+    assert_eq!(config.permission_mode("a"), None);
+    assert!(!config.set_permission_mode("a", "default"));
+
+    config.forget_thread("b");
+    assert_eq!(config.permission_mode("b"), None);
+}
+
+#[test]
+fn permission_modes_survive_a_round_trip_through_the_file() {
+    let mut config = ThreadsConfig::default();
+    config.pinned.push("a".to_owned());
+    config.set_permission_mode("a", "bypassPermissions");
+    let contents = toml::to_string_pretty(&config).unwrap();
+    let loaded: ThreadsConfig = toml::from_str(&contents).unwrap();
+    assert_eq!(loaded.permission_mode("a"), Some("bypassPermissions"));
+
+    let older: ThreadsConfig = toml::from_str("pinned = [\"a\"]").unwrap();
+    assert!(older.permission_modes.is_empty());
+}
+
+#[test]
+fn saving_the_panel_keeps_the_modes_chats_wrote_since() {
+    // The panel's copy was loaded before the chats noted any mode.
+    let mut panel = ThreadsConfig::default();
+    panel.pinned.push("a".to_owned());
+    let mut on_disk = ThreadsConfig::default();
+    on_disk.set_permission_mode("a", "auto");
+    on_disk.set_permission_mode("b", "acceptEdits");
+
+    let saved = panel.for_saving(Some(on_disk.clone()), &[]);
+    assert_eq!(saved.pinned, ["a"]);
+    assert_eq!(saved.version, CONFIG_VERSION);
+    assert_eq!(saved.permission_mode("a"), Some("auto"));
+    assert_eq!(saved.permission_mode("b"), Some("acceptEdits"));
+
+    let saved = panel.for_saving(Some(on_disk), &["b"]);
+    assert_eq!(saved.permission_mode("a"), Some("auto"));
+    assert_eq!(
+        saved.permission_mode("b"),
+        None,
+        "a deleted thread's mode goes"
+    );
+
+    panel.set_permission_mode("c", "plan");
+    assert_eq!(
+        panel.for_saving(None, &[]).permission_mode("c"),
+        Some("plan"),
+        "without a readable file, the panel's own modes are kept"
+    );
+}

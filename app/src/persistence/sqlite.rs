@@ -1214,7 +1214,8 @@ fn save_pane_state(
         LeafContents::AIDocument(_) => AI_DOCUMENT_PANE_KIND,
         LeafContents::EnvironmentManagement(_)
         | LeafContents::NetworkLog
-        | LeafContents::Artifacts => {
+        | LeafContents::Artifacts
+        | LeafContents::Browser => {
             // These pane types are filtered out before this function is
             // called; see `LeafContents::is_persisted` and the skip in
             // `save_app_state`. Reaching this arm would mean a `pane_nodes`
@@ -1459,7 +1460,7 @@ fn save_pane_state(
                 .values(ambient_agent_pane)
                 .execute(conn)?;
         }
-        LeafContents::NetworkLog | LeafContents::Artifacts => {
+        LeafContents::NetworkLog | LeafContents::Artifacts | LeafContents::Browser => {
             // Unreachable: filtered by `is_persisted` in `save_app_state`.
         }
     }

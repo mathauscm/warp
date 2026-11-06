@@ -30,6 +30,13 @@
 //! "5f0c…" = "c41d…"
 //! ```
 //!
+//! Native chats note the permission mode each thread was left in, so it reopens in it:
+//!
+//! ```toml
+//! [permission_modes]
+//! "5f0c…" = "auto"
+//! ```
+//!
 //! Threads are read straight from Claude Code's transcripts at
 //! `~/.claude/projects/<slug>/<session id>.jsonl`, where the slug is the folder
 //! the conversation started in with every non-alphanumeric character replaced
@@ -136,6 +143,8 @@ impl ThreadWorkspace {
 
 /// The version written by this build; older files have none and load the same way.
 const CONFIG_VERSION: u32 = 2;
+/// The permission mode chats start in ("Perguntar"), which isn't saved per thread.
+const DEFAULT_PERMISSION_MODE: &str = "default";
 
 /// What the Threads panel keeps between launches.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -170,6 +179,11 @@ pub struct ThreadsConfig {
     /// Workspace id of each thread started in a workspace, by session id.
     #[serde(default)]
     pub workspace_threads: BTreeMap<String, String>,
+    /// The permission mode each thread was left in, by session id. Threads in the default mode
+    /// aren't listed. Native chats write it straight to the file, so [`save_config`] keeps what
+    /// the file has.
+    #[serde(default)]
+    pub permission_modes: BTreeMap<String, String>,
 }
 
 impl ThreadsConfig {
@@ -258,6 +272,41 @@ impl ThreadsConfig {
         self.archived.retain(|id| id != session_id);
         self.moved.remove(session_id);
         self.workspace_threads.remove(session_id);
+        self.permission_modes.remove(session_id);
+    }
+
+    /// The permission mode a thread reopens in, when it was left in another than the default.
+    pub fn permission_mode(&self, session_id: &str) -> Option<&str> {
+        self.permission_modes.get(session_id).map(String::as_str)
+    }
+
+    /// Notes the permission mode a thread is in; the default one is forgotten instead. Returns
+    /// whether that changed anything.
+    pub fn set_permission_mode(&mut self, session_id: &str, mode: &str) -> bool {
+        if mode == DEFAULT_PERMISSION_MODE {
+            return self.permission_modes.remove(session_id).is_some();
+        }
+        if self.permission_mode(session_id) == Some(mode) {
+            return false;
+        }
+        self.permission_modes
+            .insert(session_id.to_owned(), mode.to_owned());
+        true
+    }
+
+    /// The config to write over `on_disk`: this one, with the permission modes the file has
+    /// (written by the chats since this one was loaded), less those of `forgotten` threads.
+    fn for_saving(&self, on_disk: Option<ThreadsConfig>, forgotten: &[&str]) -> ThreadsConfig {
+        let mut permission_modes = on_disk.map_or_else(
+            || self.permission_modes.clone(),
+            |on_disk| on_disk.permission_modes,
+        );
+        permission_modes.retain(|session_id, _| !forgotten.contains(&session_id.as_str()));
+        ThreadsConfig {
+            version: CONFIG_VERSION,
+            permission_modes,
+            ..self.clone()
+        }
     }
 }
 
@@ -266,30 +315,61 @@ fn config_path() -> PathBuf {
 }
 
 pub fn load_config() -> ThreadsConfig {
+    read_config().unwrap_or_else(|err| {
+        log::warn!("{err}");
+        ThreadsConfig::default()
+    })
+}
+
+/// The saved config; the default one when there's no file yet, an error when it can't be read.
+fn read_config() -> Result<ThreadsConfig, String> {
     let path = config_path();
-    let Ok(contents) = std::fs::read_to_string(&path) else {
-        return ThreadsConfig::default();
-    };
-    match toml::from_str(&contents) {
-        Ok(config) => config,
-        Err(err) => {
-            log::warn!("Failed to parse {}: {}", path.display(), err.message());
-            ThreadsConfig::default()
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ThreadsConfig::default());
         }
-    }
+        Err(err) => return Err(format!("Failed to read {}: {err}", path.display())),
+    };
+    toml::from_str(&contents)
+        .map_err(|err| format!("Failed to parse {}: {}", path.display(), err.message()))
 }
 
 pub fn save_config(config: &ThreadsConfig) -> std::io::Result<()> {
-    let config = ThreadsConfig {
-        version: CONFIG_VERSION,
-        ..config.clone()
-    };
-    let contents = toml::to_string_pretty(&config).map_err(std::io::Error::other)?;
+    write_config(&config.for_saving(read_config().ok(), &[]))
+}
+
+/// Like [`save_config`], also dropping the permission modes of `forgotten` threads.
+pub fn save_config_forgetting(config: &ThreadsConfig, forgotten: &[&str]) -> std::io::Result<()> {
+    write_config(&config.for_saving(read_config().ok(), forgotten))
+}
+
+fn write_config(config: &ThreadsConfig) -> std::io::Result<()> {
+    let contents = toml::to_string_pretty(config).map_err(std::io::Error::other)?;
     let path = config_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(path, contents)
+}
+
+/// The permission mode the thread `session_id` was left in, when it wasn't the default.
+pub fn saved_permission_mode(session_id: &str) -> Option<String> {
+    load_config().permission_mode(session_id).map(str::to_owned)
+}
+
+/// Saves the permission mode the thread `session_id` is in, so it reopens in it.
+pub fn remember_permission_mode(session_id: &str, mode: &str) -> Result<(), String> {
+    // A file that can't be read is left alone rather than replaced by one holding only this.
+    let mut config = read_config()?;
+    if config.set_permission_mode(session_id, mode) {
+        write_config(&ThreadsConfig {
+            version: CONFIG_VERSION,
+            ..config
+        })
+        .map_err(|err| format!("Failed to save {}: {err}", config_path().display()))?;
+    }
+    Ok(())
 }
 
 /// One Claude Code or Codex conversation.

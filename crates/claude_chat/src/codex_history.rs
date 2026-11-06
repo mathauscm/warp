@@ -549,6 +549,7 @@ impl Builder {
                 text,
                 is_error,
                 structured: None,
+                images: Vec::new(),
             }),
             parent_tool_use_id: None,
             started_at: None,

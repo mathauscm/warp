@@ -353,7 +353,8 @@ pub fn custom_tag_to_keystroke(custom: CustomTag) -> Option<Keystroke> {
         CustomAction::SelectBlockBelow => Keystroke::parse("cmdorctrl-down").ok(),
         // Set this to mac-only. On Linux this conflicts with the binding to save a workflow.
         CustomAction::CreateBlockPermalink => mac_only_keystroke("cmd-shift-S"),
-        CustomAction::ToggleBookmarkBlock => Keystroke::parse(cmd_or_ctrl_shift("b")).ok(),
+        // ⇧⌘B opens the browser; bookmarking a block stays in the Blocks menu.
+        CustomAction::ToggleBookmarkBlock => None,
         CustomAction::CopyBlockOutput => Keystroke::parse("cmdorctrl-alt-shift-C").ok(),
         // Set this to mac-only. On Linux this conflicts with the general binding to copy.
         CustomAction::CopyBlockCommand => mac_only_keystroke("cmd-shift-C"),

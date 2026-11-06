@@ -641,7 +641,9 @@ impl ClaudeThreadsView {
     fn delete_thread(&mut self, session_id: &str, ctx: &mut ViewContext<Self>) {
         self.pending_delete = None;
         self.config.forget_thread(session_id);
-        self.save_config();
+        if let Err(err) = claude_threads::save_config_forgetting(&self.config, &[session_id]) {
+            log::warn!("Failed to save the Claude threads config: {err}");
+        }
         let running_in = CLIAgentSessionsModel::as_ref(ctx)
             .session_by_agent_session_id(session_id)
             .map(|(terminal_view_id, _)| terminal_view_id);

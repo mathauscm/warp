@@ -17,12 +17,17 @@ use warpui::{
 
 /// How close to the end counts as being at the bottom.
 const BOTTOM_TOLERANCE: f32 = 4.;
+/// How far scrolling up has to go before it stops following the bottom. Less is ignored, so a
+/// trackpad's drift doesn't stop it, and the bottom isn't pulled back under the user's fingers.
+const RELEASE_DISTANCE: f32 = 2.;
 
 /// What the view and its scroller share across frames.
 #[derive(Debug)]
 pub(super) struct ViewportState {
     /// Whether to keep the last row in view as rows grow.
     pub stick_to_bottom: Cell<bool>,
+    /// Scrolling up seen while following the bottom, short of `RELEASE_DISTANCE`.
+    pending_release: Cell<f32>,
     pub row_count: Cell<usize>,
     width: Cell<f32>,
     /// The list's scroll position, visible height and content height at the last layout or
@@ -36,6 +41,7 @@ impl Default for ViewportState {
     fn default() -> Self {
         Self {
             stick_to_bottom: Cell::new(true),
+            pending_release: Cell::new(0.),
             row_count: Cell::new(0),
             width: Cell::new(0.),
             scroll_start: Cell::new(0.),
@@ -160,20 +166,53 @@ impl NewScrollableElement for Viewport {
     }
 
     fn scroll(&mut self, delta: Pixels, axis: Axis, ctx: &mut EventContext) {
-        let was_sticking = self.state.stick_to_bottom.get();
-        NewScrollableElement::scroll(&mut self.list, delta, axis, ctx);
-        // The same clamping the list applies, since the event has no app context to ask it.
-        let state = &self.state;
+        let state = self.state.clone();
         let max_start = (state.total.get() - state.visible.get()).max(0.);
-        let start = (state.scroll_start.get() - delta.as_f32()).clamp(0., max_start);
+        let delta = match scroll_step(&state, delta.as_f32(), max_start) {
+            ScrollStep::Ignore => return,
+            ScrollStep::Release(delta) => {
+                state.stick_to_bottom.set(false);
+                ctx.notify();
+                delta
+            }
+            ScrollStep::Scroll(delta) => delta,
+        };
+        NewScrollableElement::scroll(&mut self.list, delta.into_pixels(), axis, ctx);
+        // The same clamping the list applies, since the event has no app context to ask it.
+        let start = (state.scroll_start.get() - delta).clamp(0., max_start);
         state.scroll_start.set(start);
-        state
-            .stick_to_bottom
-            .set(start >= max_start - BOTTOM_TOLERANCE);
-        if was_sticking != self.state.stick_to_bottom.get() {
+        // Only scrolling down to the end follows the bottom again; content growing under a
+        // still view doesn't.
+        if delta < 0. && !state.stick_to_bottom.get() && start >= max_start - BOTTOM_TOLERANCE {
+            state.stick_to_bottom.set(true);
             ctx.notify();
         }
     }
+}
+
+/// What a wheel step does to the list; positive deltas scroll up.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) enum ScrollStep {
+    /// Too little scrolling up to stop following the bottom.
+    Ignore,
+    /// Stops following the bottom and scrolls by the delta, with what was ignored before.
+    Release(f32),
+    Scroll(f32),
+}
+
+pub(super) fn scroll_step(state: &ViewportState, delta: f32, max_start: f32) -> ScrollStep {
+    // Content that fits on screen has nothing to scroll up to, so it keeps following.
+    if !state.stick_to_bottom.get() || delta <= 0. || max_start <= 0. {
+        state.pending_release.set(0.);
+        return ScrollStep::Scroll(delta);
+    }
+    let pending = state.pending_release.get() + delta;
+    if pending < RELEASE_DISTANCE {
+        state.pending_release.set(pending);
+        return ScrollStep::Ignore;
+    }
+    state.pending_release.set(0.);
+    ScrollStep::Release(pending)
 }
 
 /// An overlay placed over the list's content at render, kept on that content when the list

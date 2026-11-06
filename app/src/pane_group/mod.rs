@@ -193,6 +193,7 @@ mod tests;
 pub use pane::ai_document_pane::AIDocumentPane;
 pub use pane::ai_fact_pane::AIFactPane;
 pub use pane::artifacts_pane::ArtifactsPane;
+pub use pane::browser_pane::BrowserPane;
 pub use pane::claude_chat_pane::ClaudeChatPane;
 pub use pane::code_diff_pane::CodeDiffPane;
 pub use pane::code_pane::CodePane;
@@ -2039,6 +2040,17 @@ impl PaneGroup {
             LeafContents::Artifacts => {
                 let pane: Box<dyn AnyPaneContent + 'static> =
                     Box::new(ArtifactsPane::new(None, ctx));
+                let pane_id = pane.as_pane().id();
+                pane_contents.insert(pane_id, pane);
+                let focus = InitialFocus {
+                    focused_pane: leaf.is_focused.then_some(pane_id),
+                    active_session: None,
+                };
+                Ok((PaneData::new(pane_id), focus))
+            }
+            LeafContents::Browser => {
+                let pane: Box<dyn AnyPaneContent + 'static> =
+                    Box::new(BrowserPane::new(Default::default(), None, ctx));
                 let pane_id = pane.as_pane().id();
                 pane_contents.insert(pane_id, pane);
                 let focus = InitialFocus {

@@ -14,9 +14,10 @@ use super::markdown::{Block, column_weights, language_label, split_blocks};
 use super::paths::{
     CHIP_LEAD, CHIP_TAIL, PathKind, add_chips, kind_of, path_candidate, resolve, strip_chip_room,
 };
+use super::viewport::{ScrollStep, ViewportState, scroll_step};
 use super::{
-    MENTION_HEIGHT, MENTION_OFFSET, first_changed_row, lightbox_description, mention_placement,
-    row_key, row_last_item,
+    MENTION_HEIGHT, MENTION_OFFSET, anchor_row, first_changed_row, lightbox_description,
+    mention_placement, row_key, row_last_item,
 };
 
 fn tool(name: &str, input: serde_json::Value) -> ToolCall {
@@ -133,6 +134,7 @@ fn tool_diff_prefers_the_structured_patch() {
                 {"lines": ["+more"]}
             ]
         })),
+        images: Vec::new(),
     });
     let lines = tool_diff(&edit);
     let kinds: Vec<_> = lines.iter().map(|line| line.kind).collect();
@@ -473,4 +475,90 @@ fn paste_previews_keep_a_few_short_lines() {
     assert!(lines[0].ends_with('…'));
     assert_eq!(lines[6], "… mais 24 linhas");
     assert_eq!(super::chips::paste_preview("curto", 1), "curto");
+}
+
+#[test]
+fn the_row_scrolled_to_is_found_again_after_the_rows_change() {
+    let keys = |keys: &[&str]| keys.iter().map(|key| (*key).to_owned()).collect::<Vec<_>>();
+    let rows = [
+        Row::UserBubble { index: 0 },
+        Row::Tool { index: 1 },
+        Row::AssistantProse { index: 4 },
+    ];
+    assert_eq!(
+        anchor_row(
+            &keys(&["user:u", "work:u", "assistant:a"]),
+            &rows,
+            "work:u",
+            3
+        ),
+        1,
+        "a row that keeps its key keeps its place"
+    );
+    assert_eq!(
+        anchor_row(
+            &keys(&["user:u", "tool:t", "assistant:a"]),
+            &rows,
+            "work:u",
+            3
+        ),
+        2,
+        "a row that went away gives way to the row now showing its last item"
+    );
+    assert_eq!(anchor_row(&keys(&["user:u"]), &rows[..1], "gone", 9), 0);
+}
+
+#[test]
+fn scrolling_up_lets_go_of_the_bottom_past_a_small_distance() {
+    let state = ViewportState::default();
+    assert_eq!(scroll_step(&state, 1., 500.), ScrollStep::Ignore);
+    assert_eq!(
+        scroll_step(&state, 1.5, 500.),
+        ScrollStep::Release(2.5),
+        "the ignored drift is scrolled too once it lets go"
+    );
+
+    assert_eq!(
+        scroll_step(&state, 1., 0.),
+        ScrollStep::Scroll(1.),
+        "content that fits has nothing to let go for"
+    );
+    assert_eq!(scroll_step(&state, -3., 500.), ScrollStep::Scroll(-3.));
+
+    state.stick_to_bottom.set(false);
+    assert_eq!(scroll_step(&state, 1., 500.), ScrollStep::Scroll(1.));
+}
+
+#[test]
+fn local_markdown_images_become_their_own_blocks() {
+    let mut blocks = split_blocks(
+        "Antes.\n\n![Tela inicial](shots/home.png)\n\n![remota](https://site.com/a.png)\n\nDepois.",
+    );
+    assert!(matches!(&blocks[0], Block::Prose(..)), "{blocks:#?}");
+    assert_eq!(
+        blocks[1],
+        Block::Image {
+            source: "shots/home.png".to_owned(),
+            alt: "Tela inicial".to_owned(),
+            path: None,
+        }
+    );
+    assert!(
+        blocks[2..]
+            .iter()
+            .all(|block| matches!(block, Block::Prose(..))),
+        "web images stay in the prose: {blocks:#?}"
+    );
+
+    let cwd = std::path::Path::new("/w/app");
+    add_chips(&mut blocks, cwd, None, &mut |path| {
+        (path == std::path::Path::new("/w/app/shots/home.png")).then_some(false)
+    });
+    let Block::Image { path, .. } = &blocks[1] else {
+        panic!("expected the image");
+    };
+    assert_eq!(
+        path.as_deref(),
+        Some(std::path::Path::new("/w/app/shots/home.png"))
+    );
 }
