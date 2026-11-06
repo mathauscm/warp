@@ -123,6 +123,8 @@ pub struct ToolResult {
     pub is_error: bool,
     /// The tool's structured output (`tool_use_result` / `toolUseResult`), when there is one.
     pub structured: Option<Value>,
+    /// Images in the result, like a screenshot an integration took or an image file Claude read.
+    pub images: Vec<ImageAttachment>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

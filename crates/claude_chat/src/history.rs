@@ -1374,6 +1374,7 @@ impl Converter {
             return;
         };
         let text = content_text(block.get("content"));
+        let images = content_images(block.get("content"));
         let is_error = block.get("is_error").and_then(Value::as_bool) == Some(true);
         let denied = (is_error && entry.raw.tool_denial_kind.is_some())
             || denied_ids.contains(&tool_use_id)
@@ -1421,6 +1422,7 @@ impl Converter {
                 text,
                 is_error,
                 structured,
+                images,
             });
         }
         self.turn.running_tools.retain(|&running| running != index);
@@ -1792,6 +1794,18 @@ fn content_text(content: Option<&Value>) -> String {
             .collect::<Vec<_>>()
             .join("\n"),
         _ => String::new(),
+    }
+}
+
+/// The image blocks of a tool result's `content`.
+fn content_images(content: Option<&Value>) -> Vec<ImageAttachment> {
+    match content {
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter(|block| block_type(block) == Some("image"))
+            .filter_map(image_attachment)
+            .collect(),
+        _ => Vec::new(),
     }
 }
 

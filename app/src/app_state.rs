@@ -158,6 +158,8 @@ pub enum LeafContents {
     ClaudeChat(ClaudeChatPaneSnapshot),
     /// The gallery of local artifacts. Not persisted: it has no state worth restoring.
     Artifacts,
+    /// The in-app browser. Not persisted: its pages and dev servers don't survive a restart.
+    Browser,
 }
 
 #[cfg(feature = "local_fs")]
@@ -178,6 +180,7 @@ impl LeafContents {
             // an on-disk log via the app-state database.
             LeafContents::NetworkLog
             | LeafContents::Artifacts
+            | LeafContents::Browser
             // Environment management panes are opened on-demand via workspace
             // actions and have no persistable state.
             | LeafContents::EnvironmentManagement(_) => false,

@@ -3,7 +3,7 @@
 //! summary sentence, and every tool call gets a short pt-BR label.
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use serde_json::Value;
@@ -1078,6 +1078,133 @@ fn line_diff(old: &str, new: &str) -> (usize, usize) {
     }
     let common = row[new.len()];
     (new.len() - common, old.len() - common)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Images
+
+/// Extensions of the image files a tool call can show as a thumbnail.
+const IMAGE_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "tif", "tiff", "ico",
+];
+/// Image files picked out of one shell command, at most.
+const MAX_COMMAND_IMAGES: usize = 6;
+
+/// An image a tool call made or showed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolImage {
+    /// A file the call read, wrote or named. It may not be there anymore.
+    File(PathBuf),
+    /// The image at this position among the ones the call's result carries.
+    Returned(usize),
+}
+
+/// Whether `path` names an image file the transcript can show.
+pub fn is_image_path(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            IMAGE_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
+        })
+}
+
+/// The images a finished tool call made or showed: image files it read, wrote or named in its
+/// input or shell command (relative ones under `cwd`), then the images its result carries.
+pub fn tool_images(tool: &ToolCall, cwd: Option<&Path>) -> Vec<ToolImage> {
+    let Some(result) = tool
+        .result
+        .as_ref()
+        .filter(|result| tool.status == ToolStatus::Done && !result.is_error)
+    else {
+        return Vec::new();
+    };
+    let resolve = |path: &str| {
+        let path = path.strip_prefix("file://").unwrap_or(path);
+        let path = match (path.strip_prefix("~/"), home_dir()) {
+            (Some(rest), Some(home)) => home.join(rest),
+            _ => PathBuf::from(path),
+        };
+        match cwd {
+            Some(cwd) if path.is_relative() => cwd.join(path),
+            _ => path,
+        }
+    };
+    let candidates: Vec<String> = match tool.name.as_str() {
+        "Read" | "Write" => tool
+            .input
+            .get("file_path")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .into_iter()
+            .collect(),
+        "Bash" => tool
+            .input
+            .get("command")
+            .and_then(Value::as_str)
+            .map(command_image_paths)
+            .unwrap_or_default(),
+        _ => tool
+            .input
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(key, _)| is_path_key(key))
+            .filter_map(|(_, value)| value.as_str().map(str::to_owned))
+            .collect(),
+    };
+    let mut files: Vec<PathBuf> = Vec::new();
+    for candidate in candidates.iter().filter(|path| is_image_path(path)) {
+        let path = resolve(candidate);
+        if !files.contains(&path) {
+            files.push(path);
+        }
+    }
+    // Reading an image returns a copy of it; the file itself shows it at full size.
+    let returned = if tool.name == "Read" && !files.is_empty() {
+        0
+    } else {
+        result.images.len()
+    };
+    files
+        .into_iter()
+        .map(ToolImage::File)
+        .chain((0..returned).map(ToolImage::Returned))
+        .collect()
+}
+
+/// Whether an integration's input field likely holds a file path, like `filePath`, `filename` or
+/// `output`.
+fn is_path_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    ["path", "file", "output"]
+        .iter()
+        .any(|part| key.contains(part))
+}
+
+/// The image files a shell command names, like the output of `screencapture` or `convert`.
+fn command_image_paths(command: &str) -> Vec<String> {
+    command
+        .split_whitespace()
+        .map(|word| {
+            let value = match word.split_once('=') {
+                Some((flag, value)) if flag.starts_with('-') => value,
+                _ => word,
+            };
+            value.trim_matches(|c: char| matches!(c, '\'' | '"' | '(' | ')' | ';' | ',' | '`'))
+        })
+        .filter(|word| {
+            !word.contains("://")
+                && !word.contains(['*', '?', '$', '<', '>', '|', '{', '}'])
+                && is_image_path(word)
+        })
+        .map(str::to_owned)
+        .take(MAX_COMMAND_IMAGES)
+        .collect()
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
 }
 
 #[cfg(test)]

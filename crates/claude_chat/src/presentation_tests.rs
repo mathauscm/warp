@@ -603,6 +603,7 @@ fn counts_edit_stats() {
         structured: Some(
             json!({"type": "update", "originalFile": "one\n2\n", "structuredPatch": []}),
         ),
+        images: Vec::new(),
     });
     assert_eq!(
         edit_stats(&write).map(|stats| (stats.added, stats.removed)),
@@ -617,6 +618,7 @@ fn counts_edit_stats() {
             {"oldStart": 1, "oldLines": 3, "newStart": 1, "newLines": 4,
              "lines": [" a", "-b", "+B", "+C", "+D", " c"]},
         ]})),
+        images: Vec::new(),
     });
     assert_eq!(
         edit_stats(&patched).map(|stats| (stats.added, stats.removed)),
@@ -756,6 +758,7 @@ fn answered_question(id: &str, text: &str, structured: Option<Value>) -> ToolCal
         text: text.to_owned(),
         is_error: false,
         structured,
+        images: Vec::new(),
     });
     call
 }
@@ -863,4 +866,94 @@ fn an_answered_question_stays_out_of_the_folded_work() {
             Row::AssistantProse { index: 2 },
         ]
     );
+}
+
+fn finished(name: &str, input: Value, images: usize) -> ToolCall {
+    let mut call = tool_call("t", name, input, ToolStatus::Done);
+    call.result = Some(ToolResult {
+        text: String::new(),
+        is_error: false,
+        structured: None,
+        images: (0..images)
+            .map(|_| crate::timeline::ImageAttachment {
+                media_type: "image/png".to_owned(),
+                path: None,
+                data: Some("iVBORw0KGgo=".to_owned()),
+            })
+            .collect(),
+    });
+    call
+}
+
+#[test]
+fn reading_or_writing_an_image_shows_the_file() {
+    let cwd = Path::new("/w/app");
+    let read = finished("Read", json!({"file_path": "/w/app/tela.PNG"}), 1);
+    assert_eq!(
+        tool_images(&read, Some(cwd)),
+        [ToolImage::File(PathBuf::from("/w/app/tela.PNG"))],
+        "the returned copy of the file isn't shown twice"
+    );
+    let write = finished("Write", json!({"file_path": "out/logo.svg"}), 0);
+    assert_eq!(
+        tool_images(&write, Some(cwd)),
+        [ToolImage::File(PathBuf::from("/w/app/out/logo.svg"))]
+    );
+    let source = finished("Read", json!({"file_path": "/w/app/main.rs"}), 0);
+    assert!(tool_images(&source, Some(cwd)).is_empty());
+}
+
+#[test]
+fn integrations_show_the_images_they_return_and_the_files_they_save() {
+    let screenshot = finished("mcp__chrome__take_screenshot", json!({"format": "png"}), 2);
+    assert_eq!(
+        tool_images(&screenshot, None),
+        [ToolImage::Returned(0), ToolImage::Returned(1)]
+    );
+    let saved = finished(
+        "mcp__playwright__browser_take_screenshot",
+        json!({"filename": "/tmp/shot.jpg", "fullPage": true}),
+        1,
+    );
+    assert_eq!(
+        tool_images(&saved, None),
+        [
+            ToolImage::File(PathBuf::from("/tmp/shot.jpg")),
+            ToolImage::Returned(0)
+        ]
+    );
+}
+
+#[test]
+fn shell_commands_name_the_images_they_make() {
+    let cwd = Path::new("/w/app");
+    let command = |command: &str| {
+        tool_images(
+            &finished("Bash", json!({ "command": command }), 0),
+            Some(cwd),
+        )
+    };
+    assert_eq!(
+        command("screencapture -x '/tmp/tela.png' && convert in.jpg --output=out/thumb.webp"),
+        [
+            ToolImage::File(PathBuf::from("/tmp/tela.png")),
+            ToolImage::File(PathBuf::from("/w/app/in.jpg")),
+            ToolImage::File(PathBuf::from("/w/app/out/thumb.webp")),
+        ]
+    );
+    assert!(command("ls *.png && curl -o x https://site/a.png").is_empty());
+    assert_eq!(
+        command("python plot.py > /tmp/log.txt; open /tmp/plot.png"),
+        [ToolImage::File(PathBuf::from("/tmp/plot.png"))]
+    );
+}
+
+#[test]
+fn unfinished_or_failed_calls_show_no_images() {
+    let mut running = finished("Write", json!({"file_path": "/tmp/a.png"}), 0);
+    running.status = ToolStatus::Running;
+    assert!(tool_images(&running, None).is_empty());
+    let mut failed = finished("Write", json!({"file_path": "/tmp/a.png"}), 0);
+    failed.status = ToolStatus::Failed;
+    assert!(tool_images(&failed, None).is_empty());
 }

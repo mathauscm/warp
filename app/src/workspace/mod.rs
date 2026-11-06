@@ -68,7 +68,7 @@ use crate::workspace::view::{
     LEFT_PANEL_PROJECT_EXPLORER_BINDING_NAME, LEFT_PANEL_WARP_DRIVE_BINDING_NAME,
     NEW_AGENT_TAB_BINDING_NAME, NEW_AMBIENT_AGENT_TAB_BINDING_NAME, NEW_FILE_BINDING_NAME,
     NEW_TAB_BINDING_NAME, NEW_TERMINAL_TAB_BINDING_NAME, NEW_WINDOW_BINDING_NAME,
-    OPEN_GLOBAL_SEARCH_BINDING_NAME, TOGGLE_CLAUDE_THREADS_BINDING_NAME,
+    OPEN_BROWSER_BINDING_NAME, OPEN_GLOBAL_SEARCH_BINDING_NAME, TOGGLE_CLAUDE_THREADS_BINDING_NAME,
     TOGGLE_CONVERSATION_LIST_VIEW_BINDING_NAME, TOGGLE_NOTIFICATION_MAILBOX_BINDING_NAME,
     TOGGLE_PROJECT_EXPLORER_BINDING_NAME, TOGGLE_PROJECT_MANAGER_BINDING_NAME,
     TOGGLE_RIGHT_PANEL_BINDING_NAME, TOGGLE_TAB_CONFIGS_MENU_BINDING_NAME,
@@ -788,7 +788,16 @@ pub fn init(app: &mut AppContext) {
         )
         .with_context_predicate(id!("Workspace") & id!(flags::USE_VERTICAL_TABS_FLAG))
         .with_group(bindings::BindingGroup::Navigation.as_str())
-        .with_enabled(|| FeatureFlag::VerticalTabs.is_enabled())
+        // No default key: ⇧⌘B opens the browser, like in the Claude desktop app.
+        .with_enabled(|| FeatureFlag::VerticalTabs.is_enabled()),
+        EditableBinding::new(
+            OPEN_BROWSER_BINDING_NAME,
+            BindingDescription::new("Abrir o navegador")
+                .with_custom_description(bindings::MAC_MENUS_CONTEXT, "Navegador"),
+            WorkspaceAction::OpenBrowser { url: None },
+        )
+        .with_context_predicate(id!("Workspace"))
+        .with_group(bindings::BindingGroup::Navigation.as_str())
         .with_key_binding(cmd_or_ctrl_shift("b")),
         EditableBinding::new(
             TOGGLE_CLAUDE_THREADS_BINDING_NAME,

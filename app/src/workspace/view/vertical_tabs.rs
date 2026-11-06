@@ -4503,6 +4503,7 @@ impl PaneGroup {
             | IPaneType::NetworkLog
             | IPaneType::ClaudeChat
             | IPaneType::Artifacts
+            | IPaneType::Browser
             | IPaneType::DeferredPlaceholder => TypedPane::Other,
             #[cfg(test)]
             IPaneType::Dummy => TypedPane::Other,

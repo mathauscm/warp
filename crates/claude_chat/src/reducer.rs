@@ -335,6 +335,14 @@ impl Conversation {
         &self.session
     }
 
+    /// Takes `mode` as the permission mode the CLI runs in, as when a chat reopens in the mode it
+    /// was left in and the CLI hasn't confirmed it yet.
+    pub fn assume_permission_mode(&mut self, mode: &str) -> Vec<ConversationChange> {
+        let mut changes = Changes::default();
+        self.set_permission_mode(mode, &mut changes);
+        changes.0
+    }
+
     pub fn session_id(&self) -> Option<&str> {
         self.session.session_id.as_deref()
     }
@@ -1413,6 +1421,19 @@ impl Conversation {
                     .any(|meta| meta.id == result.tool_use_id && meta.non_execution_kind.is_some());
                 let text = result.text();
                 let is_error = result.is_error;
+                let images: Vec<ImageAttachment> = result
+                    .content
+                    .blocks()
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Image(image) => Some(ImageAttachment {
+                            media_type: image.media_type.clone().unwrap_or_default(),
+                            path: None,
+                            data: image.data.clone(),
+                        }),
+                        _ => None,
+                    })
+                    .collect();
                 let structured = if single {
                     user.tool_use_result.clone()
                 } else {
@@ -1438,6 +1459,7 @@ impl Conversation {
                         text: text.clone(),
                         is_error,
                         structured: structured.clone(),
+                        images: images.clone(),
                     });
                     tool.finished_at = Some(now);
                     if tool.parent_tool_use_id.is_none() && !is_error {

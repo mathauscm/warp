@@ -11,6 +11,7 @@
 pub(super) mod ai_document_pane;
 pub(super) mod ai_fact_pane;
 pub(super) mod artifacts_pane;
+pub(super) mod browser_pane;
 pub(super) mod claude_chat_pane;
 pub(super) mod code_diff_pane;
 pub(super) mod code_diff_pane_model;
@@ -50,6 +51,7 @@ use crate::ai::ai_document_view::AIDocumentView;
 use crate::ai::blocklist::inline_action::code_diff_view::CodeDiffView;
 use crate::ai::execution_profiles::editor::ExecutionProfileEditorView;
 use crate::ai::facts::AIFactView;
+use crate::browser::BrowserView;
 #[cfg(feature = "local_fs")]
 use crate::code::buffer_location::LocalOrRemotePath;
 use crate::code::view::CodeView;
@@ -152,6 +154,7 @@ pub(crate) enum IPaneType {
     NetworkLog,
     ClaudeChat,
     Artifacts,
+    Browser,
     DeferredPlaceholder,
     /// A pane type only for tests.
     #[cfg(test)]
@@ -178,6 +181,7 @@ impl Display for IPaneType {
             IPaneType::NetworkLog => write!(f, "Network Log"),
             IPaneType::ClaudeChat => write!(f, "Claude Chat"),
             IPaneType::Artifacts => write!(f, "Artifacts"),
+            IPaneType::Browser => write!(f, "Browser"),
             IPaneType::DeferredPlaceholder => write!(f, "Placeholder"),
             #[cfg(test)]
             IPaneType::Dummy => write!(f, "Dummy"),
@@ -290,6 +294,10 @@ impl PaneId {
         Self::new_from_ctx(IPaneType::Artifacts, ctx)
     }
 
+    pub fn from_browser_pane_ctx(ctx: &ViewContext<PaneView<BrowserView>>) -> Self {
+        Self::new_from_ctx(IPaneType::Browser, ctx)
+    }
+
     /// Creates a [`PaneId`] from a [`PaneView<TerminalView>`] entity ID.
     pub fn from_terminal_pane_view(
         terminal_pane_view: &ViewHandle<terminal_pane::TerminalPaneView>,
@@ -400,6 +408,10 @@ impl PaneId {
 
     pub fn from_artifacts_pane_view(pane_view: &ViewHandle<PaneView<ArtifactsView>>) -> Self {
         Self::new(IPaneType::Artifacts, pane_view)
+    }
+
+    pub fn from_browser_pane_view(pane_view: &ViewHandle<PaneView<BrowserView>>) -> Self {
+        Self::new(IPaneType::Browser, pane_view)
     }
 
     #[cfg_attr(not(feature = "local_fs"), allow(dead_code))]
@@ -530,6 +542,9 @@ impl PaneId {
             }
             IPaneType::Artifacts => {
                 ChildView::<PaneView<ArtifactsView>>::with_id(self.0.pane_view_id).finish()
+            }
+            IPaneType::Browser => {
+                ChildView::<PaneView<BrowserView>>::with_id(self.0.pane_view_id).finish()
             }
             IPaneType::DeferredPlaceholder => warpui::elements::Empty::new().finish(),
             #[cfg(test)]

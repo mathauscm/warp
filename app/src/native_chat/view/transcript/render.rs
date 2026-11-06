@@ -8,7 +8,8 @@ use claude_chat::attachments::{AttachedFile, split_attached_files};
 use claude_chat::inline::{self, MessageLayout, MessagePart, TokenKind};
 use claude_chat::presentation::{Row, WorkGroup};
 use claude_chat::timeline::{
-    AssistantText, Notice, NoticeKind, SlashCommandInvocation, Thinking, TimelineItem, UserMessage,
+    AssistantText, Notice, NoticeKind, SlashCommandInvocation, Thinking, TimelineItem, ToolCall,
+    UserMessage,
 };
 use markdown_parser::{FormattedTable, FormattedText, FormattedTextLine};
 use pathfinder_color::ColorU;
@@ -35,7 +36,7 @@ use warpui::{
 use super::details::{self, format_time};
 use super::markdown::{self, Block};
 use super::paths::PathChip;
-use super::{TranscriptAction, TranscriptView, chips, tools};
+use super::{TranscriptAction, TranscriptView, chips, images, tools};
 use crate::native_chat::design::{self, ChatDesign, Palette, Sizes};
 
 pub(super) const ICON_CHEVRON_RIGHT: &str = "bundled/svg/picolas-chevron-right.svg";
@@ -61,6 +62,8 @@ const THINKING_PREVIEW_CHARS: usize = 90;
 const BLOCK_SPACING: f32 = 12.;
 /// Space between rows inside a work group.
 const NESTED_ROW_SPACING: f32 = 4.;
+/// Gap between a tool line's icon and its label, which what's under the line lines up with.
+pub(super) const TOOL_ICON_GAP: f32 = 8.;
 /// Height of the hover line under a message (time, copy).
 const MESSAGE_FOOTER_HEIGHT: f32 = 24.;
 const SMALL_BUTTON_PADDING: f32 = 4.;
@@ -759,6 +762,13 @@ fn render_blocks(
                 render_table(cx, &format!("{cache_key}#{position}"), table, tone)
             }
             Block::Quote(blocks) => render_quote(cx, &format!("{cache_key}#{position}"), blocks),
+            Block::Image { source, alt, path } => images::markdown_image(
+                cx,
+                &format!("{cache_key}#{position}"),
+                source,
+                alt,
+                path.as_deref(),
+            ),
         };
         let spacing = if position + 1 == blocks.len() {
             0.
@@ -1117,12 +1127,64 @@ fn render_work_group(cx: &RowContext, group: &WorkGroup) -> Box<dyn Element> {
         group.is_live,
     );
     if !expanded || !can_expand {
-        return header;
+        // Folded, the images its tool calls made stay in reach.
+        return with_tool_images(cx, &group.id, header, &tools_at(cx, &group.items));
     }
     Flex::column()
         .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
         .with_child(Container::new(header).with_padding_bottom(8.).finish())
         .with_child(render_nested_rows(cx, &group.rows))
+        .finish()
+}
+
+/// The tool calls among `items`.
+pub(super) fn tools_at<'a>(cx: &RowContext<'a>, items: &[usize]) -> Vec<&'a ToolCall> {
+    items
+        .iter()
+        .filter_map(|&index| match cx.items.get(index)? {
+            TimelineItem::Tool(tool) => Some(tool),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `header` with thumbnails under it of the images `tools` made or showed, if any.
+pub(super) fn with_tool_images(
+    cx: &RowContext,
+    key: &str,
+    header: Box<dyn Element>,
+    tools: &[&ToolCall],
+) -> Box<dyn Element> {
+    let shown: Vec<images::ShownImage> = tools
+        .iter()
+        .flat_map(|tool| {
+            cx.view
+                .tool_images(tool, cx.cwd)
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    if shown.is_empty() {
+        return header;
+    }
+    let tool_ids: Vec<String> = tools.iter().map(|tool| tool.id.clone()).collect();
+    let strip = images::image_strip(cx, key, &shown, |position| {
+        TranscriptAction::OpenToolImages {
+            tool_ids: tool_ids.clone(),
+            position,
+        }
+    });
+    Flex::column()
+        .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+        .with_child(header)
+        .with_child(
+            Container::new(strip)
+                .with_padding_left(cx.sizes().icon_size + TOOL_ICON_GAP)
+                .with_padding_top(4.)
+                .with_padding_bottom(4.)
+                .finish(),
+        )
         .finish()
 }
 
@@ -1388,6 +1450,11 @@ impl Element for FractionWidth {
         app: &AppContext,
     ) -> bool {
         self.child.dispatch_event(event, ctx, app)
+    }
+
+    // Without it the bubble's text paints a selection that copying and mentioning can't read.
+    fn as_selectable_element(&self) -> Option<&dyn SelectableElement> {
+        self.child.as_selectable_element()
     }
 }
 

@@ -310,10 +310,10 @@ use crate::pane_group::FilePane;
 use crate::pane_group::pane::ActionOrigin;
 use crate::pane_group::working_directories::ChatFolders;
 use crate::pane_group::{
-    self, AIFactPane, AnyPaneContent, ArtifactsPane, ChildAgentOrigin, CodeDiffPane, CodePane,
-    CodeReviewPanelArg, CustomRouterEditorPane, Direction as PaneGroupDirection, Direction,
-    EnvironmentManagementPane, ExecutionProfileEditorPane, NetworkLogPane, NewTerminalOptions,
-    PaneGroup, PaneId, PanesLayout, TabBarHoverIndex, TerminalPaneId,
+    self, AIFactPane, AnyPaneContent, ArtifactsPane, BrowserPane, ChildAgentOrigin, CodeDiffPane,
+    CodePane, CodeReviewPanelArg, CustomRouterEditorPane, Direction as PaneGroupDirection,
+    Direction, EnvironmentManagementPane, ExecutionProfileEditorPane, NetworkLogPane,
+    NewTerminalOptions, PaneGroup, PaneId, PanesLayout, TabBarHoverIndex, TerminalPaneId,
 };
 use crate::persistence::ModelEvent;
 use crate::projects::ProjectManagementModel;
@@ -710,6 +710,7 @@ pub(crate) const NEW_AMBIENT_AGENT_TAB_BINDING_NAME: &str = "workspace:new_ambie
 pub(crate) const TOGGLE_TAB_CONFIGS_MENU_BINDING_NAME: &str = "workspace:toggle_tab_configs_menu";
 pub(crate) const TOGGLE_CLAUDE_THREADS_BINDING_NAME: &str = "workspace:toggle_claude_threads";
 pub(crate) const TOGGLE_TERMINAL_PANEL_BINDING_NAME: &str = "workspace:toggle_terminal_panel";
+pub(crate) const OPEN_BROWSER_BINDING_NAME: &str = "workspace:open_browser";
 pub(crate) const TOGGLE_PROJECT_MANAGER_BINDING_NAME: &str = "workspace:toggle_project_manager";
 
 // Editable left panel toolbelt keybindings.
@@ -3746,6 +3747,13 @@ impl Workspace {
         }
         if let Some(action) = crate::native_chat::take_dev_open_settings_action() {
             ctx.dispatch_typed_action_deferred(action);
+        }
+        // After the chat of `PICOLAS_OPEN_CHAT` opens, so the browser opens beside it.
+        if let Some(action) = crate::browser::take_dev_open_browser_action() {
+            ctx.spawn(
+                warpui::r#async::Timer::after(3 * DEV_HOOK_DELAY),
+                move |_, _, ctx| ctx.dispatch_typed_action_deferred(action),
+            );
         }
         if let Some(action) = crate::native_chat::claude_update::take_dev_open_notifications_action()
         {
@@ -13536,6 +13544,78 @@ impl Workspace {
         self.add_tab_from_existing_pane(Box::new(pane), new_idx, None, ctx);
     }
 
+    /// Focuses the browser of the active tab, opening `url` in it. Without one, opens a browser
+    /// beside the focused chat, else focuses the browser of another tab, else opens one in a new
+    /// tab.
+    fn open_browser(&mut self, url: Option<String>, ctx: &mut ViewContext<Self>) {
+        let url = url.map(|url| crate::browser::url::browsable(&url));
+        let chat_dirs = self
+            .active_tab_pane_group()
+            .as_ref(ctx)
+            .focused_claude_chat_dirs(ctx);
+        let mut dirs = if chat_dirs.is_empty() {
+            self.active_session_view(ctx)
+                .and_then(|view| view.as_ref(ctx).pwd())
+                .map(PathBuf::from)
+                .into_iter()
+                .collect()
+        } else {
+            chat_dirs.clone()
+        };
+        if let Some(dir) = crate::browser::dev_browser_dir() {
+            dirs.retain(|known| *known != dir);
+            dirs.insert(0, dir);
+        }
+        let context = crate::browser::BrowserContext { dirs };
+
+        let active_group_id = self.active_tab_pane_group().id();
+        let browser_in = |tab: &TabData, ctx: &ViewContext<Self>| {
+            let pane_group = tab.pane_group.as_ref(ctx);
+            pane_group.pane_ids().find_map(|pane_id| {
+                let pane = pane_group.downcast_pane_by_id::<BrowserPane>(pane_id)?;
+                Some((
+                    PaneViewLocator {
+                        pane_group_id: tab.pane_group.id(),
+                        pane_id,
+                    },
+                    pane.backing_view(ctx),
+                ))
+            })
+        };
+        let in_active_tab = self
+            .tabs
+            .iter()
+            .find(|tab| tab.pane_group.id() == active_group_id)
+            .and_then(|tab| browser_in(tab, ctx));
+        let existing = match in_active_tab {
+            Some(existing) => Some(existing),
+            None if !chat_dirs.is_empty() => None,
+            None => self.tabs.iter().find_map(|tab| browser_in(tab, ctx)),
+        };
+        if let Some((locator, view)) = existing {
+            self.focus_pane(locator, ctx);
+            view.update(ctx, |view, ctx| {
+                view.extend_context(context, ctx);
+                if let Some(url) = url {
+                    view.open_url(url, ctx);
+                }
+                view.focus(ctx);
+            });
+            return;
+        }
+
+        let pane: Box<dyn AnyPaneContent> = Box::new(BrowserPane::new(context, url, ctx));
+        if chat_dirs.is_empty() {
+            let new_idx = self.tab_count();
+            self.add_tab_from_existing_pane(pane, new_idx, None, ctx);
+            return;
+        }
+        self.active_tab_pane_group().update(ctx, |pane_group, ctx| {
+            let chat_pane = pane_group.focused_pane_id(ctx);
+            pane_group.add_pane_sibling(chat_pane, Direction::Right, pane, true, ctx);
+        });
+    }
+
     pub fn add_tab_for_cloud_notebook(
         &mut self,
         notebook_id: SyncId,
@@ -21975,6 +22055,23 @@ impl Workspace {
         ctx: &AppContext,
     ) {
         target.add_child(ChildView::new(&self.chat_usage_bar).finish());
+        target.add_child(
+            Container::new(
+                self.render_tab_bar_icon_button(
+                    appearance,
+                    icons::Icon::Globe,
+                    &self.mouse_states.browser_button,
+                    WorkspaceAction::OpenBrowser { url: None },
+                    "Navegador".to_string(),
+                    keybinding_name_to_display_string(OPEN_BROWSER_BINDING_NAME, ctx),
+                    false,
+                    false,
+                )
+                .finish(),
+            )
+            .with_margin_left(TAB_BAR_ICON_PADDING)
+            .finish(),
+        );
         if let Some(update_pill) = self.render_tab_overflow_menu(ctx, appearance) {
             target.add_child(
                 Container::new(update_pill)
@@ -25062,6 +25159,7 @@ impl TypedActionView for Workspace {
             }
             CloseClaudeChat { session_id } => self.close_claude_chat(session_id, ctx),
             OpenArtifacts { artifact_id } => self.open_artifacts(artifact_id.clone(), ctx),
+            OpenBrowser { url } => self.open_browser(url.clone(), ctx),
             ToggleClaudeThreadsPanel => {
                 self.toggle_vertical_tabs_content(VerticalTabsContent::Threads, ctx);
             }

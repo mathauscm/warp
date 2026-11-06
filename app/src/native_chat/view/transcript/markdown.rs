@@ -1,6 +1,7 @@
 //! Claude's Markdown split into the blocks the transcript draws differently: prose runs, fenced
-//! code and tables.
+//! code, tables and images.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use markdown_parser::{
@@ -20,6 +21,13 @@ pub(super) enum Block {
     Table(FormattedTable),
     /// A `>` quote, with its own blocks.
     Quote(Vec<Block>),
+    /// A Markdown image (`![alt](source)`) of a local file.
+    Image {
+        source: String,
+        alt: String,
+        /// The file, once it's found on disk.
+        path: Option<PathBuf>,
+    },
 }
 
 /// Splits `markdown` into blocks, keeping each prose run's lines together so it lays out as one
@@ -109,6 +117,14 @@ fn split_unquoted(markdown: &str) -> Vec<Block> {
                 flush(&mut prose, &mut blocks);
                 blocks.push(Block::Table(table));
             }
+            FormattedTextLine::Image(image) if is_local_image(&image.source) => {
+                flush(&mut prose, &mut blocks);
+                blocks.push(Block::Image {
+                    source: image.source,
+                    alt: image.alt_text,
+                    path: None,
+                });
+            }
             line @ (FormattedTextLine::Heading(_)
             | FormattedTextLine::Line(_)
             | FormattedTextLine::OrderedList(_)
@@ -122,6 +138,13 @@ fn split_unquoted(markdown: &str) -> Vec<Block> {
     }
     flush(&mut prose, &mut blocks);
     blocks
+}
+
+/// Whether an image's source is a file rather than a web address or inline data.
+fn is_local_image(source: &str) -> bool {
+    !source.is_empty()
+        && !source.starts_with("data:")
+        && (source.starts_with("file://") || !source.contains("://"))
 }
 
 fn has_open_fence(markdown: &str) -> bool {

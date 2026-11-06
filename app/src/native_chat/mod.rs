@@ -1,7 +1,7 @@
 //! Picolas Code's native Claude chat: Claude Code driven headlessly (see the `claude_chat` crate)
 //! behind a chat UI like the Claude desktop app, plus the local artifacts it creates.
 
-mod artifacts;
+pub(crate) mod artifacts;
 pub mod artifacts_view;
 pub mod claude_update;
 pub mod design;

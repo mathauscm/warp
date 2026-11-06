@@ -4,6 +4,7 @@
 
 mod chips;
 mod details;
+mod images;
 mod markdown;
 mod paths;
 mod render;
@@ -22,9 +23,9 @@ use std::time::{Duration, SystemTime};
 
 use base64::Engine as _;
 use claude_chat::artifacts::{ArtifactMeta, artifact_id_from_tool_result, is_artifact_tool};
-use claude_chat::presentation::{Row, build_rows};
+use claude_chat::presentation::{self, Row, ToolImage, build_rows};
 use claude_chat::reducer::{ConversationChange, ConversationStatus};
-use claude_chat::timeline::TimelineItem;
+use claude_chat::timeline::{TimelineItem, ToolCall};
 use pathfinder_color::ColorU;
 use pathfinder_geometry::vector::{Vector2F, vec2f};
 use serde_json::Value;
@@ -57,6 +58,7 @@ use warpui::{
     ViewHandle, WeakViewHandle,
 };
 
+use self::images::ShownImage;
 use self::markdown::Block;
 use self::paths::PathKind;
 use self::render::{RowContext, Style, icon};
@@ -126,6 +128,11 @@ pub enum TranscriptAction {
         message_id: String,
         position: usize,
     },
+    /// Shows the image at `position` among those the tool calls `tool_ids` made, with the others.
+    OpenToolImages {
+        tool_ids: Vec<String>,
+        position: usize,
+    },
     ScrollToBottom,
     SelectionChanged {
         text: Option<String>,
@@ -162,6 +169,8 @@ struct RenderCache {
     highlights: HashMap<String, (u64, Highlights)>,
     /// Whether each path named in an answer is a folder, or `None` when nothing is there.
     paths: HashMap<PathBuf, Option<bool>>,
+    /// The images each finished tool call made or showed, by tool call id.
+    tool_images: HashMap<String, Rc<Vec<ShownImage>>>,
 }
 
 /// The path chip under the pointer.
@@ -366,6 +375,15 @@ impl TranscriptView {
                     self.artifacts.insert(tool.id.clone(), meta);
                 }
             }
+            TimelineItem::Tool(tool) => {
+                let images = self.returned_tool_images(tool, session.cwd());
+                for (id, bytes) in images {
+                    AssetCache::handle(ctx).update(ctx, |cache, ctx| {
+                        cache.insert_raw_asset_bytes::<ImageType>(id.clone(), &bytes, ctx);
+                    });
+                    self.image_assets.insert(id);
+                }
+            }
             TimelineItem::User(message) => {
                 let mut images = Vec::new();
                 for (position, image) in message.images.iter().enumerate() {
@@ -387,12 +405,37 @@ impl TranscriptView {
                     self.image_assets.insert(id);
                 }
             }
-            TimelineItem::Tool(_)
-            | TimelineItem::Assistant(_)
+            TimelineItem::Assistant(_)
             | TimelineItem::Thinking(_)
             | TimelineItem::Notice(_)
             | TimelineItem::TurnEnd(_) => {}
         }
+    }
+
+    /// The images a tool call's result carries that it shows and that aren't loaded yet, decoded
+    /// and with the asset ids to load them under.
+    fn returned_tool_images(&self, tool: &ToolCall, cwd: &Path) -> Vec<(String, Vec<u8>)> {
+        let Some(result) = &tool.result else {
+            return Vec::new();
+        };
+        presentation::tool_images(tool, Some(cwd))
+            .into_iter()
+            .filter_map(|image| match image {
+                ToolImage::Returned(position) => Some(position),
+                ToolImage::File(_) => None,
+            })
+            .filter_map(|position| {
+                let id = tool_image_asset_id(&tool.id, position);
+                if self.image_assets.contains(&id) {
+                    return None;
+                }
+                let data = result.images.get(position)?.data.as_deref()?;
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .ok()?;
+                Some((id, bytes))
+            })
+            .collect()
     }
 
     /// For screenshots, once the first message sent in this run is in: `PICOLAS_CHAT_OPEN_FILE=<path>`
@@ -451,17 +494,41 @@ impl TranscriptView {
                 .unwrap_or(rows.len().saturating_sub(1))
         });
         let start = first_changed_row(&self.row_keys, &keys, dirty_row);
-        for index in (start..self.rows.len()).rev() {
+        // Where the user scrolled to, by row, to keep it on screen as rows change around it.
+        let anchor = (!self.viewport.stick_to_bottom.get())
+            .then(|| self.list_state.get_scroll_index())
+            .filter(|&index| index >= start && index < self.rows.len())
+            .map(|index| {
+                (
+                    index,
+                    self.row_keys[index].clone(),
+                    row_last_item(&self.rows[index]),
+                    self.list_state.get_scroll_offset(),
+                )
+            });
+        // Rows are re-measured in place rather than removed and added again: removing a row above
+        // the one scrolled to would move the scroll position onto another row.
+        let (old_len, new_len) = (self.rows.len(), rows.len());
+        for index in start..old_len.min(new_len) {
+            self.list_state.invalidate_height_for_index(index);
+        }
+        for index in (new_len..old_len).rev() {
             self.list_state.remove(index);
         }
-        for _ in start..rows.len() {
+        for _ in old_len..new_len {
             self.list_state.add_item();
         }
         // The previous last row loses its bottom padding when rows are added after it.
-        if start == self.rows.len() && start > 0 && rows.len() > start {
+        if start == old_len && start > 0 && new_len > start {
             self.list_state.invalidate_height_for_index(start - 1);
         }
-        self.viewport.row_count.set(rows.len());
+        if let Some((index, key, last_item, offset)) = anchor {
+            let moved_to = anchor_row(&keys, &rows, &key, last_item);
+            if moved_to != index && new_len > 0 {
+                self.list_state.scroll_to_with_offset(moved_to, offset);
+            }
+        }
+        self.viewport.row_count.set(new_len);
         self.rows = rows;
         self.row_keys = keys;
         if is_working {
@@ -633,6 +700,49 @@ impl TranscriptView {
     fn image_asset_id(&self, message_id: &str, position: usize) -> Option<String> {
         let id = image_asset_id(message_id, position);
         self.image_assets.contains(&id).then_some(id)
+    }
+
+    /// The images a tool call made or showed that are there to show, worked out once it finished.
+    fn tool_images(&self, tool: &ToolCall, cwd: &Path) -> Rc<Vec<ShownImage>> {
+        if tool.result.is_none() {
+            return Rc::default();
+        }
+        if let Some(images) = self.cache.borrow().tool_images.get(&tool.id) {
+            return images.clone();
+        }
+        let images: Vec<ShownImage> = presentation::tool_images(tool, Some(cwd))
+            .into_iter()
+            .filter_map(|image| match image {
+                ToolImage::File(path) => {
+                    let is_file = std::fs::metadata(&path).is_ok_and(|metadata| metadata.is_file());
+                    // Versioned by the file's state now, so a file Claude writes again later
+                    // isn't shown from the cache of an earlier call.
+                    is_file.then(|| ShownImage {
+                        name: path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned()),
+                        source: AssetSource::LocalFile {
+                            path: path.to_string_lossy().into_owned(),
+                            content_version: None,
+                        }
+                        .with_local_file_content_version(),
+                    })
+                }
+                ToolImage::Returned(position) => {
+                    let id = tool_image_asset_id(&tool.id, position);
+                    self.image_assets.contains(&id).then(|| ShownImage {
+                        source: AssetSource::Raw { id },
+                        name: None,
+                    })
+                }
+            })
+            .collect();
+        let images = Rc::new(images);
+        self.cache
+            .borrow_mut()
+            .tool_images
+            .insert(tool.id.clone(), images.clone());
+        images
     }
 
     // --- Actions ---------------------------------------------------------------------------
@@ -836,6 +946,42 @@ impl TranscriptView {
         if !images.is_empty() {
             open_lightbox(images, start, ctx);
         }
+    }
+
+    /// Shows the images the tool calls `tool_ids` made in the lightbox, starting at `position`.
+    fn open_tool_images(
+        &mut self,
+        tool_ids: &[String],
+        position: usize,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let session = self.session.as_ref(ctx);
+        let items = session.conversation().items();
+        let images: Vec<ShownImage> = tool_ids
+            .iter()
+            .filter_map(|id| {
+                items.iter().find_map(|item| match item {
+                    TimelineItem::Tool(tool) if tool.id == *id => Some(tool),
+                    _ => None,
+                })
+            })
+            .flat_map(|tool| self.tool_images(tool, session.cwd()).to_vec())
+            .collect();
+        let count = images.len();
+        if count == 0 {
+            return;
+        }
+        let images = images
+            .into_iter()
+            .enumerate()
+            .map(|(index, image)| LightboxImage {
+                source: LightboxImageSource::Resolved {
+                    asset_source: image.source,
+                },
+                description: lightbox_description(image.name.as_deref(), index, count),
+            })
+            .collect();
+        open_lightbox(images, position.min(count - 1), ctx);
     }
 
     /// Copies the selected text, if any.
@@ -1105,6 +1251,10 @@ fn image_asset_id(message_id: &str, position: usize) -> String {
     format!("native_chat_image:{message_id}:{position}")
 }
 
+fn tool_image_asset_id(tool_id: &str, position: usize) -> String {
+    format!("native_chat_tool_image:{tool_id}:{position}")
+}
+
 /// Shows `images` in the window's lightbox, starting at `index`.
 fn open_lightbox(images: Vec<LightboxImage>, index: usize, ctx: &mut ViewContext<TranscriptView>) {
     ctx.dispatch_typed_action_deferred(WorkspaceAction::OpenLightbox {
@@ -1159,6 +1309,15 @@ fn row_last_item(row: &Row) -> usize {
             .max()
             .unwrap_or_default(),
     }
+}
+
+/// Where the row scrolled to went after the rows changed: the row with the same key, else the row
+/// now showing the last item it showed.
+fn anchor_row(keys: &[String], rows: &[Row], key: &str, last_item: usize) -> usize {
+    keys.iter()
+        .position(|candidate| candidate == key)
+        .or_else(|| rows.iter().position(|row| row_last_item(row) >= last_item))
+        .unwrap_or(rows.len().saturating_sub(1))
 }
 
 /// The first row to lay out again: where the keys stop matching, or the first row whose content
@@ -1326,6 +1485,11 @@ impl TypedActionView for TranscriptView {
                 ctx.notify();
             }
             TranscriptAction::Copy { key, text } => self.copy(key.clone(), text.clone(), ctx),
+            TranscriptAction::OpenUrl(url) if crate::browser::url::is_local_url(url) => {
+                ctx.dispatch_typed_action_deferred(WorkspaceAction::OpenBrowser {
+                    url: Some(url.clone()),
+                });
+            }
             TranscriptAction::OpenUrl(url) => ctx.open_url(url),
             TranscriptAction::OpenPath { path, kind } => self.open_path(path, *kind, ctx),
             TranscriptAction::HoverPath { id, path, hovered } => {
@@ -1335,6 +1499,9 @@ impl TypedActionView for TranscriptView {
                 message_id,
                 position,
             } => self.open_image(message_id, *position, ctx),
+            TranscriptAction::OpenToolImages { tool_ids, position } => {
+                self.open_tool_images(tool_ids, *position, ctx);
+            }
             TranscriptAction::OpenArtifact(id) => {
                 ctx.emit(TranscriptEvent::OpenArtifact(id.clone()));
             }

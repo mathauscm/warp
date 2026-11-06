@@ -2,6 +2,8 @@ use std::path::Path;
 
 use anyhow::{Result, anyhow};
 
+use crate::{NavigationState, WebViewEvent};
+
 /// Placeholder for the native parent view type; it cannot be constructed on this platform.
 pub enum ParentView {}
 
@@ -12,6 +14,13 @@ pub struct WebView {
 
 impl WebView {
     pub fn new(parent: &ParentView) -> Result<Self> {
+        match *parent {}
+    }
+
+    pub fn new_browser(
+        parent: &ParentView,
+        _on_event: impl Fn(WebViewEvent) + 'static,
+    ) -> Result<Self> {
         match *parent {}
     }
 
@@ -27,7 +36,21 @@ impl WebView {
 
     pub fn load_html(&self, _html: &str, _base_url: Option<&Path>) {}
 
+    pub fn load_url(&self, _url: &str) -> Result<()> {
+        Err(anyhow!("web views are not supported on this platform"))
+    }
+
     pub fn reload(&self) {}
+
+    pub fn stop_loading(&self) {}
+
+    pub fn go_back(&self) {}
+
+    pub fn go_forward(&self) {}
+
+    pub fn navigation_state(&self) -> NavigationState {
+        NavigationState::default()
+    }
 
     pub fn evaluate_js(&self, _script: &str) {}
 
@@ -36,6 +59,8 @@ impl WebView {
             "web view snapshots are not supported on this platform"
         )));
     }
+
+    pub fn release_focus(&self) {}
 
     pub fn remove(&self) {}
 }

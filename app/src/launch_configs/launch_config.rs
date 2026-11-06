@@ -255,6 +255,7 @@ impl TryFrom<PaneNodeSnapshot> for PaneTemplateType {
                 | LeafContents::GetStarted
                 | LeafContents::ClaudeChat(_)
                 | LeafContents::Artifacts
+                | LeafContents::Browser
                 | LeafContents::NetworkLog
                 | LeafContents::AIDocument(_)
                 | LeafContents::EnvironmentManagement(_)
